@@ -24,6 +24,10 @@
 </div>
 
 <p align="center">
+  <img src="docs/logo.svg" alt="LLMHarbor project logo: an anchor-shaped routing mark" width="144" height="144" />
+</p>
+
+<p align="center">
   <img src="repo-assets/playground.png" alt="LLMHarbor playground dashboard" width="920" />
 </p>
 
