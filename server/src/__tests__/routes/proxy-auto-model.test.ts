@@ -60,7 +60,7 @@ describe('Virtual "auto" model', () => {
     expect(body.data[0]).toMatchObject({
       id: 'auto',
       object: 'model',
-      owned_by: 'freellmapi',
+      owned_by: 'llmharbor',
     });
     // Real catalog models still follow.
     expect(body.data.length).toBeGreaterThan(1);

@@ -6,7 +6,8 @@ import { fileURLToPath } from 'url';
 import { initEncryptionKey } from '../lib/crypto.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
+const DB_PATH = path.resolve(__dirname, '../../data/llmharbor.db');
+const LEGACY_DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 
 let db: Database.Database;
 
@@ -25,6 +26,14 @@ export function initDb(dbPath?: string): Database.Database {
     const dataDir = path.dirname(resolvedPath);
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    if (!dbPath && resolvedPath === DB_PATH && !fs.existsSync(DB_PATH) && fs.existsSync(LEGACY_DB_PATH)) {
+      fs.copyFileSync(LEGACY_DB_PATH, DB_PATH);
+      for (const suffix of ['-wal', '-shm']) {
+        const legacySidecar = `${LEGACY_DB_PATH}${suffix}`;
+        if (fs.existsSync(legacySidecar)) fs.copyFileSync(legacySidecar, `${DB_PATH}${suffix}`);
+      }
     }
   }
 
@@ -86,6 +95,17 @@ function createTables(db: Database.Database) {
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_checked_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS custom_endpoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      validate_url TEXT,
+      timeout_ms INTEGER NOT NULL DEFAULT 120000,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS requests (
@@ -1266,9 +1286,16 @@ function migrateModelsV14(db: Database.Database) {
 function ensureUnifiedKey(db: Database.Database) {
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
-    const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+    const key = `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
     console.log(`\n  Your unified API key: ${key}\n`);
+    return;
+  }
+
+  if (existing.value.startsWith('freellmapi-')) {
+    const key = `llmharbor-${existing.value.slice('freellmapi-'.length)}`;
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+    console.log(`\n  Your unified API key was rebranded: ${key}\n`);
   }
 }
 
@@ -1280,7 +1307,7 @@ export function getUnifiedApiKey(): string {
 
 export function regenerateUnifiedKey(): string {
   const db = getDb();
-  const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+  const key = `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
   db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
   return key;
 }

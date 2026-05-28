@@ -3,7 +3,8 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { PageHeader } from '@/components/page-header'
+import { PageHeader, EmptyState } from '@/components/page-header'
+import { cn } from '@/lib/utils'
 
 interface FallbackEntry {
   modelDbId: number
@@ -25,6 +26,15 @@ interface ChatMessage {
     latency?: number
     fallbackAttempts?: number
   }
+}
+
+function RoutePill({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl border border-border bg-background px-3 py-2 ">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">{label}</p>
+      <p className="mt-0.5 truncate text-xs font-medium">{value}</p>
+    </div>
+  )
 }
 
 export default function PlaygroundPage() {
@@ -66,7 +76,7 @@ export default function PlaygroundPage() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
-      const body: any = {
+      const body: { messages: { role: 'user' | 'assistant'; content: string }[]; model?: string } = {
         messages: newMessages.map(m => ({ role: m.role, content: m.content })),
       }
       if (selectedModel !== 'auto') body.model = selectedModel
@@ -109,10 +119,11 @@ export default function PlaygroundPage() {
           fallbackAttempts: fallbackAttempts ? parseInt(fallbackAttempts) : undefined,
         },
       }])
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Unknown error'
       setMessages([...newMessages, {
         role: 'assistant',
-        content: `Error: ${err.message}`,
+        content: `Error: ${message}`,
       }])
     } finally {
       setLoading(false)
@@ -133,115 +144,130 @@ export default function PlaygroundPage() {
   }
 
   const activeModelLabel = selectedModel === 'auto'
-    ? 'Auto (fallback chain)'
+    ? 'Auto routing'
     : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
 
+  const lastMeta = [...messages].reverse().find(m => m.meta)?.meta
+
   return (
-    <div className="flex flex-col h-[calc(100vh-8rem)]">
+    <div className="flex min-h-[calc(100vh-9.5rem)] flex-col">
       <PageHeader
+        eyebrow="Test a request"
         title="Playground"
-        description="Send a chat completion through the router and see which provider serves it."
+        description="Send one request, see which provider handled it, and check latency without leaving the app."
         actions={
           <>
             <Select value={selectedModel} onValueChange={(v) => setSelectedModel(v ?? 'auto')}>
-              <SelectTrigger className="w-[260px]">
+              <SelectTrigger className="h-9 w-[270px] rounded-2xl bg-card">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="auto">Auto (fallback chain)</SelectItem>
+                <SelectItem value="auto">Auto routing</SelectItem>
                 {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>
-                    <span className="flex items-center gap-2">
-                      <span>{m.displayName}</span>
-                      <span className="text-xs text-muted-foreground">{m.platform}</span>
-                    </span>
-                  </SelectItem>
+                  <SelectItem key={m.modelDbId} value={m.modelId}>{m.displayName}, {m.platform}</SelectItem>
                 ))}
               </SelectContent>
             </Select>
-            {messages.length > 0 && (
-              <Button variant="outline" size="sm" onClick={handleClear}>
-                Clear
-              </Button>
-            )}
+            {messages.length > 0 && <Button variant="outline" size="sm" onClick={handleClear}>Clear thread</Button>}
           </>
         }
       />
 
-      <div className="flex-1 flex flex-col rounded-lg border bg-card overflow-hidden min-h-0">
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-          {messages.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-center">
-              <div className="space-y-2 max-w-sm">
-                <p className="text-base font-medium">Send a message to get started.</p>
-                <p className="text-sm text-muted-foreground">
-                  Using <span className="text-foreground">{activeModelLabel}</span>. Switch models in the selector above.
-                </p>
-              </div>
+      <div className="grid flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+        <section className="panel-card flex min-h-[620px] flex-col overflow-hidden rounded-2xl">
+          <div className="flex items-center justify-between border-b border-border bg-card px-5 py-3">
+            <div>
+              <p className="text-sm font-semibold">Thread</p>
+              <p className="text-xs text-muted-foreground">Enter to send. Shift Enter for a new line.</p>
             </div>
-          ) : (
-            <>
-              {messages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                  <div
-                    className={`max-w-[78%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                      msg.role === 'user'
-                        ? 'bg-primary text-primary-foreground'
-                        : 'bg-muted'
-                    }`}
-                  >
-                    <div className="whitespace-pre-wrap">{msg.content}</div>
-                    {msg.meta && (
-                      <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
-                        {msg.meta.platform && <span>{msg.meta.platform}</span>}
-                        {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
-                        {msg.meta.latency != null && <span>· {msg.meta.latency} ms</span>}
-                        {msg.meta.fallbackAttempts != null && msg.meta.fallbackAttempts > 0 && (
-                          <span>· {msg.meta.fallbackAttempts} fallback{msg.meta.fallbackAttempts > 1 ? 's' : ''}</span>
+            <div className="rounded-lg bg-primary/10 px-3 py-1 text-xs font-medium text-primary">{activeModelLabel}</div>
+          </div>
+
+          <div className="relative flex-1 overflow-y-auto p-5">
+            <div className="harbor-grid pointer-events-none absolute inset-0 opacity-70" />
+            <div className="relative space-y-4">
+              {messages.length === 0 ? (
+                <div className="flex min-h-[430px] items-center justify-center">
+                  <EmptyState
+                    title="Send a test request."
+                    description={`Using ${activeModelLabel}. Add provider keys to start routing requests.`}
+                  />
+                </div>
+              ) : (
+                <>
+                  {messages.map((msg, i) => (
+                    <div key={i} className={cn('flex', msg.role === 'user' ? 'justify-end' : 'justify-start')}>
+                      <div className={cn(
+                        'max-w-[86%] rounded-xl px-4 py-3 text-sm leading-7  sm:max-w-[76%]',
+                        msg.role === 'user'
+                          ? 'bg-primary text-primary-foreground '
+                          : 'border border-border bg-background ',
+                      )}>
+                        <div className="whitespace-pre-wrap">{msg.content}</div>
+                        {msg.meta && (
+                          <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] opacity-75 tabular-nums">
+                            {msg.meta.platform && <span>{msg.meta.platform}</span>}
+                            {msg.meta.model && <span className="font-mono">{msg.meta.model}</span>}
+                            {msg.meta.latency != null && <span>{msg.meta.latency} ms</span>}
+                            {msg.meta.fallbackAttempts != null && msg.meta.fallbackAttempts > 0 && (
+                              <span>{msg.meta.fallbackAttempts} fallback{msg.meta.fallbackAttempts > 1 ? 's' : ''}</span>
+                            )}
+                          </div>
                         )}
                       </div>
-                    )}
-                  </div>
-                </div>
-              ))}
-              {loading && (
-                <div className="flex justify-start">
-                  <div className="bg-muted rounded-2xl px-4 py-3">
-                    <div className="flex gap-1">
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '150ms' }} />
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '300ms' }} />
                     </div>
-                  </div>
-                </div>
+                  ))}
+                  {loading && (
+                    <div className="flex justify-start">
+                      <div className="rounded-xl border border-border bg-background px-4 py-3 ">
+                        <div className="flex gap-1.5">
+                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '150ms' }} />
+                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '300ms' }} />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </>
               )}
-              <div ref={messagesEndRef} />
-            </>
-          )}
-        </div>
-
-        <div className="border-t bg-background/50 p-3">
-          <div className="flex gap-2 items-end">
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Type a message… (⏎ to send, ⇧⏎ for newline)"
-              rows={1}
-              className="flex-1 resize-none rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[40px] max-h-[160px]"
-              style={{ height: 'auto', overflow: 'hidden' }}
-              onInput={e => {
-                const el = e.target as HTMLTextAreaElement
-                el.style.height = 'auto'
-                el.style.height = Math.min(el.scrollHeight, 160) + 'px'
-              }}
-            />
-            <Button onClick={handleSend} disabled={loading || !input.trim()} size="default">
-              {loading ? 'Sending…' : 'Send'}
-            </Button>
+            </div>
           </div>
-        </div>
+
+          <div className="border-t border-border bg-background p-3 ">
+            <div className="flex items-end gap-2 rounded-[var(--radius-panel)] border border-border bg-card p-2 ">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Type a test prompt..."
+                rows={1}
+                className="max-h-[180px] min-h-[44px] flex-1 resize-none rounded-[var(--radius-input)] bg-transparent px-3 py-2.5 text-sm leading-6 outline-none placeholder:text-muted-foreground/75"
+                style={{ height: 'auto', overflow: 'hidden' }}
+                onInput={e => {
+                  const el = e.target as HTMLTextAreaElement
+                  el.style.height = 'auto'
+                  el.style.height = Math.min(el.scrollHeight, 180) + 'px'
+                }}
+              />
+              <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg" className="rounded-[var(--radius-button)] px-4">
+                {loading ? 'Routing...' : 'Send'}
+              </Button>
+            </div>
+          </div>
+        </section>
+
+        <aside className="space-y-3">
+          <RoutePill label="Mode" value={selectedModel === 'auto' ? 'Auto routing' : 'Pinned model'} />
+          <RoutePill label="Ready models" value={`${availableModels.length} enabled`} />
+          <RoutePill label="Last provider" value={lastMeta?.platform ?? 'No response yet'} />
+          <RoutePill label="Latency" value={lastMeta?.latency != null ? `${lastMeta.latency} ms` : 'Waiting'} />
+          <div className="rounded-[var(--radius-panel)] border border-border bg-card p-4 text-xs leading-5 text-muted-foreground ">
+            <p className="font-medium text-foreground">Practical check</p>
+            <p className="mt-1">If a provider fails, LLMHarbor tries the next enabled model. Change the order on the Fallback page.</p>
+          </div>
+        </aside>
       </div>
     </div>
   )

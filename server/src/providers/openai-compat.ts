@@ -3,7 +3,7 @@ import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
   Platform,
-} from '@freellmapi/shared/types.js';
+} from '@llmharbor/shared/types.js';
 import { BaseProvider, type CompletionOptions } from './base.js';
 
 /**
@@ -14,12 +14,12 @@ import { BaseProvider, type CompletionOptions } from './base.js';
 export class OpenAICompatProvider extends BaseProvider {
   readonly platform: Platform;
   readonly name: string;
-  private readonly baseUrl: string;
+  readonly baseUrl: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
   /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted
    * inference (llama.cpp / vLLM on CPU) can take 30-120s for long prompts. Default 15000. */
-  private readonly timeoutMs: number;
+  readonly timeoutMs: number;
 
   constructor(opts: {
     platform: Platform;

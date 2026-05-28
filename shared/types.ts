@@ -5,7 +5,7 @@
 // Moonshot and MiniMax direct integrations were dropped in migrateModelsV4
 // (see server/src/db/index.ts). HuggingFace was dropped in V4 and re-added
 // in V13 via the router.huggingface.co Inference Providers meta-router.
-export type Platform =
+export type BuiltInPlatform =
   | 'google'
   | 'groq'
   | 'cerebras'
@@ -22,6 +22,10 @@ export type Platform =
   | 'pollinations'
   | 'llm7'
   | 'huggingface';
+
+// Custom OpenAI-compatible endpoints are stored with platform ids like
+// `custom-local-vllm`, so runtime platform values must remain open-ended.
+export type Platform = BuiltInPlatform | (string & {});
 
 export interface Model {
   id: number;

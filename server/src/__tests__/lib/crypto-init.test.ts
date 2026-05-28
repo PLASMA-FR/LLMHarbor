@@ -20,7 +20,7 @@ function restoreEnv() {
   }
 }
 
-describe('initEncryptionKey — input validation', () => {
+describe('initEncryptionKey — input validation and auto-generation', () => {
   beforeEach(() => {
     restoreEnv();
   });
@@ -33,7 +33,6 @@ describe('initEncryptionKey — input validation', () => {
     process.env.ENCRYPTION_KEY = 'a'.repeat(64);
     const db = freshDb();
     expect(() => initEncryptionKey(db)).not.toThrow();
-    // Round-trip a value to confirm the key actually works.
     const enc = encrypt('hello');
     expect(decrypt(enc.encrypted, enc.iv, enc.authTag)).toBe('hello');
   });
@@ -51,37 +50,38 @@ describe('initEncryptionKey — input validation', () => {
   });
 
   it('throws on non-hex env key of correct length', () => {
-    process.env.ENCRYPTION_KEY = 'g'.repeat(64); // g is not hex
+    process.env.ENCRYPTION_KEY = 'g'.repeat(64);
     const db = freshDb();
     expect(() => initEncryptionKey(db)).toThrow(/Invalid ENCRYPTION_KEY \(env\)/);
   });
 
-  it('requires ENCRYPTION_KEY when dev fallback is not explicitly enabled', () => {
+  it('auto-generates and persists a key when ENCRYPTION_KEY is missing', () => {
     const db = freshDb();
-    expect(() => initEncryptionKey(db)).toThrow(/ENCRYPTION_KEY is required/);
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get();
-    expect(row).toBeUndefined();
+    expect(() => initEncryptionKey(db)).not.toThrow();
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
+    expect(row.value).toMatch(/^[0-9a-f]{64}$/);
+    const enc = encrypt('generated-key-roundtrip');
+    expect(decrypt(enc.encrypted, enc.iv, enc.authTag)).toBe('generated-key-roundtrip');
   });
 
-  it('does not load a DB-stored fallback key when dev fallback is disabled', () => {
+  it('loads a DB-stored generated key even without DEV_MODE', () => {
     const db = freshDb();
     db.prepare("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run('b'.repeat(64));
-    expect(() => initEncryptionKey(db)).toThrow(/ENCRYPTION_KEY is required/);
+    expect(() => initEncryptionKey(db)).not.toThrow();
+    const enc = encrypt('persisted');
+    expect(decrypt(enc.encrypted, enc.iv, enc.authTag)).toBe('persisted');
   });
 
-  it('requires ENCRYPTION_KEY in production even when DEV_MODE is set', () => {
-    process.env.DEV_MODE = 'true';
+  it('auto-generates in production when neither env nor DB key exists', () => {
     process.env.NODE_ENV = 'production';
     const db = freshDb();
-    expect(() => initEncryptionKey(db)).toThrow(/ENCRYPTION_KEY is required/);
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get();
-    expect(row).toBeUndefined();
+    expect(() => initEncryptionKey(db)).not.toThrow();
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
+    expect(row.value).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('still treats the placeholder as "not set" and allows explicit dev fallback generation', () => {
+  it('treats the scaffold placeholder as missing and auto-generates', () => {
     process.env.ENCRYPTION_KEY = 'your-64-char-hex-key-here';
-    process.env.DEV_MODE = 'true';
-    process.env.NODE_ENV = 'test';
     const db = freshDb();
     expect(() => initEncryptionKey(db)).not.toThrow();
     const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
@@ -89,19 +89,8 @@ describe('initEncryptionKey — input validation', () => {
   });
 
   it('throws on a corrupted DB-stored key', () => {
-    process.env.DEV_MODE = 'true';
-    process.env.NODE_ENV = 'test';
     const db = freshDb();
     db.prepare("INSERT INTO settings (key, value) VALUES ('encryption_key', ?)").run('not-hex');
     expect(() => initEncryptionKey(db)).toThrow(/Invalid ENCRYPTION_KEY \(db\)/);
-  });
-
-  it('generates a fresh key on a virgin DB and persists it only in explicit dev fallback mode', () => {
-    process.env.DEV_MODE = 'true';
-    process.env.NODE_ENV = 'test';
-    const db = freshDb();
-    initEncryptionKey(db);
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string };
-    expect(row.value).toMatch(/^[0-9a-f]{64}$/);
   });
 });

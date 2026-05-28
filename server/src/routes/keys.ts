@@ -3,20 +3,15 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { hasProvider } from '../providers/index.js';
 
 export const keysRouter = Router();
 
-// Active providers — must match providers/index.ts registrations + shared/types.ts Platform.
-// Moonshot and MiniMax direct integrations were dropped in V4. HuggingFace
-// was dropped in V4 and re-added in V13 via the router.huggingface.co route.
-const PLATFORMS = [
-  'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral',
-  'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
-  'kilo', 'pollinations', 'llm7', 'huggingface',
-] as const;
+// Built-in and custom endpoint ids are accepted here. Custom endpoints are
+// validated against custom_endpoints through hasProvider().
 
 const addKeySchema = z.object({
-  platform: z.enum(PLATFORMS),
+  platform: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use a lowercase platform id like custom-local-vllm'),
   key: z.string().min(1),
   label: z.string().optional(),
 });
@@ -58,6 +53,11 @@ keysRouter.post('/', (req: Request, res: Response) => {
   }
 
   const { platform, key, label } = parsed.data;
+  if (!hasProvider(platform)) {
+    res.status(400).json({ error: { message: `Unknown endpoint '${platform}'. Add it under Custom endpoints first.` } });
+    return;
+  }
+
   const { encrypted, iv, authTag } = encrypt(key);
 
   const db = getDb();
@@ -98,7 +98,7 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
 // Toggle all keys for a platform
 keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   const platform = req.params.platform as string;
-  if (!(PLATFORMS as readonly string[]).includes(platform)) {
+  if (!hasProvider(platform)) {
     res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
     return;
   }

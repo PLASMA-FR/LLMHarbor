@@ -20,20 +20,20 @@ function formatTokens(n?: number): string {
 
 function Stat({ label, value, className }: { label: string; value: string | number; className?: string }) {
   return (
-    <div className="rounded-lg border bg-card px-4 py-3">
-      <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
-      <p className={`text-xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
+    <div className="rounded-2xl border border-border bg-card px-4 py-4 ">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">{label}</p>
+      <p className={`mt-2 text-2xl font-semibold tracking-[-0.04em] tabular-nums ${className ?? ''}`}>{value}</p>
     </div>
   )
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-lg border bg-card">
-      <div className="px-4 py-3 border-b">
-        <h3 className="text-sm font-medium">{title}</h3>
+    <div className="panel-card overflow-hidden rounded-2xl">
+      <div className="border-b border-border bg-card px-5 py-4">
+        <h3 className="text-sm font-semibold tracking-[-0.01em]">{title}</h3>
       </div>
-      <div className="p-4">{children}</div>
+      <div className="p-5">{children}</div>
     </div>
   )
 }
@@ -78,10 +78,11 @@ export default function AnalyticsPage() {
   return (
     <div>
       <PageHeader
+        eyebrow="Observability"
         title="Analytics"
-        description="Request volume, latency, token usage, and failures."
+        description="Request volume, latency, token use, savings, and provider errors in one place."
         actions={
-          <div className="flex gap-1 rounded-md border p-0.5">
+          <div className="flex gap-1 rounded-[var(--radius-input)] border border-border bg-card p-1 ">
             {(['24h', '7d', '30d'] as TimeRange[]).map(r => (
               <Button
                 key={r}
@@ -118,7 +119,7 @@ export default function AnalyticsPage() {
                   <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
-                  <Bar dataKey="requests" fill={primaryFill} radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="requests" fill="var(--primary)" radius={[8, 8, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             )}
@@ -134,7 +135,7 @@ export default function AnalyticsPage() {
                   <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                   <YAxis unit="ms" tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
-                  <Bar dataKey="avgLatencyMs" name="Latency (ms)" fill="var(--muted-foreground)" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="avgLatencyMs" name="Latency (ms)" fill="var(--accent)" radius={[8, 8, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             )}
@@ -161,7 +162,7 @@ export default function AnalyticsPage() {
           </div>
 
           <div className="lg:col-span-2">
-            <Panel title="Per-model breakdown">
+            <Panel title="Model breakdown">
               {byModel.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
               ) : (
@@ -207,7 +208,7 @@ export default function AnalyticsPage() {
                   <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
-                  <Bar dataKey="count" fill="var(--destructive)" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="count" fill="var(--destructive)" radius={[8, 8, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             )}

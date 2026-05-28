@@ -1,11 +1,13 @@
-import type { Platform } from '@freellmapi/shared/types.js';
+import type { Platform } from '@llmharbor/shared/types.js';
 import type { BaseProvider } from './base.js';
 import { GoogleProvider } from './google.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
+import { getDb } from '../db/index.js';
 
-const providers = new Map<Platform, BaseProvider>();
+const providers = new Map<string, BaseProvider>();
+const dynamicProviders = new Map<string, BaseProvider>();
 
 function register(provider: BaseProvider) {
   providers.set(provider.platform, provider);
@@ -56,7 +58,7 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://openrouter.ai/api/v1',
   extraHeaders: {
     'HTTP-Referer': 'http://localhost:3001',
-    'X-Title': 'FreeLLMAPI',
+    'X-Title': 'LLMHarbor',
   },
 }));
 
@@ -148,14 +150,56 @@ register(new OpenAICompatProvider({
 // $0.0, please pay with fiat or send tao". The "free" tier requires a
 // non-zero balance, which conflicts with the project's no-card criterion.
 
-export function getProvider(platform: Platform): BaseProvider | undefined {
-  return providers.get(platform);
+export function getProvider(platform: string): BaseProvider | undefined {
+  const builtIn = providers.get(platform);
+  if (builtIn) return builtIn;
+
+  const cached = dynamicProviders.get(platform);
+  if (cached) return cached;
+
+  try {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT platform, name, base_url, validate_url, timeout_ms
+      FROM custom_endpoints
+      WHERE platform = ? AND enabled = 1
+    `).get(platform) as { platform: string; name: string; base_url: string; validate_url: string | null; timeout_ms: number } | undefined;
+    if (!row) return undefined;
+
+    const provider = new OpenAICompatProvider({
+      platform: row.platform,
+      name: row.name,
+      baseUrl: row.base_url.replace(/\/+$/, ''),
+      validateUrl: row.validate_url || undefined,
+      timeoutMs: row.timeout_ms,
+    });
+    dynamicProviders.set(platform, provider);
+    return provider;
+  } catch {
+    return undefined;
+  }
 }
 
 export function getAllProviders(): BaseProvider[] {
   return Array.from(providers.values());
 }
 
-export function hasProvider(platform: Platform): boolean {
-  return providers.has(platform);
+export function getBuiltInProviderSummaries(): Array<{ platform: string; name: string; baseUrl: string | null; timeoutMs: number | null }> {
+  return Array.from(providers.values()).map(provider => {
+    const details = provider as BaseProvider & { baseUrl?: string; timeoutMs?: number };
+    return {
+      platform: provider.platform,
+      name: provider.name,
+      baseUrl: typeof details.baseUrl === 'string' ? details.baseUrl : null,
+      timeoutMs: typeof details.timeoutMs === 'number' ? details.timeoutMs : null,
+    };
+  });
+}
+
+export function hasProvider(platform: string): boolean {
+  return getProvider(platform) !== undefined;
+}
+
+export function clearDynamicProvider(platform: string): void {
+  dynamicProviders.delete(platform);
 }

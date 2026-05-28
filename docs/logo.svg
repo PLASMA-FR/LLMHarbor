@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">LLMHarbor anchor logo</title>
+  <desc id="desc">A premium anchor-shaped mark that combines harbor safety, model routing, and resilient fallback paths.</desc>
+  <defs>
+    <linearGradient id="mark" x1="55" y1="25" x2="205" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7FF0DE"/>
+      <stop offset="0.48" stop-color="#2AA99B"/>
+      <stop offset="1" stop-color="#D4A94E"/>
+    </linearGradient>
+    <radialGradient id="mist" cx="50%" cy="44%" r="63%">
+      <stop offset="0" stop-color="#214A43"/>
+      <stop offset="1" stop-color="#071514"/>
+    </radialGradient>
+    <filter id="soft" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0.35 0 0 0 0 0.92 0 0 0 0 0.82 0 0 0 0.35 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <rect width="256" height="256" rx="58" fill="url(#mist)"/>
+  <path d="M48 166c18 42 44.7 63 80 63s62-21 80-63" fill="none" stroke="#183A35" stroke-width="35" stroke-linecap="round"/>
+  <g filter="url(#soft)" fill="none" stroke="url(#mark)" stroke-width="21" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="128" cy="55" r="22"/>
+    <path d="M128 78v124"/>
+    <path d="M86 112h84"/>
+    <path d="M55 163c15.2 35.2 39.5 52.8 73 52.8s57.8-17.6 73-52.8"/>
+    <path d="M55 163l38-7"/>
+    <path d="M201 163l-38-7"/>
+  </g>
+  <path d="M155 99h31l-24.5 29h29" fill="none" stroke="#F2D88B" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M81 200c14 10.5 29.7 15.8 47 15.8s33-5.3 47-15.8" fill="none" stroke="#F5E8BD" stroke-width="3" stroke-linecap="round" opacity="0.5"/>
+</svg>

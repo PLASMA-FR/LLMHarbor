@@ -3,39 +3,39 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>FreeLLMAPI — One key. One billion free LLM tokens. Every month.</title>
+<title>LLMHarbor — Drop one anchor. Route every model.</title>
 <meta name="description" content="A self-hosted, OpenAI-compatible proxy that routes across 11 free-tier LLM providers — Gemini, OpenRouter, Cerebras, Groq, Mistral, GitHub Models, SambaNova, Cohere, Cloudflare, Z.ai, NVIDIA. ~1B free tokens / month, 60 models." />
-<meta name="theme-color" content="#0a0a0a" />
-<link rel="canonical" href="https://tashfeenahmed.github.io/freellmapi/" />
+<meta name="theme-color" content="#071514" />
+<link rel="canonical" href="https://tashfeenahmed.github.io/llmharbor/" />
 
 <!-- Open Graph -->
 <meta property="og:type" content="website" />
-<meta property="og:site_name" content="FreeLLMAPI" />
-<meta property="og:title" content="FreeLLMAPI — 1B free LLM tokens / month" />
-<meta property="og:description" content="One self-hosted, OpenAI-compatible proxy across 11 free-tier LLM providers. 60 models. ~1B free tokens per month." />
-<meta property="og:url" content="https://tashfeenahmed.github.io/freellmapi/" />
-<meta property="og:image" content="https://tashfeenahmed.github.io/freellmapi/og.png" />
+<meta property="og:site_name" content="LLMHarbor" />
+<meta property="og:title" content="LLMHarbor — Drop one anchor. Route every model." />
+<meta property="og:description" content="A self-hosted OpenAI-compatible harbor for routing across free-tier LLM providers, with encrypted keys, fallback chains, and local control." />
+<meta property="og:url" content="https://tashfeenahmed.github.io/llmharbor/" />
+<meta property="og:image" content="https://tashfeenahmed.github.io/llmharbor/og.png" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
-<meta property="og:image:alt" content="FreeLLMAPI — 1B free tokens / month, across 11 providers and 60 models." />
+<meta property="og:image:alt" content="LLMHarbor — 1B free tokens / month, across 11 providers and 60 models." />
 
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="FreeLLMAPI — 1B free LLM tokens / month" />
-<meta name="twitter:description" content="One self-hosted, OpenAI-compatible proxy across 11 free-tier LLM providers. 60 models. ~1B free tokens per month." />
-<meta name="twitter:image" content="https://tashfeenahmed.github.io/freellmapi/og.png" />
+<meta name="twitter:title" content="LLMHarbor — Drop one anchor. Route every model." />
+<meta name="twitter:description" content="A self-hosted OpenAI-compatible harbor for routing across free-tier LLM providers, with encrypted keys, fallback chains, and local control." />
+<meta name="twitter:image" content="https://tashfeenahmed.github.io/llmharbor/og.png" />
 <link rel="icon" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%230a0a0a'/%3E%3Ccircle cx='16' cy='16' r='9' fill='%23ffffff'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='%230a0a0a'/%3E%3C/svg%3E" />
 <style>
   :root {
-    --bg: #fafafa;
-    --fg: #0a0a0a;
-    --muted: #6b6b6b;
-    --border: #e5e5e5;
-    --card: #ffffff;
-    --accent: #0a0a0a;
-    --accent-soft: #f0f0f0;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.05);
-    --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.08), 0 24px 56px rgba(0, 0, 0, 0.10);
+    --bg: #F4F1E8;
+    --fg: #071514;
+    --muted: #667A75;
+    --border: #D7E0DA;
+    --card: #F7F1DF;
+    --accent: #2BA89B;
+    --accent-soft: #E9F0EA;
+    --shadow: 0 1px 2px rgba(7, 21, 20, 0.04), 0 8px 24px rgba(7, 21, 20, 0.06);
+    --shadow-lg: 0 4px 12px rgba(7, 21, 20, 0.10), 0 24px 56px rgba(7, 21, 20, 0.14);
     --radius-sm: 12px;
     --radius: 20px;
     --radius-lg: 28px;
@@ -46,7 +46,7 @@
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+    font-family: 'Geist Variable', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
   }
@@ -257,7 +257,7 @@
   }
   .terminal-body .prompt { color: #8fa9ff; user-select: none; margin-right: 10px; }
   .terminal-body .c { color: rgba(255,255,255,0.4); font-style: italic; }
-  .terminal-body .k { color: #ffffff; font-weight: 600; }
+  .terminal-body .k { color: #F7F1DF; font-weight: 600; }
   .terminal-body .s { color: #c0c0c0; }
   .terminal-body .blank { display: block; height: 0.4em; }
 
@@ -277,26 +277,27 @@
     <nav>
       <a class="brand" href="#">
         <span class="brand-mark">
-          <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="16" cy="16" r="11" fill="#ffffff"/>
-            <circle cx="16" cy="16" r="4" fill="#0a0a0a"/>
+          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <defs><linearGradient id="nav-mark" x1="12" y1="6" x2="54" y2="58"><stop offset="0" stop-color="#6FE7D4"/><stop offset=".54" stop-color="#2BA89B"/><stop offset="1" stop-color="#D4A94E"/></linearGradient></defs>
+            <rect width="64" height="64" rx="17" fill="#071514"/>
+            <g fill="none" stroke="url(#nav-mark)" stroke-width="5.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="32" cy="13.5" r="5.5"/><path d="M32 19v31"/><path d="M21.5 28h21"/><path d="M14 40.5c3.8 8.4 9.8 12.6 18 12.6s14.2-4.2 18-12.6"/><path d="M14 40.5l9.5-1.8"/><path d="M50 40.5l-9.5-1.8"/></g>
           </svg>
         </span>
-        <span>FreeLLMAPI</span>
+        <span>LLMHarbor</span>
       </a>
       <div class="nav-links">
         <a href="#providers">Providers</a>
         <a href="#start">Quick start</a>
-        <a href="https://github.com/tashfeenahmed/freellmapi" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/tashfeenahmed/llmharbor" target="_blank" rel="noopener">GitHub</a>
       </div>
     </nav>
 
     <header class="hero">
       <span class="badge"><span class="badge-dot"></span> 60 free models · 11 providers · self-hosted</span>
-      <h1>One key.<br><span class="gradient">One billion</span> free tokens.<br>Every month.</h1>
-      <p class="subtitle">A self-hosted, OpenAI-compatible proxy that routes across every credible free-tier LLM provider. Bring your own keys; we just point requests at whichever provider still has budget left.</p>
+      <h1>Drop one anchor.<br><span class="gradient">Route every model.</span></h1>
+      <p class="subtitle">A local OpenAI-compatible harbor for your provider keys, fallback chain, and free-tier model budget. Bring the keys; LLMHarbor keeps requests moving when one route dries up.</p>
       <div class="cta-row">
-        <a class="btn btn-primary" href="https://github.com/tashfeenahmed/freellmapi" target="_blank" rel="noopener">View on GitHub →</a>
+        <a class="btn btn-primary" href="https://github.com/tashfeenahmed/llmharbor" target="_blank" rel="noopener">View on GitHub →</a>
         <a class="btn btn-secondary" href="#start">Quick start</a>
       </div>
     </header>
@@ -400,11 +401,11 @@
       <div class="terminal">
         <div class="terminal-chrome">
           <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          <span class="filename">~/freellmapi · zsh</span>
+          <span class="filename">~/llmharbor · zsh</span>
         </div>
         <pre class="terminal-body"><span class="c"># 1. clone, install, run</span>
-<span class="prompt">$</span><span class="k">git</span> clone https://github.com/tashfeenahmed/freellmapi.git
-<span class="prompt">$</span><span class="k">cd</span> freellmapi
+<span class="prompt">$</span><span class="k">git</span> clone https://github.com/tashfeenahmed/llmharbor.git
+<span class="prompt">$</span><span class="k">cd</span> llmharbor
 <span class="prompt">$</span>npm install <span class="k">&amp;&amp;</span> npm run dev
 <span class="blank"></span>
 <span class="c"># 2. open http://localhost:3001 — paste keys in the UI</span>
@@ -417,7 +418,7 @@
     </section>
 
     <footer>
-      <p>FreeLLMAPI — open source, self-hosted, single-user. <a href="https://github.com/tashfeenahmed/freellmapi" target="_blank" rel="noopener">github.com/tashfeenahmed/freellmapi</a></p>
+      <p>LLMHarbor — open source, self-hosted, single-user. <a href="https://github.com/tashfeenahmed/llmharbor" target="_blank" rel="noopener">github.com/tashfeenahmed/llmharbor</a></p>
       <p style="margin-top: 6px; opacity: 0.7;">Built for personal use only. Each provider's ToS applies — don't expose this proxy publicly.</p>
     </footer>
   </div>
