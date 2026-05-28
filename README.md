@@ -19,6 +19,8 @@
     <a href="#screenshots">Screenshots</a> ·
     <a href="#using-the-api">API</a> ·
     <a href="#supported-providers">Providers</a> ·
+    <a href="#bulk-import-provider-keys">Bulk import</a> ·
+    <a href="https://plasma-fr.github.io/LLMHarbor/">Website</a> ·
     <a href="#contributing">Contributing</a>
   </p>
 </div>
@@ -227,6 +229,8 @@ http://localhost:3001
 Then:
 
 1. Go to **Keys** and add provider keys or a custom endpoint.
+   - For one key, paste it into **Add a provider key**.
+   - For many keys, use **Bulk import provider keys** with a `.txt` file: one key per line. The provider id follows the visible list, so Google is `1`, Groq is `2`, and custom providers continue after built-ins.
 2. Go to **Models** and probe the models you want to use.
 3. Go to **Fallback** and order the route list.
 4. Create or copy a client API key from **Keys**.
@@ -275,6 +279,27 @@ curl http://localhost:3001/v1/chat/completions \
     "model": "auto",
     "messages": [{"role": "user", "content": "hi"}]
   }'
+```
+
+### Bulk import provider keys
+
+If you have a batch of provider credentials, create a plain text file with one key per line:
+
+```txt
+key-one
+key-two
+# comments and blank lines are ignored
+key-three
+```
+
+Open **Keys → Bulk import provider keys**, choose the provider id, upload the file, and import. Provider ids are based on the visible provider order: Google is `1`, Groq is `2`, and custom endpoints continue after the built-ins. Cloudflare lines should use the same stored shape as the single-key form: `account_id:api_token`.
+
+The same flow is available through the local control-plane API:
+
+```bash
+curl http://127.0.0.1:3001/api/keys/import \
+  -H "Content-Type: application/json" \
+  -d '{"providerId":1,"contents":"key-one\nkey-two","labelPrefix":"Google batch"}'
 ```
 
 ### Streaming

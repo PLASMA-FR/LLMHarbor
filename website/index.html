@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLMHarbor - local OpenAI-compatible routing for every model key</title>
+  <meta name="description" content="LLMHarbor is a self-hosted OpenAI-compatible LLM router with fallback routing, provider key management, analytics, and a practical local dashboard." />
+  <meta property="og:title" content="LLMHarbor" />
+  <meta property="og:description" content="One local OpenAI-compatible harbor for provider keys, model fallback, analytics, and safer routing." />
+  <meta property="og:type" content="website" />
+  <link rel="icon" href="./assets/logo.svg" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <a class="skip" href="#docs">Skip to docs</a>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="LLMHarbor home">
+      <img src="./assets/logo.svg" alt="" />
+      <span>LLMHarbor</span>
+    </a>
+    <nav aria-label="Primary">
+      <a href="#why">Why</a>
+      <a href="#features">Features</a>
+      <a href="#docs">Docs</a>
+      <a href="#importer">Bulk import</a>
+      <a href="https://github.com/PLASMA-FR/LLMHarbor">GitHub</a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero section-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">Self-hosted · local-first · OpenAI compatible</p>
+        <h1>Bring every LLM key into one quiet harbor.</h1>
+        <p class="lead">LLMHarbor sits between your apps and model providers. Add provider keys, choose fallback order, watch traffic, and keep one stable OpenAI-compatible endpoint for your agents, editors, and experiments.</p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Install in one command</a>
+          <a class="button" href="#docs">Read the docs</a>
+        </div>
+        <div class="install-card" id="install">
+          <span>Install</span>
+          <code>curl -fsSL https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install.sh | bash</code>
+          <button type="button" data-copy="curl -fsSL https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install.sh | bash">Copy</button>
+        </div>
+      </div>
+
+      <div class="pitch-wrap" aria-label="Animated LLMHarbor routing scene">
+        <div class="pitch-scene">
+          <div class="water water-a"></div>
+          <div class="water water-b"></div>
+          <div class="harbor-base"></div>
+          <div class="anchor-model">
+            <div class="anchor-ring"></div>
+            <div class="anchor-stem"></div>
+            <div class="anchor-cross"></div>
+            <div class="anchor-left"></div>
+            <div class="anchor-right"></div>
+          </div>
+          <div class="route route-one"><span></span></div>
+          <div class="route route-two"><span></span></div>
+          <div class="route route-three"><span></span></div>
+          <div class="provider provider-a">Google</div>
+          <div class="provider provider-b">Groq</div>
+          <div class="provider provider-c">Mistral</div>
+          <div class="client-node">Your app</div>
+        </div>
+        <p class="scene-caption">A small local control plane routes requests to healthy providers, rotates keys, and falls back without changing your client code.</p>
+      </div>
+    </section>
+
+    <section class="trust-strip" aria-label="Project highlights">
+      <div><strong>OpenAI-compatible</strong><span>/v1/chat/completions</span></div>
+      <div><strong>Local by default</strong><span>127.0.0.1 control plane</span></div>
+      <div><strong>Provider-aware</strong><span>health, fallback, limits</span></div>
+      <div><strong>No lock-in</strong><span>plain Node, SQLite, React</span></div>
+    </section>
+
+    <section id="why" class="section-grid split">
+      <div>
+        <p class="eyebrow">Why it exists</p>
+        <h2>Model access is messy. Your apps should not care.</h2>
+      </div>
+      <div class="body-copy">
+        <p>Most AI tools want one base URL and one API key. Real life is different: Google has a Gemini format, Groq and Mistral are OpenAI-compatible, Cloudflare needs account-scoped keys, local servers move around, and free tiers get rate-limited.</p>
+        <p>LLMHarbor gives you one stable local endpoint while it handles provider credentials, model registration, fallback order, health checks, and request analytics behind the scenes.</p>
+      </div>
+    </section>
+
+    <section id="features" class="feature-grid">
+      <article><span>01</span><h3>One client key</h3><p>Create revocable <code>llmharbor-*</code> keys for apps and agents without exposing upstream provider credentials.</p></article>
+      <article><span>02</span><h3>Provider key vault</h3><p>Add Google, Groq, Mistral, OpenRouter, Cloudflare, NVIDIA, HuggingFace, and custom OpenAI-compatible endpoints.</p></article>
+      <article><span>03</span><h3>Fallback routing</h3><p>Order models by preference. The router skips unhealthy, disabled, rate-limited, and incompatible routes.</p></article>
+      <article><span>04</span><h3>Bulk imports</h3><p>Drop a text file with one key per line and import an entire batch into the provider id you choose.</p></article>
+      <article><span>05</span><h3>Live checks</h3><p>Probe provider credentials and models before sending production traffic through them.</p></article>
+      <article><span>06</span><h3>Readable analytics</h3><p>See model usage, latency, error reasons, and traffic patterns from a local dashboard.</p></article>
+    </section>
+
+    <section id="importer" class="callout section-grid">
+      <div>
+        <p class="eyebrow">New workflow</p>
+        <h2>Bulk API key importer</h2>
+        <p>Open Keys, pick the provider id, upload a <code>.txt</code> file, and LLMHarbor creates one stored credential per non-empty line. Google is provider id <strong>1</strong>; the rest follow the on-screen provider list, including custom endpoints.</p>
+      </div>
+      <div class="code-panel">
+        <p>keys.txt</p>
+        <pre><code>AIzaSy...one
+AIzaSy...two
+# comments are ignored
+AIzaSy...three</code></pre>
+        <p>API shape</p>
+        <pre><code>POST /api/keys/import
+{
+  "providerId": 1,
+  "contents": "key-one\nkey-two",
+  "labelPrefix": "Google batch"
+}</code></pre>
+      </div>
+    </section>
+
+    <section id="docs" class="docs-shell">
+      <aside class="docs-nav" aria-label="Documentation sections">
+        <a href="#quickstart">Quickstart</a>
+        <a href="#concepts">Concepts</a>
+        <a href="#providers">Providers</a>
+        <a href="#routing">Routing</a>
+        <a href="#api">API reference</a>
+        <a href="#security">Security</a>
+        <a href="#ops">Operations</a>
+      </aside>
+      <div class="docs-content">
+        <p class="eyebrow">Full docs</p>
+        <h2>Run, configure, and operate LLMHarbor</h2>
+
+        <article id="quickstart" class="doc-section">
+          <h3>Quickstart</h3>
+          <ol>
+            <li>Install with the curl command above.</li>
+            <li>Start the app with <code>llmharbor start</code> or run from the repo with <code>npm run dev</code>.</li>
+            <li>Open the local dashboard and create a client key on the Keys page.</li>
+            <li>Add at least one provider key, then run Check all.</li>
+            <li>Point any OpenAI-compatible client at <code>http://127.0.0.1:3001/v1</code>.</li>
+          </ol>
+          <pre><code>curl http://127.0.0.1:3001/v1/chat/completions -H Authorization:Bearer-llmharbor-key -H Content-Type:application/json -d '{&quot;model&quot;:&quot;auto&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hello&quot;}]}'</code></pre>
+        </article>
+
+        <article id="concepts" class="doc-section">
+          <h3>Core concepts</h3>
+          <dl>
+            <dt>Client API keys</dt><dd>Keys used by your apps to call LLMHarbor. They are separate from provider credentials and can be revoked independently.</dd>
+            <dt>Provider keys</dt><dd>Encrypted upstream credentials for Google, Groq, Mistral, OpenRouter, custom endpoints, and other providers.</dd>
+            <dt>Models</dt><dd>Provider model rows with limits, context windows, display names, and routing metadata.</dd>
+            <dt>Fallback chain</dt><dd>The ordered list used when <code>model: auto</code> or a requested model needs a healthy backup.</dd>
+          </dl>
+        </article>
+
+        <article id="providers" class="doc-section">
+          <h3>Providers and custom endpoints</h3>
+          <p>Built-in providers appear first in the Keys and Models pages. Custom OpenAI-compatible endpoints can be added from Keys and then populated with models from Models. Provider ids used by bulk import match this same visible order.</p>
+          <ul class="pill-list"><li>Google</li><li>Groq</li><li>Cerebras</li><li>SambaNova</li><li>NVIDIA</li><li>Mistral</li><li>OpenRouter</li><li>GitHub Models</li><li>Cohere</li><li>Cloudflare</li><li>Zhipu</li><li>Ollama</li><li>Kilo Gateway</li><li>Pollinations</li><li>LLM7</li><li>HuggingFace</li><li>Custom</li></ul>
+        </article>
+
+        <article id="routing" class="doc-section">
+          <h3>Routing and fallback</h3>
+          <p>LLMHarbor routes requests through enabled models with healthy credentials. The fallback page lets you reorder priorities, pause rows, and shape the model chain. The router tracks provider errors and avoids wasting calls on disabled or unhealthy routes.</p>
+        </article>
+
+        <article id="api" class="doc-section">
+          <h3>API reference</h3>
+          <div class="api-list">
+            <div><code>GET /api/ping</code><span>Public liveness check.</span></div>
+            <div><code>GET /api/keys</code><span>List masked provider credentials.</span></div>
+            <div><code>POST /api/keys</code><span>Add one provider credential.</span></div>
+            <div><code>GET /api/keys/providers</code><span>List provider ids for bulk import.</span></div>
+            <div><code>POST /api/keys/import</code><span>Import provider credentials from text lines.</span></div>
+            <div><code>GET /api/endpoints</code><span>List built-in and custom endpoints.</span></div>
+            <div><code>POST /v1/chat/completions</code><span>OpenAI-compatible chat completions proxy.</span></div>
+          </div>
+        </article>
+
+        <article id="security" class="doc-section">
+          <h3>Security model</h3>
+          <p>The dashboard/control-plane API is loopback-only by default. Provider keys are encrypted before storage and never returned in plaintext from listing endpoints. Do not expose the server directly to the public internet; if you bind to <code>0.0.0.0</code>, put it behind your own VPN, firewall, reverse proxy, and authentication layer.</p>
+        </article>
+
+        <article id="ops" class="doc-section">
+          <h3>Operations</h3>
+          <ul>
+            <li>Use <code>HOST=127.0.0.1</code> for local-only operation.</li>
+            <li>Use <code>PORT=3001</code> or another valid port between 1 and 65535.</li>
+            <li>Run <code>npm test</code>, <code>npm run build</code>, and <code>npm audit</code> before deploying changes.</li>
+            <li>Back up the SQLite database if you rely on stored provider credentials.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div><strong>LLMHarbor</strong><span>Local routing for practical model work.</span></div>
+    <a href="https://github.com/PLASMA-FR/LLMHarbor">GitHub</a>
+  </footer>
+
+  <script src="./script.js"></script>
+</body>
+</html>

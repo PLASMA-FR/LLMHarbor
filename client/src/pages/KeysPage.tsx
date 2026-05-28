@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -70,6 +70,21 @@ interface ClientApiKey {
   enabled: boolean
   createdAt: string
   lastUsedAt: string | null
+}
+
+interface ProviderImportTarget {
+  providerId: number
+  platform: string
+  name: string
+}
+
+interface BulkImportResult {
+  providerId: number
+  platform: string
+  providerName: string
+  attempted: number
+  imported: number
+  skipped: number
 }
 
 function ClientKeysSection() {
@@ -219,6 +234,12 @@ export default function KeysPage() {
   const [label, setLabel] = useState('')
   const [endpointName, setEndpointName] = useState('')
   const [endpointBaseUrl, setEndpointBaseUrl] = useState('')
+  const [importProviderId, setImportProviderId] = useState('')
+  const [importLabelPrefix, setImportLabelPrefix] = useState('')
+  const [importContents, setImportContents] = useState('')
+  const [importFileName, setImportFileName] = useState('')
+  const [lastImport, setLastImport] = useState<BulkImportResult | null>(null)
+  const importFileRef = useRef<HTMLInputElement | null>(null)
 
   const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
@@ -236,6 +257,11 @@ export default function KeysPage() {
     queryFn: () => apiFetch('/api/endpoints'),
   })
 
+  const { data: providerTargets = [] } = useQuery<ProviderImportTarget[]>({
+    queryKey: ['key-import-providers'],
+    queryFn: () => apiFetch('/api/keys/providers'),
+  })
+
   const customEndpoints = endpoints.filter(endpoint => endpoint.custom)
 
   const addEndpoint = useMutation({
@@ -243,6 +269,7 @@ export default function KeysPage() {
       apiFetch<EndpointSummary>('/api/endpoints', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      queryClient.invalidateQueries({ queryKey: ['key-import-providers'] })
       setEndpointName('')
       setEndpointBaseUrl('')
     },
@@ -252,6 +279,7 @@ export default function KeysPage() {
     mutationFn: (endpointPlatform: string) => apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      queryClient.invalidateQueries({ queryKey: ['key-import-providers'] })
       queryClient.invalidateQueries({ queryKey: ['keys'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
     },
@@ -308,6 +336,26 @@ export default function KeysPage() {
     },
   })
 
+  const bulkImport = useMutation({
+    mutationFn: () => apiFetch<BulkImportResult>('/api/keys/import', {
+      method: 'POST',
+      body: JSON.stringify({
+        providerId: Number(importProviderId),
+        contents: importContents,
+        labelPrefix: importLabelPrefix || undefined,
+      }),
+    }),
+    onSuccess: (result) => {
+      setLastImport(result)
+      setImportContents('')
+      setImportFileName('')
+      if (importFileRef.current) importFileRef.current.value = ''
+      queryClient.invalidateQueries({ queryKey: ['keys'] })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    },
+  })
+
   const allPlatforms = endpoints.length > 0
     ? endpoints.map(endpoint => ({ value: endpoint.platform as Platform, label: endpoint.custom ? `${endpoint.name} (custom)` : endpoint.name }))
     : BUILT_IN_PLATFORMS
@@ -320,6 +368,15 @@ export default function KeysPage() {
     const key = needsAccountId ? `${accountId}:${apiKey}` : apiKey
     addKey.mutate({ platform, key, label: label || undefined })
   }
+
+  const handleImportFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setImportFileName(file.name)
+    setImportContents(await file.text())
+  }
+
+  const selectedImportTarget = providerTargets.find(target => String(target.providerId) === importProviderId)
 
   const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null }>()
   for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
@@ -424,6 +481,67 @@ export default function KeysPage() {
             </Button>
           </form>
           {addKey.isError && <p className="mt-3 text-xs text-destructive">{(addKey.error as Error).message}</p>}
+        </section>
+
+        <section className="panel-card rounded-2xl p-5 sm:p-6">
+          <SectionTitle
+            title="Bulk import provider keys"
+            description="Upload a .txt file with one key per line. Select the numbered provider target first — Google is 1, Groq is 2, and custom providers continue after the built-ins. Blank lines and # comments are ignored."
+          />
+          <div className="grid gap-3 lg:grid-cols-[240px_1fr_180px_auto] lg:items-end">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Provider ID</Label>
+              <Select value={importProviderId} onValueChange={(value) => setImportProviderId(value ?? '')}>
+                <SelectTrigger className="h-10 rounded-2xl bg-background">
+                  <SelectValue placeholder="Choose ID" />
+                </SelectTrigger>
+                <SelectContent>
+                  {providerTargets.map(target => (
+                    <SelectItem key={target.providerId} value={String(target.providerId)}>
+                      {target.providerId}. {target.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">TXT file</Label>
+              <Input ref={importFileRef} type="file" accept=".txt,text/plain" onChange={handleImportFile} className="h-10 rounded-2xl bg-background text-xs file:mr-3 file:rounded-xl file:border-0 file:bg-muted file:px-3 file:py-1 file:text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Label prefix</Label>
+              <Input value={importLabelPrefix} onChange={e => setImportLabelPrefix(e.target.value)} placeholder="optional" className="h-10 rounded-2xl bg-background" />
+            </div>
+            <Button
+              type="button"
+              size="lg"
+              className="rounded-2xl"
+              disabled={!importProviderId || !importContents || bulkImport.isPending}
+              onClick={() => bulkImport.mutate()}
+            >
+              {bulkImport.isPending ? 'Importing...' : 'Import keys'}
+            </Button>
+          </div>
+          <div className="mt-4 grid gap-3 text-xs sm:grid-cols-3">
+            <div className="rounded-2xl bg-card px-3 py-2">
+              <span className="block text-muted-foreground">Selected target</span>
+              <span className="mt-0.5 block font-medium">{selectedImportTarget ? `${selectedImportTarget.providerId}. ${selectedImportTarget.name}` : 'Pick a provider id'}</span>
+            </div>
+            <div className="rounded-2xl bg-card px-3 py-2">
+              <span className="block text-muted-foreground">File</span>
+              <span className="mt-0.5 block truncate font-medium">{importFileName || 'No file selected'}</span>
+            </div>
+            <div className="rounded-2xl bg-card px-3 py-2">
+              <span className="block text-muted-foreground">Lines ready</span>
+              <span className="mt-0.5 block font-medium tabular-nums">{importContents.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#')).length}</span>
+            </div>
+          </div>
+          {lastImport && (
+            <p className="mt-3 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-100">
+              Imported {lastImport.imported} key{lastImport.imported === 1 ? '' : 's'} for {lastImport.providerName}; skipped {lastImport.skipped} duplicate{lastImport.skipped === 1 ? '' : 's'}.
+            </p>
+          )}
+          {bulkImport.isError && <p className="mt-3 text-xs text-destructive">{(bulkImport.error as Error).message}</p>}
         </section>
 
         <section>

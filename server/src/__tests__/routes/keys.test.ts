@@ -97,4 +97,37 @@ describe('Keys API', () => {
     const { status } = await request(app, 'DELETE', '/api/keys/99999');
     expect(status).toBe(404);
   });
+
+  it('POST /api/keys/import adds one provider key per non-empty line using provider list id', async () => {
+    const imported = await request(app, 'POST', '/api/keys/import', {
+      providerId: 1,
+      contents: 'google-key-one\n\n google-key-two \n# comment\ngoogle-key-one\n',
+      labelPrefix: 'Studio batch',
+    });
+
+    expect(imported.status).toBe(201);
+    expect(imported.body).toMatchObject({
+      platform: 'google',
+      providerId: 1,
+      attempted: 3,
+      imported: 2,
+      skipped: 1,
+    });
+    expect(imported.body.keys).toHaveLength(2);
+    expect(imported.body.keys[0].label).toBe('Studio batch 1');
+    expect(imported.body.keys[0].maskedKey).not.toContain('google-key-one');
+
+    const listed = await request(app, 'GET', '/api/keys');
+    expect(listed.body.filter((key: any) => key.platform === 'google')).toHaveLength(2);
+  });
+
+  it('POST /api/keys/import rejects unknown provider list ids', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys/import', {
+      providerId: 999,
+      contents: 'key-one',
+    });
+
+    expect(status).toBe(400);
+    expect(body.error.message).toContain('Unknown provider id');
+  });
 });
