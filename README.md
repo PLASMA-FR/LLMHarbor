@@ -145,7 +145,17 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 - npm
 - A provider API key, or a local OpenAI-compatible endpoint to add later
 
-### Install
+### One-line install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install.sh | bash
+llmharbor start
+llmharbor open
+```
+
+The installer clones the repo to `~/.llmharbor/app`, creates a local `.env` with a fresh encryption key, installs dependencies, builds the production app, and links `llmharbor` into `~/.local/bin`.
+
+### Manual install
 
 ```bash
 git clone https://github.com/PLASMA-FR/LLMHarbor.git
@@ -166,10 +176,24 @@ Start the server and dashboard together:
 npm run dev
 ```
 
-Open the dashboard:
+Or use the bundled command line:
+
+```bash
+./bin/llmharbor install
+./bin/llmharbor start
+./bin/llmharbor open
+```
+
+Open the dev dashboard:
 
 ```txt
 http://localhost:5173
+```
+
+Production runs on:
+
+```txt
+http://localhost:3001
 ```
 
 Then:
@@ -364,6 +388,18 @@ npm run build -w client
 npm run test -w server
 ```
 
+CLI commands:
+
+```bash
+./bin/llmharbor doctor   # check git, node, npm, curl, .env, and build output
+./bin/llmharbor install  # install dependencies, create .env, and build
+./bin/llmharbor start    # run production server in the background
+./bin/llmharbor status   # show process and health-check status
+./bin/llmharbor logs     # follow server logs
+./bin/llmharbor stop     # stop the background server
+./bin/llmharbor update   # git pull, rebuild, and restart if running
+```
+
 Before opening a PR:
 
 ```bash
@@ -384,8 +420,10 @@ LLMHarbor/
     src/routes/         API routes
     src/services/       Router, health checks, rate limiter
   shared/               Shared TypeScript types
+  bin/                  LLMHarbor command line
   docs/                 Logo, Open Graph assets, generated docs assets
   repo-assets/          README screenshots
+  install.sh            Curl-friendly installer script
 ```
 
 ## Environment

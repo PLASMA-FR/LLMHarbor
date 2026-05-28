@@ -1,6 +1,9 @@
 {
   "name": "llmharbor",
   "private": true,
+  "bin": {
+    "llmharbor": "./bin/llmharbor"
+  },
   "workspaces": [
     "shared",
     "server",

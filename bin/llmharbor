@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="LLMHarbor"
+DEFAULT_PORT="3001"
+
+log() {
+  printf '%s\n' "$*" >&2
+}
+
+fail() {
+  log "Error: $*"
+  exit 1
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]}"
+  while [ -L "$source" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd
+}
+
+SCRIPT_DIR="$(resolve_script_path)"
+PROJECT_ROOT="${LLMHARBOR_HOME:-$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)}"
+STATE_DIR="$PROJECT_ROOT/.llmharbor"
+PID_FILE="$STATE_DIR/llmharbor.pid"
+LOG_FILE="$STATE_DIR/llmharbor.log"
+
+usage() {
+  cat <<'EOF'
+LLMHarbor command line
+
+Usage:
+  llmharbor <command> [options]
+
+Commands:
+  install       Install npm dependencies, create .env, and build production assets
+  dev           Run the API and dashboard in development mode
+  start         Start the production server in the background
+  stop          Stop the background production server
+  restart       Restart the background production server
+  status        Show process and health-check status
+  logs          Follow background server logs
+  update        Pull latest git changes, rebuild, and restart if already running
+  open          Open the dashboard in your browser
+  url           Print dashboard and OpenAI-compatible API URLs
+  doctor        Check local prerequisites
+  help          Show this help
+
+Environment:
+  LLMHARBOR_HOME=/path/to/LLMHarbor   Override project directory
+  PORT=3001                           Override server port for this invocation
+EOF
+}
+
+cd_project() {
+  [[ -d "$PROJECT_ROOT" ]] || fail "Project directory not found: $PROJECT_ROOT"
+  cd "$PROJECT_ROOT"
+}
+
+require_cmd() {
+  command_exists "$1" || fail "Missing required command: $1"
+}
+
+read_env_value() {
+  local key="$1"
+  local file="$PROJECT_ROOT/.env"
+  [[ -f "$file" ]] || return 1
+  grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2- || return 1
+}
+
+current_port() {
+  if [[ -n "${PORT:-}" ]]; then
+    printf '%s\n' "$PORT"
+  else
+    read_env_value PORT 2>/dev/null || printf '%s\n' "$DEFAULT_PORT"
+  fi
+}
+
+make_encryption_key() {
+  node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))'
+}
+
+ensure_env() {
+  cd_project
+  require_cmd node
+
+  if [[ ! -f .env ]]; then
+    cp .env.example .env
+  fi
+
+  if ! grep -Eq '^ENCRYPTION_KEY=[0-9a-fA-F]{64}$' .env; then
+    local key tmp
+    key="$(make_encryption_key)"
+    tmp="$(mktemp)"
+    if grep -q '^ENCRYPTION_KEY=' .env; then
+      sed "s/^ENCRYPTION_KEY=.*/ENCRYPTION_KEY=$key/" .env > "$tmp"
+    else
+      cat .env > "$tmp"
+      printf '\nENCRYPTION_KEY=%s\n' "$key" >> "$tmp"
+    fi
+    mv "$tmp" .env
+    log "Created a local ENCRYPTION_KEY in .env"
+  fi
+}
+
+install_app() {
+  cd_project
+  require_cmd node
+  require_cmd npm
+  ensure_env
+  npm install
+  npm run build
+  mkdir -p "$STATE_DIR"
+  log "$APP_NAME is installed. Run: llmharbor start"
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(<"$PID_FILE")"
+  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+start_app() {
+  cd_project
+  require_cmd node
+  require_cmd npm
+  ensure_env
+  mkdir -p "$STATE_DIR"
+
+  if is_running; then
+    log "$APP_NAME is already running with PID $(<"$PID_FILE")"
+    return 0
+  fi
+
+  if [[ ! -f server/dist/index.js || ! -f client/dist/index.html ]]; then
+    log "Production build not found. Building first..."
+    npm run build
+  fi
+
+  local port
+  port="$(current_port)"
+  : > "$LOG_FILE"
+  PORT="$port" NODE_ENV=production nohup node server/dist/index.js >> "$LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" > "$PID_FILE"
+
+  sleep 1
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    rm -f "$PID_FILE"
+    log "Startup failed. Last logs:"
+    tail -n 40 "$LOG_FILE" >&2 || true
+    exit 1
+  fi
+
+  log "$APP_NAME started on http://localhost:$port with PID $pid"
+}
+
+stop_app() {
+  if ! is_running; then
+    rm -f "$PID_FILE"
+    log "$APP_NAME is not running"
+    return 0
+  fi
+
+  local pid
+  pid="$(<"$PID_FILE")"
+  kill "$pid" >/dev/null 2>&1 || true
+
+  for _ in {1..20}; do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      rm -f "$PID_FILE"
+      log "$APP_NAME stopped"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  kill -9 "$pid" >/dev/null 2>&1 || true
+  rm -f "$PID_FILE"
+  log "$APP_NAME stopped forcefully"
+}
+
+status_app() {
+  cd_project
+  local port url
+  port="$(current_port)"
+  url="http://localhost:$port/api/ping"
+
+  if is_running; then
+    printf 'Process: running, PID %s\n' "$(<"$PID_FILE")"
+  else
+    printf 'Process: stopped\n'
+  fi
+
+  if command_exists curl && curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+    printf 'Health:  ok (%s)\n' "$url"
+  else
+    printf 'Health:  unavailable (%s)\n' "$url"
+  fi
+
+  printf 'Home:    %s\n' "$PROJECT_ROOT"
+  printf 'Logs:    %s\n' "$LOG_FILE"
+}
+
+show_logs() {
+  mkdir -p "$STATE_DIR"
+  touch "$LOG_FILE"
+  tail -n 120 -f "$LOG_FILE"
+}
+
+update_app() {
+  cd_project
+  require_cmd git
+  local was_running=false
+  if is_running; then
+    was_running=true
+  fi
+
+  git pull --ff-only
+  install_app
+
+  if [[ "$was_running" == "true" ]]; then
+    stop_app
+    start_app
+  fi
+}
+
+open_app() {
+  local port url
+  port="$(current_port)"
+  url="http://localhost:$port"
+
+  if command_exists xdg-open; then
+    xdg-open "$url" >/dev/null 2>&1 &
+  elif command_exists open; then
+    open "$url" >/dev/null 2>&1 &
+  else
+    printf '%s\n' "$url"
+    return 0
+  fi
+
+  log "Opened $url"
+}
+
+print_urls() {
+  local port
+  port="$(current_port)"
+  printf 'Dashboard: %s\n' "http://localhost:$port"
+  printf 'API base:  %s\n' "http://localhost:$port/v1"
+  printf 'Chat:      %s\n' "http://localhost:$port/v1/chat/completions"
+}
+
+doctor() {
+  cd_project
+  local failed=false
+  for cmd in git node npm curl; do
+    if command_exists "$cmd"; then
+      printf 'ok   %s: %s\n' "$cmd" "$(command -v "$cmd")"
+    else
+      printf 'miss %s\n' "$cmd"
+      failed=true
+    fi
+  done
+
+  if [[ -f .env ]]; then
+    printf 'ok   .env\n'
+  else
+    printf 'miss .env (run: llmharbor install)\n'
+  fi
+
+  if [[ -f server/dist/index.js && -f client/dist/index.html ]]; then
+    printf 'ok   production build\n'
+  else
+    printf 'miss production build (run: llmharbor install)\n'
+  fi
+
+  [[ "$failed" == "false" ]] || exit 1
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  install) install_app "$@" ;;
+  dev) cd_project; ensure_env; npm run dev "$@" ;;
+  start) start_app "$@" ;;
+  stop) stop_app "$@" ;;
+  restart) stop_app; start_app "$@" ;;
+  status) status_app "$@" ;;
+  logs) show_logs "$@" ;;
+  update) update_app "$@" ;;
+  open) open_app "$@" ;;
+  url|urls) print_urls "$@" ;;
+  doctor) doctor "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; fail "Unknown command: $cmd" ;;
+esac
