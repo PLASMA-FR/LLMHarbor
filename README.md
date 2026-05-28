@@ -1,132 +1,199 @@
 <div align="center">
+  <img src="docs/logo.svg" alt="LLMHarbor anchor logo" width="110" height="110" />
 
-<img src="docs/logo.svg" alt="LLMHarbor anchor logo" width="96" height="96" />
+  # LLMHarbor
 
-# LLMHarbor
+  **Drop one anchor. Route every model.**
 
-**Drop one anchor. Route every model.**
+  A self-hosted OpenAI-compatible router for free-tier and local LLM endpoints. Add your provider keys once, get one local API key, and let LLMHarbor route requests across the models that still have budget left.
 
-One OpenAI-compatible endpoint aggregates the free tiers from Google, Groq, Cerebras, SambaNova, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, and Z.ai (Zhipu). Provider keys stay encrypted. The router picks the best available model for each request, falls over when a provider is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
+  <p>
+    <a href="https://github.com/PLASMA-FR/LLMHarbor/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/PLASMA-FR/LLMHarbor/ci.yml?branch=main&label=tests&style=for-the-badge"></a>
+    <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-204b46?style=for-the-badge"></a>
+    <img alt="Node 20+" src="https://img.shields.io/badge/node-20%2B-2f6f68?style=for-the-badge">
+    <img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI-compatible-163c38?style=for-the-badge">
+  </p>
 
-[![CI](https://github.com/tashfeenahmed/llmharbor/actions/workflows/ci.yml/badge.svg)](https://github.com/tashfeenahmed/llmharbor/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
-
-![Fallback chain with per-provider token budget](repo-assets/fallback-chain.png)
-
+  <p>
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#screenshots">Screenshots</a> ·
+    <a href="#using-the-api">API</a> ·
+    <a href="#supported-providers">Providers</a> ·
+    <a href="#contributing">Contributing</a>
+  </p>
 </div>
 
----
+<p align="center">
+  <img src="repo-assets/playground.png" alt="LLMHarbor playground dashboard" width="920" />
+</p>
 
-## Contents
+## What is LLMHarbor?
 
-- [Why this exists](#why-this-exists)
-- [Supported providers](#supported-providers)
-- [Features](#features)
-- [Not yet supported](#not-yet-supported)
-- [Quick start](#quick-start)
-- [Using the API](#using-the-api)
-- [Screenshots](#screenshots)
-- [How it works](#how-it-works)
-- [Limitations](#limitations)
-- [Contributing](#contributing)
-- [Terms of Service review](#terms-of-service-review)
-- [Disclaimer](#disclaimer)
+LLMHarbor is a local control plane for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: encrypted provider keys, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, and request analytics.
 
-## Why this exists
+Use it when you want one stable local endpoint for experiments, coding agents, small tools, and personal workflows without wiring every provider into every app.
 
-Every serious AI lab now offers a free tier — a few million tokens a month, a few thousand requests a day. On its own each tier is a toy. Stacked together, they add up to roughly **1.3 billion tokens per month** of working inference capacity, across dozens of models from small-and-fast to reasonably capable.
+```txt
+Your app / OpenAI SDK
+        |
+        |  Bearer llmharbor-...
+        v
+LLMHarbor local proxy
+        |
+        |  chooses a healthy model under quota
+        v
+Google · Groq · Cerebras · Mistral · OpenRouter · Cloudflare · Ollama · Custom endpoints
+```
 
-The problem is that stacking them by hand is painful: fourteen different SDKs, fourteen different rate limits, fourteen places a request can fail. LLMHarbor collapses that into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
+## Why it exists
+
+Free tiers are useful, but they are scattered. Each provider has its own key, model list, rate limit, streaming quirks, error format, and tool-call behavior. One provider fails with a 429. Another times out. A third changes the model ID you were using.
+
+LLMHarbor puts a harbor in front of that traffic.
+
+- One local OpenAI-compatible base URL.
+- One unified API key for your clients.
+- Many upstream providers behind it.
+- A fallback chain you can inspect and reorder.
+- A dashboard that shows what happened after each request.
+
+It is not meant to sell free tiers as production infrastructure. It is meant to make personal routing sane.
+
+## Highlights
+
+| Area | What LLMHarbor does |
+|---|---|
+| OpenAI compatibility | `POST /v1/chat/completions` and `GET /v1/models` work with OpenAI-style SDKs and clients. |
+| Auto routing | Use `model: "auto"` and let the router choose the highest-priority healthy model under quota. |
+| Fallbacks | On 429, 5xx, timeout, or provider failure, LLMHarbor cools that key down and tries the next enabled route. |
+| Streaming | Server-Sent Events are supported for `stream: true`. |
+| Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
+| Key storage | Provider keys are encrypted with AES-256-GCM before they are written to SQLite. |
+| Rate tracking | RPM, RPD, TPM, and TPD counters are tracked per provider, model, and key. |
+| Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
+| Custom providers | Add any OpenAI-compatible endpoint from the dashboard. Local vLLM, Ollama-compatible gateways, OpenCode Zen, and private gateways fit here. |
+| Model probes | Test whether a model works before putting traffic on it. |
+| Analytics | Track request count, success rate, latency, token use, provider split, model split, and recent failures. |
+
+## Screenshots
+
+### Playground
+
+Send a request through the router, inspect the routed provider, and see latency without leaving the dashboard.
+
+<p align="center">
+  <img src="repo-assets/playground.png" alt="LLMHarbor playground page" width="920" />
+</p>
+
+### Keys
+
+Store provider credentials, copy your unified API key, check health, and manage custom OpenAI-compatible endpoints.
+
+<p align="center">
+  <img src="repo-assets/keys.png" alt="LLMHarbor keys page" width="920" />
+</p>
+
+### Models
+
+Register built-in and custom endpoint models, probe live credentials, and keep model context defaults with the provider.
+
+<p align="center">
+  <img src="repo-assets/models.png" alt="LLMHarbor models page" width="920" />
+</p>
+
+### Fallback chain
+
+Reorder the route list, toggle models on or off, and choose presets for quality, speed, or remaining budget.
+
+<p align="center">
+  <img src="repo-assets/fallback.png" alt="LLMHarbor fallback chain page" width="920" />
+</p>
+
+### Analytics
+
+See traffic, latency, tokens, estimated savings, model breakdowns, and provider errors.
+
+<p align="center">
+  <img src="repo-assets/analytics.png" alt="LLMHarbor analytics page" width="920" />
+</p>
 
 ## Supported providers
 
-<table>
-<tr>
-<td align="center" width="180"><a href="https://ai.google.dev"><b>Google</b><br/>Gemini 2.5 Flash · 3.x previews</a></td>
-<td align="center" width="180"><a href="https://groq.com"><b>Groq</b><br/>Llama 3.3, Llama 4, GPT-OSS, Qwen3</a></td>
-<td align="center" width="180"><a href="https://cerebras.ai"><b>Cerebras</b><br/>Qwen3 235B</a></td>
-<td align="center" width="180"><a href="https://cloud.sambanova.ai"><b>SambaNova</b><br/>DeepSeek V3.x · Llama 4 · Gemma 3</a></td>
-</tr>
-<tr>
-<td align="center"><a href="https://mistral.ai"><b>Mistral</b><br/>Large 3 · Medium 3.5 · Codestral · Devstral</a></td>
-<td align="center"><a href="https://openrouter.ai"><b>OpenRouter</b><br/>21 free-tier models</a></td>
-<td align="center"><a href="https://github.com/marketplace/models"><b>GitHub Models</b><br/>GPT-4.1 · GPT-4o</a></td>
-<td align="center"><a href="https://developers.cloudflare.com/workers-ai"><b>Cloudflare</b><br/>Kimi K2 · GLM-4.7 · GPT-OSS · Granite 4</a></td>
-</tr>
-<tr>
-<td align="center"><a href="https://cohere.com"><b>Cohere</b><br/>Command R+ · Command-A (trial)</a></td>
-<td align="center"><a href="https://docs.z.ai"><b>Z.ai (Zhipu)</b><br/>GLM-4.5 · GLM-4.7 Flash</a></td>
-<td align="center"><a href="https://build.nvidia.com"><b>NVIDIA</b><br/>NIM (disabled by default)</a></td>
-<td align="center"><a href="https://huggingface.co/docs/inference-providers"><b>HuggingFace</b><br/>Router → DeepSeek V4 · Kimi K2.6 · Qwen3</a></td>
-</tr>
-</table>
+LLMHarbor ships with adapters and catalog entries for the common free-tier and OpenAI-compatible routes. Some providers require account setup or have stricter terms than others.
 
-## Features
-
-- **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
-- **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
-- **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
-- **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
-- **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps.
-- **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
-- **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
-- **Unified API key** — Clients authenticate to your proxy with a single `llmharbor-…` bearer token. You never expose upstream provider keys to your apps.
-- **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
-- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
-- **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
-- **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
-
-## Not yet supported
-
-The scope is deliberately narrow. If a feature isn't on this list and isn't below, assume it isn't there yet.
-
-- **Embeddings** (`/v1/embeddings`)
-- **Image generation** (`/v1/images/*`)
-- **Audio / speech** (`/v1/audio/*`)
-- **Vision / multimodal inputs** — message content is text-only
-- **Legacy completions** (`/v1/completions`) — only the chat endpoint is implemented
-- **Moderation** (`/v1/moderations`)
-- **`n > 1`** (multiple completions per request)
-- **Per-user billing / multi-tenant auth** — single-user by design
-
-PRs that add any of these are very welcome. See [Contributing](#contributing).
+| Provider | Typical models or routes | Notes |
+|---|---|---|
+| Google AI Studio | Gemini Flash and Pro family | Native adapter with OpenAI shape translation. |
+| Groq | Llama, GPT-OSS, Qwen | Fast OpenAI-compatible route. |
+| Cerebras | Qwen and Llama routes | Fast inference, quota-dependent. |
+| SambaNova | DeepSeek, Llama, Gemma | OpenAI-compatible route. |
+| Mistral | Mistral Large, Codestral, Devstral | OpenAI-compatible route. |
+| OpenRouter | Free and paid OpenRouter models | Works well as an extra model pool. |
+| GitHub Models | GPT-4.1, GPT-4o family | Useful for prototyping. |
+| Cloudflare Workers AI | Kimi, GLM, GPT-OSS, Granite | Account and route configuration required. |
+| Cohere | Command family | Supported, but review terms before personal use. |
+| HuggingFace Router | Provider-routed open models | OpenAI-compatible route. |
+| Zhipu / Z.ai | GLM family | Terms differ by entity and endpoint. |
+| Ollama Cloud | Cloud model access | Good for local-first workflows. |
+| Custom OpenAI-compatible | vLLM, LiteLLM, OpenCode Zen, private gateways | Add from the Keys page, then register models on Models. |
 
 ## Quick start
 
-**Prerequisites:** Node.js 20+, npm.
+### Prerequisites
+
+- Node.js 20+
+- npm
+- A provider API key, or a local OpenAI-compatible endpoint to add later
+
+### Install
 
 ```bash
-git clone https://github.com/tashfeenahmed/llmharbor.git
-cd llmharbor
+git clone https://github.com/PLASMA-FR/LLMHarbor.git
+cd LLMHarbor
 npm install
+```
 
-# Generate an encryption key for at-rest key storage
+Create an environment file:
+
+```bash
 cp .env.example .env
-echo "ENCRYPTION_KEY=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")" >> .env
+node -e 'console.log("ENCRYPTION_KEY=" + require("crypto").randomBytes(32).toString("hex"))' >> .env
+```
 
-# Start server + dashboard together
+Start the server and dashboard together:
+
+```bash
 npm run dev
 ```
 
-`ENCRYPTION_KEY` is required for startup. The server only falls back to a
-database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not
-`production`; do not use that fallback with real provider keys.
+Open the dashboard:
 
-Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
+```txt
+http://localhost:5173
+```
 
-For a production build:
+Then:
+
+1. Go to **Keys** and add provider keys or a custom endpoint.
+2. Go to **Models** and probe the models you want to use.
+3. Go to **Fallback** and order the route list.
+4. Copy the unified API key from **Keys**.
+5. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
+
+### Production build
 
 ```bash
 npm run build
-node server/dist/index.js     # server + dashboard both served on :3001
+node server/dist/index.js
 ```
+
+The production server serves the API and built dashboard on port `3001`.
 
 ## Using the API
 
-Any OpenAI-compatible client works. Examples:
+LLMHarbor accepts OpenAI-style chat requests. Change the base URL and API key, then keep using the client you already use.
 
-**Python**
+### Python
 
 ```python
 from openai import OpenAI
@@ -136,15 +203,17 @@ client = OpenAI(
     api_key="llmharbor-your-unified-key",
 )
 
-resp = client.chat.completions.create(
-    model="auto",  # let the router pick; or specify e.g. "gemini-2.5-flash"
-    messages=[{"role": "user", "content": "Summarise the fall of Rome in one sentence."}],
+response = client.chat.completions.create(
+    model="auto",
+    messages=[
+        {"role": "user", "content": "Explain SQLite WAL mode in two sentences."}
+    ],
 )
-print(resp.choices[0].message.content)
-print("Routed via:", resp.headers.get("x-routed-via"))
+
+print(response.choices[0].message.content)
 ```
 
-**curl**
+### curl
 
 ```bash
 curl http://localhost:3001/v1/chat/completions \
@@ -156,21 +225,20 @@ curl http://localhost:3001/v1/chat/completions \
   }'
 ```
 
-**Streaming**
+### Streaming
 
 ```python
 stream = client.chat.completions.create(
     model="auto",
-    messages=[{"role": "user", "content": "Stream me a haiku about SQLite."}],
+    messages=[{"role": "user", "content": "Stream a short haiku about SQLite."}],
     stream=True,
 )
+
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-**Tool calling**
-
-Pass OpenAI-style `tools` and `tool_choice`; the assistant response round-trips back through the proxy exactly like the OpenAI API. Multi-step flows (assistant `tool_calls` → `tool` role follow-up → final answer) work across every provider the router can reach.
+### Tool calling
 
 ```python
 tools = [{
@@ -186,16 +254,15 @@ tools = [{
     },
 }]
 
-# 1. Model asks for a tool call
 first = client.chat.completions.create(
     model="auto",
     messages=[{"role": "user", "content": "What's the weather in Karachi?"}],
     tools=tools,
     tool_choice="required",
 )
+
 call = first.choices[0].message.tool_calls[0]
 
-# 2. You execute the tool, feed the result back
 final = client.chat.completions.create(
     model="auto",
     messages=[
@@ -205,144 +272,184 @@ final = client.chat.completions.create(
     ],
     tools=tools,
 )
+
 print(final.choices[0].message.content)
 ```
 
-Works with `stream=True` as well — you'll get `delta.tool_calls` chunks followed by a `finish_reason: "tool_calls"` close. Under the hood, OpenAI-compatible providers (Groq, Cerebras, SambaNova, Mistral, OpenRouter, GitHub Models, HuggingFace, Cloudflare, Cohere compat) get the request passed through; Gemini requests get translated into Google's `functionDeclarations` / `functionResponse` shape and the response is translated back.
+Every successful response includes routing headers when available:
 
-Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N`.
+| Header | Meaning |
+|---|---|
+| `X-Routed-Via` | Provider and model that served the request. |
+| `X-Fallback-Attempts` | Number of providers tried before success. |
 
-## Screenshots
+## Dashboard map
 
-### Keys
+| Page | Use it for |
+|---|---|
+| Playground | Send a test request and inspect the route result. |
+| Keys | Manage unified API key, provider keys, key health, and custom providers. |
+| Models | Register endpoint models and run probes. |
+| Fallback | Reorder the chain and switch models on or off. |
+| Analytics | Watch volume, latency, tokens, savings, errors, and model usage. |
 
-Manage provider credentials and grab the unified API key your apps connect with. Each key shows a status dot and when it was last health-checked.
+## How routing works
 
-![Keys page](repo-assets/keys.png)
-
-### Playground
-
-Send a chat completion through the router and see which provider served it, with the model ID and latency printed right on the message.
-
-![Playground page](repo-assets/playground.png)
-
-### Analytics
-
-Request volume, success rate, tokens in and out, average latency, and per-provider breakdowns over 24h / 7d / 30d windows.
-
-![Analytics page](repo-assets/analytics.png)
-
-## How it works
-
-```
-┌──────────────────┐   Bearer llmharbor-…   ┌─────────────────────────┐
-│  OpenAI SDK /    │ ──────────────────────▶ │  Express proxy (:3001)  │
-│  curl / any      │ ◀────────────────────── │  /v1/chat/completions   │
-│  OpenAI client   │      streamed tokens    └────────────┬────────────┘
-└──────────────────┘                                      │
-                                                          ▼
-                             ┌────────────────────────────────────────────────┐
-                             │  Router                                        │
-                             │   1. Pick highest-priority model that          │
-                             │      (a) has a healthy key and                 │
-                             │      (b) is under all its rate limits.         │
-                             │   2. Decrypt key, call provider SDK.           │
-                             │   3. On 429/5xx → cooldown + retry next model. │
-                             └────────────────────────────────────────────────┘
-                                          │
-   ┌──────────────┬────────────┬──────────┴─────────┬─────────────┬──────────┐
-   ▼              ▼            ▼                    ▼             ▼          ▼
- Google         Groq        Cerebras           OpenRouter        HF       …10 more
+```mermaid
+flowchart LR
+  A[OpenAI SDK, curl, agents] -->|Bearer llmharbor key| B[Express API]
+  B --> C{Model requested?}
+  C -->|auto| D[Router picks highest priority healthy model]
+  C -->|specific model| E[Router finds matching enabled model]
+  D --> F[Decrypt provider key in memory]
+  E --> F
+  F --> G[Call provider adapter]
+  G -->|success| H[Return OpenAI-shaped response]
+  G -->|429, timeout, 5xx| I[Cooldown key and try next fallback]
+  I --> D
+  H --> J[Write analytics and token usage]
 ```
 
-- **Router** (`server/src/services/router.ts`) — picks a model per request.
-- **Rate-limit ledger** (`server/src/services/ratelimit.ts`) — in-memory RPM/RPD/TPM/TPD counters backed by SQLite, with cooldowns on 429s.
-- **Provider adapters** (`server/src/providers/*.ts`) — one file per provider, implementing the `Provider` base class: `chatCompletion()` and `streamChatCompletion()`.
-- **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
-- **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
-- **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
+Main pieces:
 
-## Limitations
+| Component | Path | Responsibility |
+|---|---|---|
+| API app | `server/src/app.ts` | Express routes, CORS, OpenAI-compatible surface. |
+| Router | `server/src/services/router.ts` | Model choice, fallback attempts, sticky sessions. |
+| Rate limiter | `server/src/services/ratelimit.ts` | RPM, RPD, TPM, TPD accounting and cooldowns. |
+| Providers | `server/src/providers/*.ts` | Provider-specific request and streaming adapters. |
+| Keys routes | `server/src/routes/keys.ts` | Unified API key and provider credential management. |
+| Endpoint routes | `server/src/routes/endpoints.ts` | Custom providers and model registry. |
+| Database | `server/src/db/index.ts` | SQLite schema, seed catalog, encrypted key storage. |
+| Dashboard | `client/src` | React control plane. |
+| Shared types | `shared/types.ts` | Request, model, provider, and analytics types. |
 
-Stacking free tiers has real trade-offs. Be honest with yourself about them:
+## Security model
 
-- **No frontier models.** The free-tier catalog tops out around Llama 3.3 70B, GLM-4.5, Qwen 3 Coder, and Gemini 2.5 Pro. You will not get GPT-5 or Claude Opus class reasoning through this. For hard problems, pay for a real API.
-- **Intelligence degrades as the day progresses.** Your top-ranked models (usually Gemini 2.5 Pro, GPT-4o via GitHub Models) have the lowest daily caps. Once they hit their limits, the router falls down your priority chain to smaller/weaker models. Expect the effective intelligence of the endpoint to drop in the late hours of each day — then reset at UTC midnight.
-- **Latency is highly variable.** Cerebras and Groq are extremely fast; others are not. You get whichever one is available.
-- **Free tiers can change without notice.** Providers regularly tighten, loosen, or remove free tiers. When that happens you'll see 429s or auth errors until you update the catalog. Re-seed scripts live in `server/src/scripts/`.
-- **No SLA, by definition.** If you need reliability, use a paid provider with a contract.
-- **Local-first.** There's no multi-tenant auth. Run this for yourself; don't expose it to the internet.
+LLMHarbor is local-first and single-user by design.
 
-## Contributing
+- Provider keys are encrypted at rest with AES-256-GCM.
+- The encryption key comes from `ENCRYPTION_KEY` in `.env` for real use.
+- The development fallback key is only for local experimentation. Do not use it with real provider credentials.
+- Clients call LLMHarbor with one `llmharbor-...` token.
+- Upstream provider keys never leave the server process.
+- Do not expose your LLMHarbor instance to the public internet without adding your own network controls.
 
-Contributors very welcome! Good first PRs:
+## What is not supported yet
 
-- **Add a provider** — copy `server/src/providers/openai-compat.ts` as a template, wire it into `server/src/providers/index.ts`, seed its models in `server/src/db/index.ts`, add a test in `server/src/__tests__/providers/`.
-- **Add an endpoint** — embeddings, images, moderations. The provider base class can grow new methods; adapters declare which they support.
-- **Improve the router** — cost-aware routing (cheapest-healthy-fastest tradeoffs), better latency-weighted priority, regional pinning.
-- **Dashboard polish** — charts on the Analytics page, key rotation UX, batch import of keys from `.env`.
-- **Docs** — more examples, client library snippets for Go/Rust/etc., a deployment recipe for Docker or Fly.
+LLMHarbor intentionally starts with chat completions.
 
-**Development loop:**
+- Embeddings: `/v1/embeddings`
+- Image generation: `/v1/images/*`
+- Audio and speech: `/v1/audio/*`
+- Moderation: `/v1/moderations`
+- Legacy completions: `/v1/completions`
+- `n > 1` multi-completion requests
+- Multi-tenant auth, billing, orgs, or team management
+
+## Development
 
 ```bash
 npm install
-npm run dev      # server on :3001, dashboard on :5173, both with HMR
-npm test         # server vitest; also runs client tests if the workspace adds them
-npm run build    # compile server and dashboard
+npm run dev       # server on :3001, dashboard on :5173
+npm test          # server Vitest suite, plus client tests if present
+npm run build     # TypeScript + Vite production build
 ```
 
-PRs should include a test, keep the existing test suite green, and match the `.editorconfig` / tsconfig defaults already in the repo. Issues and discussions are open.
+Useful workspace commands:
 
-### Contributors
+```bash
+npm run build -w server
+npm run build -w client
+npm run test -w server
+```
 
-<a href="https://github.com/moaaz12-web"><img src="https://images.weserv.nl/?url=github.com/moaaz12-web.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@moaaz12-web" /></a>
-<a href="https://github.com/lukasulc"><img src="https://images.weserv.nl/?url=github.com/lukasulc.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@lukasulc" /></a>
-<a href="https://github.com/VinhPhamAI"><img src="https://images.weserv.nl/?url=github.com/VinhPhamAI.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@VinhPhamAI" /></a>
-<a href="https://github.com/deadc"><img src="https://images.weserv.nl/?url=github.com/deadc.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@deadc" /></a>
-<a href="https://github.com/zhangyu1324"><img src="https://images.weserv.nl/?url=github.com/zhangyu1324.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@zhangyu1324" /></a>
-<a href="https://github.com/jtbrennan-git"><img src="https://images.weserv.nl/?url=github.com/jtbrennan-git.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jtbrennan-git" /></a>
-<a href="https://github.com/praveenkumarpranjal"><img src="https://images.weserv.nl/?url=github.com/praveenkumarpranjal.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@praveenkumarpranjal" /></a>
-<a href="https://github.com/nordbyte"><img src="https://images.weserv.nl/?url=github.com/nordbyte.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@nordbyte" /></a>
-<a href="https://github.com/mybropro"><img src="https://images.weserv.nl/?url=github.com/mybropro.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@mybropro" /></a>
-<a href="https://github.com/danscMax"><img src="https://images.weserv.nl/?url=github.com/danscMax.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@danscMax" /></a>
-<a href="https://github.com/jhash"><img src="https://images.weserv.nl/?url=github.com/jhash.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@jhash" /></a>
-<a href="https://github.com/JammyJames1234"><img src="https://images.weserv.nl/?url=github.com/JammyJames1234.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@JammyJames1234" /></a>
-<a href="https://github.com/Sumit4codes"><img src="https://images.weserv.nl/?url=github.com/Sumit4codes.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@Sumit4codes" /></a>
-<a href="https://github.com/meliani"><img src="https://images.weserv.nl/?url=github.com/meliani.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@meliani" /></a>
+Before opening a PR:
 
-## Terms of Service review
+```bash
+npm test
+npm run build
+```
 
-A self-hosted, single-user, personal-use setup was re-reviewed against each provider's ToS (May 2026). Summary:
+## Project structure
 
-| Provider | Verdict | Notes |
-|---|---|---|
-| Google Gemini | ⚠️ Caution | March 2026 ToS narrows scope to *"professional or business purposes, not for consumer use"* — a self-hosted developer proxy is still defensible, but the clause is new. |
-| Groq | ✅ Likely OK | GroqCloud Services Agreement permits Customer Application integration. |
-| Cerebras | ✅ Likely OK | Permitted; explicitly forbids selling/transferring API keys. |
-| Mistral | ✅ Likely OK | APIs allowed for personal/internal business use. |
-| OpenRouter | ✅ Likely OK | April 2026 ToS sharpens the no-resale / no-competing-service clause; private single-user proxy still fine. |
-| SambaNova | ⚠️ Ambiguous | EULA §1.5(c) blocks resale and "service bureau" use; single-user with no third-party access is fine. |
-| Cloudflare Workers AI | ⚠️ Ambiguous | No anti-proxy clause; covered by general Self-Serve Subscription Agreement. |
-| NVIDIA NIM | ⚠️ Caution | Trial ToS §1.2 / §1.4: *"evaluation only, not production."* Disabled in default catalog. |
-| GitHub Models | ⚠️ Caution | Free tier explicitly scoped to *"experimentation"* and *"prototyping."* |
-| Cohere | ❌ Avoid | Terms §14 still forbids *"personal, family or household purposes."* |
-| Zhipu (open.bigmodel.cn) | ✅ Likely OK | Personal/non-commercial research carve-out still in the platform docs. |
-| Z.ai (api.z.ai) | ⚠️ Caution | New row — Singapore entity (distinct from Zhipu CN). §III.3(l) anti-traffic-redirect clause could plausibly be read against a proxy; no explicit personal-use carve-out. |
-| Ollama Cloud | ✅ Likely OK | New row — Free plan permits cloud-model access (1 concurrent, 5-hour session caps). No anti-proxy / anti-resale clauses found. *(Integration tracked in #14.)* |
+```txt
+LLMHarbor/
+  client/               React + Vite dashboard
+    src/components/     Shared UI primitives and app shell pieces
+    src/pages/          Playground, Keys, Models, Fallback, Analytics
+  server/               Express API and provider routing
+    src/db/             SQLite schema and model catalog
+    src/providers/      Provider adapters
+    src/routes/         API routes
+    src/services/       Router, health checks, rate limiter
+  shared/               Shared TypeScript types
+  docs/                 Logo, Open Graph assets, generated docs assets
+  repo-assets/          README screenshots
+```
 
-Rules of thumb that keep most providers happy: **one account per provider**, **no reselling**, **no sharing your endpoint with other humans**, **don't hammer a free tier as a paid production backend**. This is informational, not legal advice — read each provider's ToS and make your own call.
+## Environment
 
-Removed since the April 2026 review: Hugging Face, Moonshot, and MiniMax direct integrations were dropped from the catalog (HF — tool-call format issues; Moonshot — moved to paid only; MiniMax — superseded by the OpenRouter `minimax/minimax-m2.5:free` route).
+Common `.env` values:
 
-## Disclaimer
+```bash
+ENCRYPTION_KEY=replace-with-64-hex-characters
+PORT=3001
+DEV_MODE=false
+DATABASE_PATH=server/data/llmharbor.db
+```
 
-**This project is for personal experimentation and learning, not production.** Free tiers exist so developers can prototype against them; they aren't a stable, supported inference substrate and shouldn't be treated as one. If you build something real on top of LLMHarbor, swap in a paid API before you ship. Your relationship with each upstream provider is governed by the terms you accepted when you created your account — those terms still apply when the traffic is proxied through this project, and you're responsible for complying with them.
+Provider keys are normally added in the dashboard. Keep `.env` and SQLite data out of commits.
 
-## Star History
+## Limitations and honest notes
 
-[![Star History Chart](https://api.star-history.com/chart?repos=tashfeenahmed/llmharbor&type=date&legend=top-left)](https://www.star-history.com/?repos=tashfeenahmed%2Fllmharbor&type=date&legend=top-left)
+- Free-tier quotas move. Providers can change limits or remove models without warning.
+- The best model in your chain may run out early in the day. After that, routing falls to the next enabled model.
+- Latency varies by provider. Groq and Cerebras are often fast. Others may not be.
+- Some provider terms limit production, resale, personal use, or traffic relay patterns. Read the terms for each account you connect.
+- There is no SLA. If the request matters, use a paid provider directly or put LLMHarbor behind your own reliability layer.
+
+## Contributing
+
+Good contributions are practical and testable.
+
+- Add a provider adapter.
+- Add an endpoint family such as embeddings or images.
+- Improve fallback scoring.
+- Improve analytics and charts.
+- Add deployment recipes.
+- Tighten copy, accessibility, keyboard behavior, or empty states.
+- Add tests for provider quirks and rate-limit edge cases.
+
+A provider PR usually touches:
+
+```txt
+server/src/providers/<provider>.ts
+server/src/providers/index.ts
+server/src/db/index.ts
+server/src/__tests__/providers/<provider>.test.ts
+```
+
+Please keep PRs focused and include tests for routing behavior when possible.
+
+## Terms of Service reminder
+
+LLMHarbor does not bypass provider terms. You are still responsible for how each upstream key is used.
+
+Safe defaults:
+
+- One account per provider.
+- No reselling.
+- No shared public endpoint.
+- No production dependency on trial-only APIs.
+- No traffic volume that looks like a commercial relay.
+
+This is not legal advice. Read the terms for every provider you connect.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/chart?repos=PLASMA-FR/LLMHarbor&type=date&legend=top-left)](https://www.star-history.com/#PLASMA-FR/LLMHarbor&date)
 
 ## License
 
-[MIT](./LICENSE)
+MIT. See [LICENSE](./LICENSE).
