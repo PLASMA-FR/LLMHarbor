@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import type { Request, Response, NextFunction } from 'express';
 import { keysRouter } from './routes/keys.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
@@ -30,6 +31,33 @@ function getAllowedCorsOrigins() {
   return new Set([...DEFAULT_DASHBOARD_ORIGINS, ...configuredOrigins]);
 }
 
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address === '::ffff:127.0.0.1'
+    || address.startsWith('127.');
+}
+
+function requireLocalControlPlane(req: Request, res: Response, next: NextFunction) {
+  if (process.env.LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE === '1') {
+    next();
+    return;
+  }
+
+  if (isLoopbackAddress(req.socket.remoteAddress)) {
+    next();
+    return;
+  }
+
+  res.status(403).json({
+    error: {
+      message: 'LLMHarbor dashboard API is local-only. Set LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE=1 only behind your own network controls.',
+      type: 'forbidden',
+    },
+  });
+}
+
 export function createApp() {
   const app = express();
   const allowedCorsOrigins = getAllowedCorsOrigins();
@@ -48,6 +76,16 @@ export function createApp() {
   }));
   app.use(express.json({ limit: '1mb' }));
 
+  // Public liveness probe: no credentials or config data.
+  app.get('/api/ping', (_req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // The dashboard/control-plane API exposes local credentials and mutates the
+  // router config. Keep it loopback-only even if someone opts the authenticated
+  // /v1 proxy into a remote bind with HOST=0.0.0.0.
+  app.use('/api', requireLocalControlPlane);
+
   // API routes
   app.use('/api/keys', keysRouter);
   app.use('/api/models', modelsRouter);
@@ -59,11 +97,6 @@ export function createApp() {
 
   // OpenAI-compatible proxy
   app.use('/v1', proxyRouter);
-
-  // Health check
-  app.get('/api/ping', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
 
   // Error handler (for API routes)
   app.use(errorHandler);

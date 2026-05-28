@@ -71,13 +71,13 @@ export default function ModelsPage() {
 
   const { data: endpointModels = [] } = useQuery<EndpointModel[]>({
     queryKey: ['custom-endpoint-models', selectedEndpoint],
-    queryFn: () => apiFetch(`/api/endpoints/${selectedEndpoint}/models`),
+    queryFn: () => apiFetch(`/api/endpoints/${encodeURIComponent(selectedEndpoint)}/models`),
     enabled: Boolean(selectedEndpoint),
   })
 
   const addModel = useMutation({
     mutationFn: (body: { platform: string; modelId: string; displayName: string }) =>
-      apiFetch(`/api/endpoints/${body.platform}/models`, {
+      apiFetch(`/api/endpoints/${encodeURIComponent(body.platform)}/models`, {
         method: 'POST',
         body: JSON.stringify({
           modelId: body.modelId,
@@ -99,7 +99,7 @@ export default function ModelsPage() {
 
   const probeModel = useMutation({
     mutationFn: (body: { platform: string; modelId: string }) =>
-      apiFetch<ProbeResult>(`/api/endpoints/${body.platform}/models/probe`, {
+      apiFetch<ProbeResult>(`/api/endpoints/${encodeURIComponent(body.platform)}/models/probe`, {
         method: 'POST',
         body: JSON.stringify({ modelId: body.modelId }),
       }),
@@ -114,7 +114,7 @@ export default function ModelsPage() {
 
   const deleteModel = useMutation({
     mutationFn: ({ endpointPlatform, modelDbId }: { endpointPlatform: string; modelDbId: number }) =>
-      apiFetch(`/api/endpoints/${endpointPlatform}/models/${modelDbId}`, { method: 'DELETE' }),
+      apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}/models/${modelDbId}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
       queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', selectedEndpoint] })

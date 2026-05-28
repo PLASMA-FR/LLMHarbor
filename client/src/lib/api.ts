@@ -9,5 +9,13 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
     throw new Error(body.error?.message ?? `HTTP ${res.status}`);
   }
-  return res.json();
+
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  if (!text) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`Expected JSON response from ${path}`);
+  }
 }

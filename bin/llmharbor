@@ -58,6 +58,7 @@ Commands:
 Environment:
   LLMHARBOR_HOME=/path/to/LLMHarbor   Override project directory
   PORT=3001                           Override server port for this invocation
+  HOST=127.0.0.1                      Bind address; use 0.0.0.0 only behind network controls
 EOF
 }
 
@@ -78,11 +79,15 @@ read_env_value() {
 }
 
 current_port() {
+  local port
   if [[ -n "${PORT:-}" ]]; then
-    printf '%s\n' "$PORT"
+    port="$PORT"
   else
-    read_env_value PORT 2>/dev/null || printf '%s\n' "$DEFAULT_PORT"
+    port="$(read_env_value PORT 2>/dev/null || printf '%s\n' "$DEFAULT_PORT")"
   fi
+  [[ "$port" =~ ^[0-9]+$ ]] || fail "PORT must be numeric: $port"
+  (( port >= 1 && port <= 65535 )) || fail "PORT must be between 1 and 65535: $port"
+  printf '%s\n' "$port"
 }
 
 make_encryption_key() {

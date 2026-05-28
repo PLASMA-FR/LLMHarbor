@@ -65,7 +65,7 @@ interface EndpointSummary {
 interface ClientApiKey {
   id: number
   label: string
-  key: string
+  key?: string
   maskedKey: string
   enabled: boolean
   createdAt: string
@@ -76,6 +76,7 @@ function ClientKeysSection() {
   const queryClient = useQueryClient()
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null)
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
+  const [createdKey, setCreatedKey] = useState<ClientApiKey | null>(null)
   const [newKeyLabel, setNewKeyLabel] = useState('')
 
   const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
@@ -88,7 +89,8 @@ function ClientKeysSection() {
       method: 'POST',
       body: JSON.stringify({ label: label || 'Personal key' }),
     }),
-    onSuccess: () => {
+    onSuccess: (key) => {
+      setCreatedKey(key)
       queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
       queryClient.invalidateQueries({ queryKey: ['unified-key'] })
       setNewKeyLabel('')
@@ -116,6 +118,7 @@ function ClientKeysSection() {
     : `${window.location.origin}/v1`
 
   function copy(key: ClientApiKey) {
+    if (!key.key) return
     navigator.clipboard.writeText(key.key)
     setCopiedKeyId(key.id)
     setTimeout(() => setCopiedKeyId(null), 1500)
@@ -154,6 +157,18 @@ function ClientKeysSection() {
         </div>
       </div>
 
+      {createdKey?.key && (
+        <div className="relative mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="font-semibold text-amber-900 dark:text-amber-100">Copy this new key now. It will only be shown once.</p>
+              <code className="mt-2 block truncate rounded-xl bg-background/80 px-3 py-2 font-mono select-all">{createdKey.key}</code>
+            </div>
+            <Button size="sm" onClick={() => copy(createdKey)}>{copiedKeyId === createdKey.id ? 'Copied' : 'Copy key'}</Button>
+          </div>
+        </div>
+      )}
+
       <div className="relative mt-5 space-y-3">
         {clientKeys.length === 0 ? (
           <EmptyState title="No client keys yet" description="Create a key to call the local OpenAI-compatible API." />
@@ -169,12 +184,12 @@ function ClientKeysSection() {
                   {key.lastUsedAt && <span className="text-xs text-muted-foreground">Last used {new Date(key.lastUsedAt).toLocaleString()}</span>}
                 </div>
                 <code className="mt-2 block truncate rounded-xl bg-muted/70 px-3 py-2 font-mono text-xs tabular-nums select-all">
-                  {visibleKeyId === key.id ? key.key : key.maskedKey}
+                  {visibleKeyId === key.id && key.key ? key.key : key.maskedKey}
                 </code>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)}>{visibleKeyId === key.id ? 'Hide' : 'Show'}</Button>
-                <Button variant="default" size="sm" onClick={() => copy(key)}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
+                <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)} disabled={!key.key}>{visibleKeyId === key.id && key.key ? 'Hide' : 'Show'}</Button>
+                <Button variant="default" size="sm" onClick={() => copy(key)} disabled={!key.key}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
                 <Switch checked={key.enabled} onCheckedChange={(enabled) => toggleKey.mutate({ id: key.id, enabled })} />
                 <Button variant="ghost" size="sm" onClick={() => deleteClientKey.mutate(key.id)}>Delete</Button>
               </div>
@@ -234,7 +249,7 @@ export default function KeysPage() {
   })
 
   const deleteEndpoint = useMutation({
-    mutationFn: (endpointPlatform: string) => apiFetch(`/api/endpoints/${endpointPlatform}`, { method: 'DELETE' }),
+    mutationFn: (endpointPlatform: string) => apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
       queryClient.invalidateQueries({ queryKey: ['keys'] })
@@ -282,7 +297,7 @@ export default function KeysPage() {
 
   const togglePlatform = useMutation({
     mutationFn: ({ platform, enabled }: { platform: string; enabled: boolean }) =>
-      apiFetch(`/api/keys/platform/${platform}`, {
+      apiFetch(`/api/keys/platform/${encodeURIComponent(platform)}`, {
         method: 'PATCH',
         body: JSON.stringify({ enabled }),
       }),

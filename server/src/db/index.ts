@@ -1320,24 +1320,24 @@ function ensureUnifiedKey(db: Database.Database) {
     VALUES ('Default key', ?, 1)
   `).run(key);
 
-  console.log(`\n  Your default LLMHarbor client key: ${key}\n`);
+  console.log('\n  Created a default LLMHarbor client key. Open the dashboard locally to copy it.\n');
 }
 
 export interface ClientApiKeyRecord {
   id: number;
   label: string;
-  key: string;
+  key?: string;
   maskedKey: string;
   enabled: boolean;
   createdAt: string;
   lastUsedAt: string | null;
 }
 
-function rowToClientApiKey(row: any): ClientApiKeyRecord {
+function rowToClientApiKey(row: any, includeSecret = false): ClientApiKeyRecord {
   return {
     id: row.id,
     label: row.label,
-    key: row.key,
+    ...(includeSecret ? { key: row.key } : {}),
     maskedKey: maskClientApiKey(row.key),
     enabled: row.enabled === 1,
     createdAt: row.created_at,
@@ -1348,7 +1348,7 @@ function rowToClientApiKey(row: any): ClientApiKeyRecord {
 export function listClientApiKeys(): ClientApiKeyRecord[] {
   const db = getDb();
   const rows = db.prepare('SELECT * FROM client_api_keys ORDER BY created_at DESC, id DESC').all() as any[];
-  return rows.map(rowToClientApiKey);
+  return rows.map(row => rowToClientApiKey(row));
 }
 
 export function getUnifiedApiKey(): string {
@@ -1368,7 +1368,7 @@ export function createNamedClientApiKey(label = 'Personal key'): ClientApiKeyRec
     VALUES (?, ?, 1)
   `).run(label.trim() || 'Personal key', key);
   const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(result.lastInsertRowid) as any;
-  return rowToClientApiKey(row);
+  return rowToClientApiKey(row, true);
 }
 
 export function updateClientApiKey(id: number, updates: { label?: string; enabled?: boolean }): ClientApiKeyRecord | null {

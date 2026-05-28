@@ -385,7 +385,9 @@ LLMHarbor is local-first and single-user by design.
 - The development fallback key is only for local experimentation. Do not use it with real provider credentials.
 - Clients call LLMHarbor with one `llmharbor-...` token.
 - Upstream provider keys never leave the server process.
-- Do not expose your LLMHarbor instance to the public internet without adding your own network controls.
+- The server binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` only behind your own firewall, VPN, or authenticated reverse proxy.
+- The dashboard/control-plane API stays loopback-only by default even when the authenticated `/v1` proxy is remotely bound. Set `LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE=1` only behind your own network controls.
+- Do not expose your LLMHarbor instance directly to the public internet.
 
 ## What is not supported yet
 

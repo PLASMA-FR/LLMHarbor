@@ -50,6 +50,7 @@ describe('Proxy authentication and CORS', () => {
     const listed = await request(app, 'GET', '/api/settings/api-keys');
     expect(listed.status).toBe(200);
     expect(listed.body.length).toBeGreaterThanOrEqual(2);
+    expect(listed.body.every((key: any) => key.key === undefined)).toBe(true);
 
     const compare = (provided: string, expected: string) => provided === expected;
     expect(isValidClientApiKey(created.body.key, compare)).toBe(true);

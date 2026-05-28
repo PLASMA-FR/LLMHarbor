@@ -28,13 +28,18 @@ function Require-Command($Name) {
 }
 
 function Get-Port {
-  if ($env:PORT) { return $env:PORT }
-  $EnvFile = Join-Path $ProjectRoot ".env"
-  if (Test-Path $EnvFile) {
-    $Line = Get-Content $EnvFile | Where-Object { $_ -match '^PORT=' } | Select-Object -Last 1
-    if ($Line) { return ($Line -replace '^PORT=', '') }
+  if ($env:PORT) { $PortValue = $env:PORT } else {
+    $EnvFile = Join-Path $ProjectRoot ".env"
+    if (Test-Path $EnvFile) {
+      $Line = Get-Content $EnvFile | Where-Object { $_ -match '^PORT=' } | Select-Object -Last 1
+      if ($Line) { $PortValue = ($Line -replace '^PORT=', '') }
+    }
+    if (-not $PortValue) { $PortValue = $DefaultPort }
   }
-  return $DefaultPort
+  if ($PortValue -notmatch '^[0-9]+$') { Fail "PORT must be numeric: $PortValue" }
+  $PortNumber = [int]$PortValue
+  if ($PortNumber -lt 1 -or $PortNumber -gt 65535) { Fail "PORT must be between 1 and 65535: $PortValue" }
+  return $PortValue
 }
 
 function New-EncryptionKey {
