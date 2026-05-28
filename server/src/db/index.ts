@@ -154,6 +154,15 @@ function createTables(db: Database.Database) {
       value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS client_api_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      label TEXT NOT NULL DEFAULT 'Default key',
+      key TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_used_at TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
     CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
@@ -1283,31 +1292,129 @@ function migrateModelsV14(db: Database.Database) {
   `).run();
 }
 
+function createClientApiKey(): string {
+  return `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
+}
+
+function maskClientApiKey(key: string): string {
+  if (key.length <= 18) return `${key.slice(0, 8)}••••`;
+  return `${key.slice(0, 13)}${'•'.repeat(26)}${key.slice(-6)}`;
+}
+
 function ensureUnifiedKey(db: Database.Database) {
+  const existingClientKey = db.prepare('SELECT key FROM client_api_keys ORDER BY id ASC LIMIT 1').get() as { key: string } | undefined;
+  if (existingClientKey) return;
+
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
-  if (!existing) {
-    const key = `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
+  let key = existing?.value ?? createClientApiKey();
+
+  if (key.startsWith('freellmapi-')) {
+    key = `llmharbor-${key.slice('freellmapi-'.length)}`;
+    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+  } else if (!existing) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
-    return;
   }
 
-  if (existing.value.startsWith('freellmapi-')) {
-    const key = `llmharbor-${existing.value.slice('freellmapi-'.length)}`;
-    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
-    console.log(`\n  Your unified API key was rebranded: ${key}\n`);
-  }
+  db.prepare(`
+    INSERT OR IGNORE INTO client_api_keys (label, key, enabled)
+    VALUES ('Default key', ?, 1)
+  `).run(key);
+
+  console.log(`\n  Your default LLMHarbor client key: ${key}\n`);
+}
+
+export interface ClientApiKeyRecord {
+  id: number;
+  label: string;
+  key: string;
+  maskedKey: string;
+  enabled: boolean;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+function rowToClientApiKey(row: any): ClientApiKeyRecord {
+  return {
+    id: row.id,
+    label: row.label,
+    key: row.key,
+    maskedKey: maskClientApiKey(row.key),
+    enabled: row.enabled === 1,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at,
+  };
+}
+
+export function listClientApiKeys(): ClientApiKeyRecord[] {
+  const db = getDb();
+  const rows = db.prepare('SELECT * FROM client_api_keys ORDER BY created_at DESC, id DESC').all() as any[];
+  return rows.map(rowToClientApiKey);
 }
 
 export function getUnifiedApiKey(): string {
   const db = getDb();
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
-  return row.value;
+  const row = db.prepare('SELECT key FROM client_api_keys WHERE enabled = 1 ORDER BY id ASC LIMIT 1').get() as { key: string } | undefined;
+  if (row) return row.key;
+  const fallback = createClientApiKey();
+  db.prepare(`INSERT INTO client_api_keys (label, key, enabled) VALUES ('Default key', ?, 1)`).run(fallback);
+  return fallback;
+}
+
+export function createNamedClientApiKey(label = 'Personal key'): ClientApiKeyRecord {
+  const db = getDb();
+  const key = createClientApiKey();
+  const result = db.prepare(`
+    INSERT INTO client_api_keys (label, key, enabled)
+    VALUES (?, ?, 1)
+  `).run(label.trim() || 'Personal key', key);
+  const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(result.lastInsertRowid) as any;
+  return rowToClientApiKey(row);
+}
+
+export function updateClientApiKey(id: number, updates: { label?: string; enabled?: boolean }): ClientApiKeyRecord | null {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id) as any | undefined;
+  if (!existing) return null;
+
+  if (typeof updates.label === 'string') {
+    db.prepare('UPDATE client_api_keys SET label = ? WHERE id = ?').run(updates.label.trim() || existing.label, id);
+  }
+  if (typeof updates.enabled === 'boolean') {
+    db.prepare('UPDATE client_api_keys SET enabled = ? WHERE id = ?').run(updates.enabled ? 1 : 0, id);
+  }
+
+  const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id) as any;
+  return rowToClientApiKey(row);
+}
+
+export function deleteClientApiKey(id: number): boolean {
+  const db = getDb();
+  const result = db.prepare('DELETE FROM client_api_keys WHERE id = ?').run(id);
+  if (result.changes > 0) ensureUnifiedKey(db);
+  return result.changes > 0;
 }
 
 export function regenerateUnifiedKey(): string {
   const db = getDb();
-  const key = `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
-  db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
+  const row = db.prepare('SELECT id FROM client_api_keys ORDER BY id ASC LIMIT 1').get() as { id: number } | undefined;
+  const key = createClientApiKey();
+  if (row) {
+    db.prepare('UPDATE client_api_keys SET key = ?, enabled = 1 WHERE id = ?').run(key, row.id);
+  } else {
+    db.prepare(`INSERT INTO client_api_keys (label, key, enabled) VALUES ('Default key', ?, 1)`).run(key);
+  }
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
   return key;
+}
+
+export function isValidClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): boolean {
+  const db = getDb();
+  const rows = db.prepare('SELECT id, key FROM client_api_keys WHERE enabled = 1').all() as { id: number; key: string }[];
+  for (const row of rows) {
+    if (compare(provided, row.key)) {
+      db.prepare("UPDATE client_api_keys SET last_used_at = datetime('now') WHERE id = ?").run(row.id);
+      return true;
+    }
+  }
+  return false;
 }

@@ -62,69 +62,125 @@ interface EndpointSummary {
   keyCount: number
 }
 
-function UnifiedKeySection() {
+interface ClientApiKey {
+  id: number
+  label: string
+  key: string
+  maskedKey: string
+  enabled: boolean
+  createdAt: string
+  lastUsedAt: string | null
+}
+
+function ClientKeysSection() {
   const queryClient = useQueryClient()
-  const [showKey, setShowKey] = useState(false)
-  const [copied, setCopied] = useState(false)
+  const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null)
+  const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
+  const [newKeyLabel, setNewKeyLabel] = useState('')
 
-  const { data } = useQuery<{ apiKey: string }>({
-    queryKey: ['unified-key'],
-    queryFn: () => apiFetch('/api/settings/api-key'),
+  const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
+    queryKey: ['client-api-keys'],
+    queryFn: () => apiFetch('/api/settings/api-keys'),
   })
 
-  const regenerate = useMutation({
-    mutationFn: () => apiFetch('/api/settings/api-key/regenerate', { method: 'POST' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['unified-key'] }),
+  const createKey = useMutation({
+    mutationFn: (label: string) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
+      method: 'POST',
+      body: JSON.stringify({ label: label || 'Personal key' }),
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
+      queryClient.invalidateQueries({ queryKey: ['unified-key'] })
+      setNewKeyLabel('')
+    },
   })
 
-  const apiKey = data?.apiKey ?? ''
-  const masked = apiKey ? `${apiKey.slice(0, 13)}${'•'.repeat(26)}${apiKey.slice(-6)}` : 'Generating...'
+  const toggleKey = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => apiFetch<ClientApiKey>(`/api/settings/api-keys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-api-keys'] }),
+  })
+
+  const deleteClientKey = useMutation({
+    mutationFn: (id: number) => apiFetch(`/api/settings/api-keys/${id}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
+      queryClient.invalidateQueries({ queryKey: ['unified-key'] })
+    },
+  })
+
   const baseUrl = import.meta.env.DEV
     ? `http://${window.location.hostname}:${__SERVER_PORT__}/v1`
     : `${window.location.origin}/v1`
 
-  function copy() {
-    if (!apiKey) return
-    navigator.clipboard.writeText(apiKey)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 1500)
+  function copy(key: ClientApiKey) {
+    navigator.clipboard.writeText(key.key)
+    setCopiedKeyId(key.id)
+    setTimeout(() => setCopiedKeyId(null), 1500)
   }
 
   return (
     <section className="panel-card relative overflow-hidden rounded-2xl p-5 sm:p-6">
       <div className="relative flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-        <div className="max-w-xl">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-primary/80">Client key</p>
-          <h2 className="mt-2 text-xl font-semibold tracking-[-0.035em]">Unified API key</h2>
+        <div className="max-w-2xl">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-primary/80">Personal API platform</p>
+          <h2 className="mt-2 text-xl font-semibold tracking-[-0.035em]">Client API keys</h2>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            Use this OpenAI-compatible key in your apps. LLMHarbor keeps provider keys on this machine.
+            Create one OpenAI-compatible key per app, agent, laptop, or experiment. Revoke a single client without touching provider credentials.
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={() => regenerate.mutate()} disabled={regenerate.isPending}>
-          {regenerate.isPending ? 'Regenerating...' : 'Regenerate key'}
-        </Button>
+        <div className="grid min-w-0 gap-2 sm:min-w-[320px] sm:grid-cols-[1fr_auto]">
+          <Input
+            placeholder="Label, e.g. Cursor on MacBook"
+            value={newKeyLabel}
+            onChange={(event) => setNewKeyLabel(event.target.value)}
+          />
+          <Button onClick={() => createKey.mutate(newKeyLabel)} disabled={createKey.isPending}>
+            {createKey.isPending ? 'Creating...' : 'New key'}
+          </Button>
+        </div>
       </div>
 
-      <div className="relative mt-5 rounded-2xl border border-border bg-background p-3 ">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <code className="min-w-0 flex-1 truncate rounded-2xl bg-muted/70 px-3 py-3 font-mono text-xs tabular-nums select-all">
-            {showKey ? apiKey : masked}
-          </code>
-          <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={() => setShowKey(!showKey)}>{showKey ? 'Hide' : 'Show'}</Button>
-            <Button variant="default" size="sm" onClick={copy}>{copied ? 'Copied' : 'Copy'}</Button>
-          </div>
+      <div className="relative mt-5 grid gap-3 text-xs sm:grid-cols-2">
+        <div className="rounded-2xl bg-card px-3 py-2">
+          <span className="block text-muted-foreground">Base URL</span>
+          <code className="mt-0.5 block truncate font-mono">{baseUrl}</code>
         </div>
-        <div className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
-          <div className="rounded-2xl bg-card px-3 py-2">
-            <span className="block text-muted-foreground">Base URL</span>
-            <code className="mt-0.5 block truncate font-mono">{baseUrl}</code>
-          </div>
-          <div className="rounded-2xl bg-card px-3 py-2">
-            <span className="block text-muted-foreground">Endpoint</span>
-            <code className="mt-0.5 block truncate font-mono">/v1/chat/completions</code>
-          </div>
+        <div className="rounded-2xl bg-card px-3 py-2">
+          <span className="block text-muted-foreground">Endpoint</span>
+          <code className="mt-0.5 block truncate font-mono">/v1/chat/completions</code>
         </div>
+      </div>
+
+      <div className="relative mt-5 space-y-3">
+        {clientKeys.length === 0 ? (
+          <EmptyState title="No client keys yet" description="Create a key to call the local OpenAI-compatible API." />
+        ) : clientKeys.map((key) => (
+          <div key={key.id} className="rounded-2xl border border-border bg-background p-3">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="font-medium text-foreground">{key.label}</p>
+                  <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em]', key.enabled ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'bg-muted text-muted-foreground')}>
+                    {key.enabled ? 'Enabled' : 'Disabled'}
+                  </span>
+                  {key.lastUsedAt && <span className="text-xs text-muted-foreground">Last used {new Date(key.lastUsedAt).toLocaleString()}</span>}
+                </div>
+                <code className="mt-2 block truncate rounded-xl bg-muted/70 px-3 py-2 font-mono text-xs tabular-nums select-all">
+                  {visibleKeyId === key.id ? key.key : key.maskedKey}
+                </code>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)}>{visibleKeyId === key.id ? 'Hide' : 'Show'}</Button>
+                <Button variant="default" size="sm" onClick={() => copy(key)}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
+                <Switch checked={key.enabled} onCheckedChange={(enabled) => toggleKey.mutate({ id: key.id, enabled })} />
+                <Button variant="ghost" size="sm" onClick={() => deleteClientKey.mutate(key.id)}>Delete</Button>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </section>
   )
@@ -278,7 +334,7 @@ export default function KeysPage() {
       />
 
       <div className="space-y-7">
-        <UnifiedKeySection />
+        <ClientKeysSection />
 
         <div className="grid gap-3 sm:grid-cols-4">
           <StatCard label="Provider keys" value={keys.length} />

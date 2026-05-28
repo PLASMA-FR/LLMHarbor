@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { ChatMessage } from '@llmharbor/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getDb, isValidClientApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 
 export const proxyRouter = Router();
@@ -230,12 +230,11 @@ export function isRetryableError(err: any): boolean {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Authenticate with the unified API key for every proxy request, including
-  // loopback callers. Browser pages can reach localhost, so socket locality is
-  // not a reliable authorization boundary.
+  // Authenticate with any enabled personal API key for every proxy request,
+  // including loopback callers. Browser pages can reach localhost, so socket
+  // locality is not a reliable authorization boundary.
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  if (!token || !isValidClientApiKey(token, timingSafeStringEqual)) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
     });

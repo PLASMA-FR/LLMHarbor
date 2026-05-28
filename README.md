@@ -5,7 +5,7 @@
 
   **Drop one anchor. Route every model.**
 
-  A self-hosted OpenAI-compatible router for free-tier and local LLM endpoints. Add your provider keys once, get one local API key, and let LLMHarbor route requests across the models that still have budget left.
+  A self-hosted personal API platform for free-tier and local LLM endpoints. Add your provider keys once, mint separate local client keys for every app or agent, and let LLMHarbor route requests across the models that still have budget left.
 
   <p>
     <a href="https://github.com/PLASMA-FR/LLMHarbor/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/PLASMA-FR/LLMHarbor/ci.yml?branch=main&label=tests&style=for-the-badge"></a>
@@ -29,7 +29,7 @@
 
 ## What is LLMHarbor?
 
-LLMHarbor is a local control plane for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: encrypted provider keys, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, and request analytics.
+LLMHarbor is a local personal API platform for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: multiple client API keys, encrypted provider keys, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, and request analytics.
 
 Use it when you want one stable local endpoint for experiments, coding agents, small tools, and personal workflows without wiring every provider into every app.
 
@@ -52,7 +52,7 @@ Free tiers are useful, but they are scattered. Each provider has its own key, mo
 LLMHarbor puts a harbor in front of that traffic.
 
 - One local OpenAI-compatible base URL.
-- One unified API key for your clients.
+- Multiple personal client API keys for apps, agents, laptops, and experiments.
 - Many upstream providers behind it.
 - A fallback chain you can inspect and reorder.
 - A dashboard that shows what happened after each request.
@@ -68,6 +68,7 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 | Fallbacks | On 429, 5xx, timeout, or provider failure, LLMHarbor cools that key down and tries the next enabled route. |
 | Streaming | Server-Sent Events are supported for `stream: true`. |
 | Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
+| Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, disable or delete one without rotating everything. |
 | Key storage | Provider keys are encrypted with AES-256-GCM before they are written to SQLite. |
 | Rate tracking | RPM, RPD, TPM, and TPD counters are tracked per provider, model, and key. |
 | Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
@@ -87,7 +88,7 @@ Send a request through the router, inspect the routed provider, and see latency 
 
 ### Keys
 
-Store provider credentials, copy your unified API key, check health, and manage custom OpenAI-compatible endpoints.
+Store provider credentials, create personal client keys, check health, and manage custom OpenAI-compatible endpoints.
 
 <p align="center">
   <img src="repo-assets/keys.png" alt="LLMHarbor keys page" width="920" />
@@ -147,13 +148,36 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 
 ### One-line install
 
+macOS / Linux:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install.sh | bash
 llmharbor start
 llmharbor open
 ```
 
-The installer clones the repo to `~/.llmharbor/app`, creates a local `.env` with a fresh encryption key, installs dependencies, builds the production app, and links `llmharbor` into `~/.local/bin`.
+macOS-specific installer with Homebrew/Xcode hints:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install-macos.sh | bash
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/PLASMA-FR/LLMHarbor/main/install.ps1 | iex
+llmharbor start
+llmharbor open
+```
+
+The installers clone the repo, create a local `.env` with a fresh encryption key, install dependencies, build the production app, and place a `llmharbor` command on your PATH. Defaults:
+
+| OS | App directory | Command directory |
+|---|---|---|
+| Linux/macOS | `~/.llmharbor/app` | `~/.local/bin` or `/usr/local/bin` on macOS when writable |
+| Windows | `%USERPROFILE%\.llmharbor\app` | `%LOCALAPPDATA%\LLMHarbor\bin` |
+
+Override with `LLMHARBOR_HOME`, `LLMHARBOR_BIN_DIR`, or `LLMHARBOR_REPO` when needed.
 
 ### Manual install
 
@@ -201,7 +225,7 @@ Then:
 1. Go to **Keys** and add provider keys or a custom endpoint.
 2. Go to **Models** and probe the models you want to use.
 3. Go to **Fallback** and order the route list.
-4. Copy the unified API key from **Keys**.
+4. Create or copy a client API key from **Keys**.
 5. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
 
 ### Production build

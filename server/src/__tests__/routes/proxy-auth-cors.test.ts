@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb } from '../../db/index.js';
+import { initDb, isValidClientApiKey } from '../../db/index.js';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0);
@@ -39,6 +39,25 @@ describe('Proxy authentication and CORS', () => {
 
     expect(status).toBe(401);
     expect(body.error.type).toBe('authentication_error');
+  });
+
+  it('creates multiple personal client API keys and authenticates any enabled key', async () => {
+    const created = await request(app, 'POST', '/api/settings/api-keys', { label: 'CI agent' });
+    expect(created.status).toBe(201);
+    expect(created.body.label).toBe('CI agent');
+    expect(created.body.key).toMatch(/^llmharbor-/);
+
+    const listed = await request(app, 'GET', '/api/settings/api-keys');
+    expect(listed.status).toBe(200);
+    expect(listed.body.length).toBeGreaterThanOrEqual(2);
+
+    const compare = (provided: string, expected: string) => provided === expected;
+    expect(isValidClientApiKey(created.body.key, compare)).toBe(true);
+
+    const disabled = await request(app, 'PATCH', `/api/settings/api-keys/${created.body.id}`, { enabled: false });
+    expect(disabled.status).toBe(200);
+    expect(disabled.body.enabled).toBe(false);
+    expect(isValidClientApiKey(created.body.key, compare)).toBe(false);
   });
 
   it('does not grant CORS access to arbitrary browser origins', async () => {
