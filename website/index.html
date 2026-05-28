@@ -30,7 +30,7 @@
   <main id="top">
     <section class="hero section-grid">
       <div class="hero-copy">
-        <p class="eyebrow">Self-hosted · local-first · OpenAI compatible</p>
+        <p class="eyebrow">Self-hosted, local-first, OpenAI compatible</p>
         <h1>Bring every LLM key into one quiet harbor.</h1>
         <p class="lead">LLMHarbor sits between your apps and model providers. Add provider keys, choose fallback order, watch traffic, and keep one stable OpenAI-compatible endpoint for your agents, editors, and experiments.</p>
         <div class="hero-actions">
@@ -140,7 +140,10 @@ AIzaSy...three</code></pre>
             <li>Add at least one provider key, then run Check all.</li>
             <li>Point any OpenAI-compatible client at <code>http://127.0.0.1:3001/v1</code>.</li>
           </ol>
-          <pre><code>curl http://127.0.0.1:3001/v1/chat/completions -H Authorization:Bearer-llmharbor-key -H Content-Type:application/json -d '{&quot;model&quot;:&quot;auto&quot;,&quot;messages&quot;:[{&quot;role&quot;:&quot;user&quot;,&quot;content&quot;:&quot;hello&quot;}]}'</code></pre>
+          <pre><code>curl http://127.0.0.1:3001/v1/chat/completions \
+  -H &quot;Authorization: Bearer $LLMHARBOR_KEY&quot; \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'</code></pre>
         </article>
 
         <article id="concepts" class="doc-section">
