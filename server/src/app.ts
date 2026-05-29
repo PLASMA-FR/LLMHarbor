@@ -12,6 +12,8 @@ import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
 import { endpointsRouter } from './routes/endpoints.js';
+import { oauthRouter } from './routes/oauth.js';
+import { mediaRouter } from './routes/media.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -94,9 +96,13 @@ export function createApp() {
   app.use('/api/health', healthRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/endpoints', endpointsRouter);
+  app.use('/api/oauth', oauthRouter);
 
   // OpenAI-compatible proxy
   app.use('/v1', proxyRouter);
+  app.use('/v1', mediaRouter);
+  app.use('/e/:endpointSlug/v1', proxyRouter);
+  app.use('/e/:endpointSlug/v1', mediaRouter);
 
   // Error handler (for API routes)
   app.use(errorHandler);

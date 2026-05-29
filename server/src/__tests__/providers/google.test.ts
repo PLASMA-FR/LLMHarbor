@@ -309,4 +309,75 @@ describe('GoogleProvider', () => {
     expect(toolDeltas[0].function.arguments).toBe('{"city":"Karachi"}');
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
+
+  it('uses Antigravity Code Assist wrapper for Google browser OAuth requests', async () => {
+    let capturedUrl = '';
+    let capturedHeaders: any;
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = typeof url === 'string' ? url : url.toString();
+      capturedHeaders = (init as any).headers;
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          response: {
+            candidates: [{ content: { parts: [{ text: 'ahoy' }] }, finishReason: 'STOP' }],
+            usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
+          },
+        }),
+      } as any;
+    });
+
+    const result = await provider.chatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+      { oauth: { accountId: 7, provider: 'antigravity', accountHint: 'captain@example.com', metadata: { cloudaicompanionProject: 'cloud-project-123' } } },
+    );
+
+    expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent');
+    expect(capturedHeaders.Authorization).toBe('Bearer oauth-access-token');
+    expect(capturedHeaders['X-Client-Name']).toBe('antigravity');
+    expect(capturedHeaders['X-Machine-Session-Id']).toBeTruthy();
+    expect(capturedBody).toMatchObject({
+      project: 'cloud-project-123',
+      model: 'gemini-2.5-pro',
+      userAgent: 'antigravity',
+      requestType: 'agent',
+    });
+    expect(capturedBody.requestId).toMatch(/^agent-/);
+    expect(capturedBody.request.sessionId).toEqual(expect.any(String));
+    expect(capturedBody.request.sessionId).toHaveLength(49);
+    expect(capturedBody.request.systemInstruction.parts[0].text).toContain('You are Antigravity');
+    expect(capturedBody.request.systemInstruction.parts[1].text).toContain('[ignore]');
+    expect(capturedBody.request.contents[0].parts[0].text).toBe('Hi');
+    expect(result.choices[0].message.content).toBe('ahoy');
+  });
+
+  it('uses Code Assist SSE endpoint for non-streaming Antigravity thinking models', async () => {
+    let capturedUrl = '';
+    let capturedAccept = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = typeof url === 'string' ? url : url.toString();
+      capturedAccept = String(((init as any).headers as any).Accept ?? '');
+      return new Response(
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"think"}]}}]}}\n\n' +
+        'data: {"response":{"candidates":[{"content":{"parts":[{"text":"ing"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":2,"totalTokenCount":4}}}\n\n',
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      );
+    });
+
+    const result = await provider.chatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-3-pro-preview',
+      { oauth: { accountId: 7, provider: 'antigravity', accountHint: 'captain@example.com', metadata: { cloudaicompanionProject: 'cloud-project-123' } } },
+    );
+
+    expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse');
+    expect(capturedAccept).toBe('text/event-stream');
+    expect(result.choices[0].message.content).toBe('thinking');
+    expect(result.usage.total_tokens).toBe(4);
+  });
 });

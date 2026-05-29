@@ -3,9 +3,9 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@llmharbor/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import { routeRequestAsync, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
-import { getDb, isValidClientApiKey } from '../db/index.js';
+import { authenticateClientApiKey, checkClientApiKeyLimits, getDb, recordClientApiKeyUsage } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 
 export const proxyRouter = Router();
@@ -85,7 +85,24 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
 // OpenAI-compatible /models endpoint (used by Hermes for metadata)
 proxyRouter.get('/models', (_req: Request, res: Response) => {
   const db = getDb();
-  const models = db.prepare('SELECT platform, model_id, display_name, context_window FROM models WHERE enabled = 1 ORDER BY intelligence_rank').all() as any[];
+  const models = db.prepare(`
+    SELECT m.platform, m.model_id, m.display_name, m.context_window
+      FROM models m
+     WHERE m.enabled = 1
+       AND EXISTS (
+         SELECT 1
+           FROM api_keys ak
+           LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
+          WHERE ak.platform = m.platform
+            AND ak.enabled = 1
+            AND (ak.status IN ('healthy', 'unknown') OR ak.source = 'oauth')
+            AND (
+              ak.source != 'oauth'
+              OR (oa.enabled = 1 AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1)
+            )
+       )
+     ORDER BY m.intelligence_rank
+  `).all() as any[];
   res.json({
     object: 'list',
     data: [
@@ -234,7 +251,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // including loopback callers. Browser pages can reach localhost, so socket
   // locality is not a reliable authorization boundary.
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-  if (!token || !isValidClientApiKey(token, timingSafeStringEqual)) {
+  const clientKey = token ? authenticateClientApiKey(token, timingSafeStringEqual) : null;
+  if (!clientKey) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
     });
@@ -297,17 +315,53 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }, 0);
   const estimatedTotal = estimatedInputTokens + (max_tokens ?? 1000);
 
+  const clientLimitBlock = checkClientApiKeyLimits(clientKey, estimatedTotal);
+  if (clientLimitBlock) {
+    res.setHeader('Retry-After', String(clientLimitBlock.retryAfterSeconds));
+    res.status(429).json({
+      error: {
+        message: clientLimitBlock.message,
+        type: 'rate_limit_error',
+        code: 'client_key_limit_exceeded',
+        metric: clientLimitBlock.metric,
+        limit: clientLimitBlock.limit,
+        used: clientLimitBlock.used,
+        requested: clientLimitBlock.requested,
+      },
+    });
+    return;
+  }
+
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
   // different model would be surprising to OpenAI-compatible clients.
   // Sticky-session is the fallback when no `model` field was sent at all.
   let preferredModel: number | undefined;
+  const explicitModelStrict = Boolean(requestedModel && !isAutoModel(requestedModel));
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
     const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    const enabled = db.prepare(`
+      SELECT m.id
+        FROM models m
+       WHERE m.model_id = ?
+         AND m.enabled = 1
+         AND EXISTS (
+           SELECT 1 FROM api_keys ak
+           LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
+            WHERE ak.platform = m.platform
+              AND ak.enabled = 1
+              AND (ak.status IN ('healthy', 'unknown') OR ak.source = 'oauth')
+              AND (
+                ak.source != 'oauth'
+                OR (oa.enabled = 1 AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1)
+              )
+         )
+       ORDER BY CASE WHEN m.display_name LIKE '%browser account%' THEN 0 ELSE 1 END, m.intelligence_rank ASC, m.id ASC
+       LIMIT 1
+    `).get(requestedModel) as { id: number } | undefined;
     if (enabled) {
       preferredModel = enabled.id;
     } else {
@@ -333,14 +387,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel);
+      route = await routeRequestAsync(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, explicitModelStrict);
     } catch (err: any) {
       // No more models available
       if (lastError) {
-        res.status(429).json({
+        const lastMessage = String(lastError.message ?? lastError);
+        const strictRateLimited = explicitModelStrict && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
+        res.status(explicitModelStrict ? (strictRateLimited ? 429 : 502) : 429).json({
           error: {
-            message: `All models rate-limited. Last error: ${lastError.message}`,
-            type: 'rate_limit_error',
+            message: explicitModelStrict
+              ? `Requested model '${requestedModel}' failed and no fallback was attempted. Last error: ${lastMessage}`
+              : `All models rate-limited. Last error: ${lastMessage}`,
+            type: explicitModelStrict ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
+            ...(explicitModelStrict ? { code: 'model_no_fallback' } : {}),
           },
         });
       } else {
@@ -363,7 +422,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
-            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, oauth: route.oauth },
           );
 
           for await (const chunk of gen) {
@@ -389,6 +448,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.end();
 
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          recordClientApiKeyUsage(clientKey.id, estimatedInputTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId);
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
@@ -412,11 +472,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, messages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, oauth: route.oauth },
         );
 
-        const totalTokens = result.usage?.total_tokens ?? 0;
+        const totalTokens = result.usage?.total_tokens ?? estimatedTotal;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
+        recordClientApiKeyUsage(clientKey.id, totalTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId);
 
@@ -448,7 +509,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, ${explicitModelStrict ? 'retrying same requested model/key pool' : 'falling back'} (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
@@ -464,10 +525,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   // Exhausted all retries
-  res.status(429).json({
+  const lastMessage = String(lastError?.message ?? lastError ?? 'unknown error');
+  const strictRateLimited = explicitModelStrict && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
+  res.status(explicitModelStrict ? (strictRateLimited ? 429 : 502) : 429).json({
     error: {
-      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`,
-      type: 'rate_limit_error',
+      message: explicitModelStrict
+        ? `Requested model '${requestedModel}' failed and no fallback was attempted. Last error: ${lastMessage}`
+        : `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastMessage}`,
+      type: explicitModelStrict ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
+      ...(explicitModelStrict ? { code: 'model_no_fallback' } : {}),
     },
   });
 });

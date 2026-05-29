@@ -15,6 +15,12 @@ export interface CompletionOptions {
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;
   parallel_tool_calls?: boolean;
+  oauth?: {
+    accountId: number;
+    provider: string;
+    accountHint?: string | null;
+    metadata?: Record<string, unknown>;
+  };
 }
 
 export abstract class BaseProvider {

@@ -43,6 +43,12 @@ interface ProbeResult {
   message?: string
 }
 
+function platformDisplay(platform: string) {
+  if (platform === 'google') return { name: 'Google AI Studio', surface: 'API key' }
+  if (platform === 'google-oauth') return { name: 'Antigravity Browser Account', surface: 'OAuth' }
+  return { name: platform, surface: null as string | null }
+}
+
 function CommandMetric({ label, value, tone = 'default' }: { label: string; value: string | number; tone?: 'default' | 'good' | 'warn' }) {
   const color = tone === 'good' ? 'text-emerald-600 dark:text-emerald-300' : tone === 'warn' ? 'text-amber-600 dark:text-amber-300' : 'text-foreground'
   return (
@@ -161,7 +167,10 @@ export default function ModelsPage() {
                       <span className="truncate">{endpoint.name}</span>
                       <span className={cn('shrink-0 rounded-lg px-2 py-0.5 text-[10px] font-semibold', endpoint.custom ? 'bg-amber-500/12 text-amber-700 dark:text-amber-300' : 'bg-primary/10 text-primary')}>{endpoint.custom ? 'Custom' : 'Built-in'}</span>
                     </span>
-                    <code className="mt-1 block truncate text-[11px] text-muted-foreground">{endpoint.platform}</code>
+                    <code className="mt-1 block truncate text-[11px] text-muted-foreground">
+                      {platformDisplay(endpoint.platform).name}
+                      {platformDisplay(endpoint.platform).surface ? ` · ${platformDisplay(endpoint.platform).surface}` : ` · ${endpoint.platform}`}
+                    </code>
                     <span className="mt-2 block truncate text-[11px] text-muted-foreground">{endpoint.baseUrl || 'Provider-specific API'}</span>
                     <span className="mt-2 block text-xs text-muted-foreground">{endpoint.modelCount} model{endpoint.modelCount === 1 ? '' : 's'} · {endpoint.keyCount} key{endpoint.keyCount === 1 ? '' : 's'}</span>
                   </button>
@@ -173,8 +182,8 @@ export default function ModelsPage() {
                   <div className="space-y-5">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-muted-foreground">{selectedEndpointInfo.custom ? 'Custom harbor' : 'Built-in harbor'}</p>
-                        <h3 className="mt-1 text-lg font-semibold tracking-[-0.03em]">{selectedEndpointInfo.name}</h3>
+                        <p className="text-sm font-medium text-muted-foreground">{selectedEndpointInfo.custom ? 'Custom harbor' : platformDisplay(selectedEndpointInfo.platform).surface ?? 'Built-in harbor'}</p>
+                        <h3 className="mt-1 text-lg font-semibold tracking-[-0.03em]">{selectedEndpointInfo.platform === 'google-oauth' ? 'Antigravity Browser Account' : selectedEndpointInfo.name}</h3>
                         <code className="mt-1 block truncate text-xs text-muted-foreground">{selectedEndpointInfo.baseUrl || selectedEndpointInfo.platform}</code>
                       </div>
                       {selectedEndpointInfo.keyCount === 0 && <span className="rounded-[var(--radius-badge)] bg-amber-500/10 px-3 py-1 text-xs text-amber-700 dark:text-amber-300">Add a key before probing</span>}

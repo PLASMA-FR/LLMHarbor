@@ -42,10 +42,14 @@ describe('Proxy authentication and CORS', () => {
   });
 
   it('creates multiple personal client API keys and authenticates any enabled key', async () => {
-    const created = await request(app, 'POST', '/api/settings/api-keys', { label: 'CI agent' });
+    const created = await request(app, 'POST', '/api/settings/api-keys', {
+      label: 'CI agent',
+      limits: { rpm: 3, rpd: 20, tpm: null, tpd: 5000 },
+    });
     expect(created.status).toBe(201);
     expect(created.body.label).toBe('CI agent');
     expect(created.body.key).toMatch(/^llmharbor-/);
+    expect(created.body.limits).toEqual({ rpm: 3, rpd: 20, tpm: null, tpd: 5000 });
 
     const listed = await request(app, 'GET', '/api/settings/api-keys');
     expect(listed.status).toBe(200);
@@ -54,6 +58,18 @@ describe('Proxy authentication and CORS', () => {
 
     const compare = (provided: string, expected: string) => provided === expected;
     expect(isValidClientApiKey(created.body.key, compare)).toBe(true);
+
+    const limited = await request(app, 'PATCH', `/api/settings/api-keys/${created.body.id}`, {
+      limits: { rpm: 1, rpd: null, tpm: 42, tpd: null },
+    });
+    expect(limited.status).toBe(200);
+    expect(limited.body.limits).toEqual({ rpm: 1, rpd: null, tpm: 42, tpd: null });
+
+    const invalidLimit = await request(app, 'POST', '/api/settings/api-keys', {
+      label: 'bad limit',
+      limits: { rpm: 0 },
+    });
+    expect(invalidLimit.status).toBe(400);
 
     const disabled = await request(app, 'PATCH', `/api/settings/api-keys/${created.body.id}`, { enabled: false });
     expect(disabled.status).toBe(200);

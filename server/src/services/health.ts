@@ -14,6 +14,13 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
   const row = db.prepare('SELECT * FROM api_keys WHERE id = ?').get(keyId) as any;
   if (!row) return 'error';
 
+  if (row.source === 'oauth' || row.oauth_account_id) {
+    db.prepare("UPDATE api_keys SET status = 'healthy', last_checked_at = datetime('now') WHERE id = ?")
+      .run(keyId);
+    failureCount.delete(keyId);
+    return 'healthy';
+  }
+
   const provider = getProvider(row.platform as Platform);
   if (!provider) return 'error';
 

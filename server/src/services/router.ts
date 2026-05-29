@@ -1,6 +1,6 @@
 import { getDb } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
-import { decrypt } from '../lib/crypto.js';
+import { decrypt, encrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
 import type { BaseProvider } from '../providers/base.js';
 
@@ -23,6 +23,125 @@ interface KeyRow {
   auth_tag: string;
   status: string;
   enabled: number;
+  oauth_account_id?: number | null;
+}
+
+function refreshTokenForProvider(provider: string, rawRefreshToken: string) {
+  // Antigravity-compatible tools may persist refresh tokens as
+  // refreshToken|duetProject|managedProject. Google only accepts the first
+  // segment at oauth2.googleapis.com/token.
+  return provider === 'antigravity' ? rawRefreshToken.split('|')[0] : rawRefreshToken;
+}
+
+function markOAuthAccountNeedsReconnect(db: ReturnType<typeof getDb>, account: any, message: string) {
+  let metadata: Record<string, unknown> = {};
+  try {
+    metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {};
+  } catch {}
+  metadata.oauthNeedsReconnect = true;
+  metadata.oauthDiscoveryError = message;
+  metadata.oauthModelCount = 0;
+  metadata.oauthLastDiscoveredAt = new Date().toISOString();
+  db.prepare(`
+    UPDATE oauth_accounts
+       SET metadata_json = ?, last_discovered_at = datetime('now')
+     WHERE id = ?
+  `).run(JSON.stringify(metadata), account.id);
+  db.prepare(`
+    UPDATE api_keys
+       SET status = 'invalid', enabled = 0, last_checked_at = datetime('now')
+     WHERE oauth_account_id = ?
+  `).run(account.id);
+}
+
+interface OAuthAccountRow {
+  id: number;
+  provider: string;
+  account_hint: string | null;
+  metadata_json: string | null;
+}
+
+function oauthClient(provider: string) {
+  if (provider === 'openai') {
+    return {
+      clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+      tokenUrl: 'https://auth.openai.com/oauth/token',
+      clientSecret: '',
+    };
+  }
+  if (provider === 'antigravity') {
+    return {
+      clientId: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com',
+      tokenUrl: 'https://oauth2.googleapis.com/token',
+      clientSecret: process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET || '',
+    };
+  }
+  return null;
+}
+
+async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
+  if (!key.oauth_account_id) return null;
+  const db = getDb();
+  const account = db.prepare('SELECT * FROM oauth_accounts WHERE id = ? AND enabled = 1').get(key.oauth_account_id) as any;
+  if (!account) return null;
+  const expiresAt = account.expires_at ? Date.parse(account.expires_at) : 0;
+  if (!expiresAt || expiresAt - Date.now() > 5 * 60 * 1000) return null;
+  if (!account.encrypted_refresh_token || !account.refresh_iv || !account.refresh_auth_tag) {
+    const message = `${account.provider === 'antigravity' ? 'Antigravity' : 'ChatGPT'} OAuth access token expired and no refresh token is available.`;
+    markOAuthAccountNeedsReconnect(db, account, message);
+    const err = new Error(`${message} Reconnect the browser account.`) as any;
+    err.status = 401;
+    throw err;
+  }
+  const rawRefreshToken = decrypt(account.encrypted_refresh_token, account.refresh_iv, account.refresh_auth_tag);
+  const refreshToken = refreshTokenForProvider(account.provider, rawRefreshToken);
+  const client = oauthClient(account.provider);
+  if (!client) return null;
+  if (account.provider !== 'openai' && !client.clientSecret) return null;
+  const params = new URLSearchParams({
+    grant_type: 'refresh_token',
+    client_id: client.clientId,
+    refresh_token: refreshToken,
+  });
+  if (client.clientSecret) params.set('client_secret', client.clientSecret);
+  const upstream = await fetch(client.tokenUrl, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString(),
+  });
+  if (!upstream.ok) {
+    const message = `${client.clientId === '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com' ? 'Antigravity' : 'ChatGPT'} OAuth token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
+    markOAuthAccountNeedsReconnect(db, account, message);
+    const err = new Error(`${message} Reconnect the browser account.`) as any;
+    err.status = 401;
+    throw err;
+  }
+  const tokenData = await upstream.json() as any;
+  if (!tokenData.access_token) {
+    const message = `${client.clientId === '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com' ? 'Antigravity' : 'ChatGPT'} OAuth token refresh response did not contain an access token.`;
+    markOAuthAccountNeedsReconnect(db, account, message);
+    const err = new Error(`${message} Reconnect the browser account.`) as any;
+    err.status = 401;
+    throw err;
+  }
+  const access = encrypt(String(tokenData.access_token));
+  const nextRefresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
+  const expires = typeof tokenData.expires_in === 'number' ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : account.expires_at;
+  db.prepare(`
+    UPDATE oauth_accounts
+    SET encrypted_access_token = ?, access_iv = ?, access_auth_tag = ?,
+        encrypted_refresh_token = COALESCE(?, encrypted_refresh_token),
+        refresh_iv = COALESCE(?, refresh_iv),
+        refresh_auth_tag = COALESCE(?, refresh_auth_tag),
+        expires_at = ?, last_used_at = datetime('now')
+    WHERE id = ?
+  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expires, account.id);
+  db.prepare(`
+    UPDATE api_keys
+    SET encrypted_key = ?, iv = ?, auth_tag = ?, status = 'healthy', last_checked_at = datetime('now')
+    WHERE id = ?
+  `).run(access.encrypted, access.iv, access.authTag, key.id);
+  return String(tokenData.access_token);
 }
 
 interface FallbackRow {
@@ -39,6 +158,29 @@ export interface RouteResult {
   keyId: number;
   platform: string;
   displayName: string;
+  oauth?: {
+    accountId: number;
+    provider: string;
+    accountHint?: string | null;
+    metadata?: Record<string, unknown>;
+  };
+}
+
+function oauthOptionsForKey(db: ReturnType<typeof getDb>, key: KeyRow): RouteResult['oauth'] {
+  if (!key.oauth_account_id) return undefined;
+  const account = db.prepare('SELECT id, provider, account_hint, metadata_json FROM oauth_accounts WHERE id = ? AND enabled = 1')
+    .get(key.oauth_account_id) as OAuthAccountRow | undefined;
+  if (!account) return undefined;
+  let metadata: Record<string, unknown> = {};
+  try {
+    metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {};
+  } catch {}
+  return {
+    accountId: account.id,
+    provider: account.provider,
+    accountHint: account.account_hint,
+    metadata,
+  };
 }
 
 // Round-robin index per platform
@@ -131,7 +273,7 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
  * @param preferredModelDbId - try this model first (sticky session)
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, strictPreferredModel = false): RouteResult {
   const db = getDb();
 
   // Get fallback chain ordered by priority
@@ -147,10 +289,21 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     effectivePriority: entry.priority + getPenalty(entry.model_db_id),
   })).sort((a, b) => a.effectivePriority - b.effectivePriority);
 
-  // Sticky session: move preferred model to front of chain
+  // Sticky session: move preferred model to front of chain. Explicit model
+  // requests use strict mode so provider errors/rate limits never silently
+  // switch to a different model id.
   if (preferredModelDbId) {
     const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
-    if (idx > 0) {
+    if (strictPreferredModel) {
+      if (idx === -1) {
+        const err = new Error('Requested model is not available in the fallback chain.') as any;
+        err.status = 404;
+        throw err;
+      }
+      const preferred = sortedChain[idx];
+      sortedChain.length = 0;
+      sortedChain.push(preferred);
+    } else if (idx > 0) {
       const [preferred] = sortedChain.splice(idx, 1);
       sortedChain.unshift(preferred);
     }
@@ -169,7 +322,16 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
     // Get enabled keys that have not already failed validation or decryption.
     const keys = db.prepare(
-      "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+      `SELECT ak.*
+         FROM api_keys ak
+         LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
+        WHERE ak.platform = ?
+          AND ak.enabled = 1
+          AND (ak.status IN ('healthy', 'unknown') OR ak.source = 'oauth')
+          AND (
+            ak.source != 'oauth'
+            OR (oa.enabled = 1 AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1)
+          )`
     ).all(model.platform) as KeyRow[];
 
     if (keys.length === 0) continue;
@@ -218,6 +380,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         keyId: key.id,
         platform: model.platform,
         displayName: model.display_name,
+        oauth: oauthOptionsForKey(db, key),
       };
     }
 
@@ -233,4 +396,14 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
   err.status = 429;
   throw err;
+}
+
+export async function routeRequestAsync(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, strictPreferredModel = false): Promise<RouteResult> {
+  const route = routeRequest(estimatedTokens, skipKeys, preferredModelDbId, strictPreferredModel);
+  const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
+  if (key?.oauth_account_id) {
+    const refreshed = await refreshOAuthKeyIfNeeded(key);
+    if (refreshed) return { ...route, apiKey: refreshed };
+  }
+  return route;
 }

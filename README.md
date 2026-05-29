@@ -35,7 +35,7 @@
 
 ## What is LLMHarbor?
 
-LLMHarbor is a local personal API platform for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: multiple client API keys, encrypted provider keys, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, and request analytics.
+LLMHarbor is a local personal API platform for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: multiple client API keys with request/token limits, encrypted provider keys, browser OAuth accounts, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, media routes, and request analytics.
 
 Use it when you want one stable local endpoint for experiments, coding agents, small tools, and personal workflows without wiring every provider into every app.
 
@@ -59,7 +59,8 @@ LLMHarbor puts a harbor in front of that traffic.
 
 - One local OpenAI-compatible base URL.
 - Multiple personal client API keys for apps, agents, laptops, and experiments.
-- Many upstream providers behind it.
+- Optional RPM/RPD/TPM/TPD limits per local client key.
+- API-key providers and browser OAuth accounts behind it.
 - A fallback chain you can inspect and reorder.
 - A dashboard that shows what happened after each request.
 
@@ -74,9 +75,10 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 | Fallbacks | On 429, 5xx, timeout, or provider failure, LLMHarbor cools that key down and tries the next enabled route. |
 | Streaming | Server-Sent Events are supported for `stream: true`. |
 | Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
-| Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, disable or delete one without rotating everything. |
-| Key storage | Provider keys are encrypted with AES-256-GCM before they are written to SQLite. |
-| Rate tracking | RPM, RPD, TPM, and TPD counters are tracked per provider, model, and key. |
+| Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, add optional RPM/RPD/TPM/TPD limits, disable or delete one without rotating everything. |
+| Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT and Antigravity through loopback OAuth with encrypted refresh storage and live model discovery. |
+| Key storage | Provider keys and OAuth tokens are encrypted with AES-256-GCM before they are written to SQLite. |
+| Rate tracking | RPM, RPD, TPM, and TPD counters are tracked per provider, model, upstream key, and local client key. |
 | Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
 | Custom providers | Add any OpenAI-compatible endpoint from the dashboard. Local vLLM, Ollama-compatible gateways, OpenCode Zen, and private gateways fit here. |
 | Model probes | Test whether a model works before putting traffic on it. |
@@ -94,7 +96,7 @@ Send a request through the router, inspect the routed provider, and see latency 
 
 ### Keys
 
-Store provider credentials, create personal client keys, check health, and manage custom OpenAI-compatible endpoints.
+Store provider credentials, create personal client keys with limits, check health, connect browser OAuth accounts, and manage custom OpenAI-compatible endpoints.
 
 <p align="center">
   <img src="repo-assets/keys.png" alt="LLMHarbor keys page" width="920" />
@@ -130,7 +132,9 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 
 | Provider | Typical models or routes | Notes |
 |---|---|---|
-| Google AI Studio | Gemini Flash and Pro family | Native adapter with OpenAI shape translation. |
+| Google API keys | Gemini Flash and Pro family | Native adapter with OpenAI shape translation. |
+| OpenAI / ChatGPT OAuth | Account-discovered GPT and Codex routes | Browser OAuth account flow with loopback callback and live inventory. |
+| Antigravity OAuth | Google Code Assist / Gemini routes | Browser OAuth account flow with Code Assist inventory and reconnect handling. |
 | Groq | Llama, GPT-OSS, Qwen | Fast OpenAI-compatible route. |
 | Cerebras | Qwen and Llama routes | Fast inference, quota-dependent. |
 | SambaNova | DeepSeek, Llama, Gemma | OpenAI-compatible route. |
@@ -232,9 +236,10 @@ Then:
    - For one key, paste it into **Add a provider key**.
    - For many keys, use **Bulk import provider keys** with a `.txt` file: one key per line. The provider id follows the visible list, so Google is `1`, Groq is `2`, and custom providers continue after built-ins.
 2. Go to **Models** and probe the models you want to use.
-3. Go to **Fallback** and order the route list.
-4. Create or copy a client API key from **Keys**.
-5. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
+3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT or Antigravity.
+4. Go to **Fallback** and order the route list.
+5. Create or copy a client API key from **Keys**. Add RPM/RPD/TPM/TPD limits if the key belongs to a specific app, agent, or shared device.
+6. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
 
 ### Production build
 
@@ -279,6 +284,40 @@ curl http://localhost:3001/v1/chat/completions \
     "model": "auto",
     "messages": [{"role": "user", "content": "hi"}]
   }'
+```
+
+
+### Client key limits
+
+Local `llmharbor-*` keys can be scoped without touching upstream provider credentials. Limits are nullable; omit or set a field to `null` for unlimited.
+
+```bash
+curl http://127.0.0.1:3001/api/settings/api-keys \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "editor agent",
+    "limits": {
+      "rpm": 30,
+      "rpd": 500,
+      "tpm": 90000,
+      "tpd": 1000000
+    }
+  }'
+```
+
+When a client key crosses a request or token limit, LLMHarbor returns `429` with `error.code = "client_key_limit_exceeded"` and a `Retry-After` header before spending upstream quota.
+
+### Browser OAuth accounts
+
+The OAuth page connects supported browser accounts through local loopback callbacks and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native client and requires `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` in the server environment before starting its login flow.
+
+```bash
+# Start browser-account login flows from the local dashboard/API
+POST /api/oauth/connect/openai/start
+POST /api/oauth/connect/antigravity/start
+
+# Refresh discovered account models and limits
+GET /api/oauth/accounts/:id/models
 ```
 
 ### Bulk import provider keys
@@ -365,7 +404,8 @@ Every successful response includes routing headers when available:
 | Page | Use it for |
 |---|---|
 | Playground | Send a test request and inspect the route result. |
-| Keys | Manage unified API key, provider keys, key health, and custom providers. |
+| Keys | Manage local client keys, per-key limits, provider keys, key health, and custom providers. |
+| OAuth | Connect browser accounts, refresh discovered models, inspect account limits, and handle reconnects. |
 | Models | Register endpoint models and run probes. |
 | Fallback | Reorder the chain and switch models on or off. |
 | Analytics | Watch volume, latency, tokens, savings, errors, and model usage. |
@@ -375,7 +415,9 @@ Every successful response includes routing headers when available:
 ```mermaid
 flowchart LR
   A[OpenAI SDK, curl, agents] -->|Bearer llmharbor key| B[Express API]
-  B --> C{Model requested?}
+  B --> L{Client key under limit?}
+  L -->|no| R[429 with Retry-After]
+  L -->|yes| C{Model requested?}
   C -->|auto| D[Router picks highest priority healthy model]
   C -->|specific model| E[Router finds matching enabled model]
   D --> F[Decrypt provider key in memory]
@@ -384,7 +426,7 @@ flowchart LR
   G -->|success| H[Return OpenAI-shaped response]
   G -->|429, timeout, 5xx| I[Cooldown key and try next fallback]
   I --> D
-  H --> J[Write analytics and token usage]
+  H --> J[Write analytics, provider usage, and client-key usage]
 ```
 
 Main pieces:
@@ -393,9 +435,12 @@ Main pieces:
 |---|---|---|
 | API app | `server/src/app.ts` | Express routes, CORS, OpenAI-compatible surface. |
 | Router | `server/src/services/router.ts` | Model choice, fallback attempts, sticky sessions. |
-| Rate limiter | `server/src/services/ratelimit.ts` | RPM, RPD, TPM, TPD accounting and cooldowns. |
+| Rate limiter | `server/src/services/ratelimit.ts` | Provider-side RPM, RPD, TPM, TPD accounting and cooldowns. |
 | Providers | `server/src/providers/*.ts` | Provider-specific request and streaming adapters. |
-| Keys routes | `server/src/routes/keys.ts` | Unified API key and provider credential management. |
+| Keys routes | `server/src/routes/keys.ts` | Provider credential management and bulk import. |
+| Settings routes | `server/src/routes/settings.ts` | Local client API keys, per-key limits, and local endpoint keys. |
+| OAuth routes | `server/src/routes/oauth.ts` | Browser-account OAuth flows, encrypted account storage, and discovered inventory. |
+| Media routes | `server/src/routes/media.ts` | OpenAI-style image and speech proxy routes. |
 | Endpoint routes | `server/src/routes/endpoints.ts` | Custom providers and model registry. |
 | Database | `server/src/db/index.ts` | SQLite schema, seed catalog, encrypted key storage. |
 | Dashboard | `client/src` | React control plane. |
@@ -409,18 +454,17 @@ LLMHarbor is local-first and single-user by design.
 - The encryption key comes from `ENCRYPTION_KEY` in `.env` for real use.
 - The development fallback key is only for local experimentation. Do not use it with real provider credentials.
 - Clients call LLMHarbor with one `llmharbor-...` token.
-- Upstream provider keys never leave the server process.
+- Each local client token can have independent request and token limits.
+- Upstream provider keys and OAuth refresh tokens never leave the server process.
 - The server binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` only behind your own firewall, VPN, or authenticated reverse proxy.
 - The dashboard/control-plane API stays loopback-only by default even when the authenticated `/v1` proxy is remotely bound. Set `LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE=1` only behind your own network controls.
 - Do not expose your LLMHarbor instance directly to the public internet.
 
 ## What is not supported yet
 
-LLMHarbor intentionally starts with chat completions.
+LLMHarbor focuses on chat completions and a small set of OpenAI-style media routes. These endpoint families are still out of scope:
 
 - Embeddings: `/v1/embeddings`
-- Image generation: `/v1/images/*`
-- Audio and speech: `/v1/audio/*`
 - Moderation: `/v1/moderations`
 - Legacy completions: `/v1/completions`
 - `n > 1` multi-completion requests
@@ -468,7 +512,7 @@ npm run build
 LLMHarbor/
   client/               React + Vite dashboard
     src/components/     Shared UI primitives and app shell pieces
-    src/pages/          Playground, Keys, Models, Fallback, Analytics
+    src/pages/          Playground, Keys, OAuth, Models, Fallback, Analytics, Settings
   server/               Express API and provider routing
     src/db/             SQLite schema and model catalog
     src/providers/      Provider adapters
@@ -476,6 +520,7 @@ LLMHarbor/
     src/services/       Router, health checks, rate limiter
   shared/               Shared TypeScript types
   bin/                  LLMHarbor command line
+  website/              Static GitHub Pages site
   docs/                 Logo, Open Graph assets, generated docs assets
   repo-assets/          README screenshots
   install.sh            Curl-friendly installer script

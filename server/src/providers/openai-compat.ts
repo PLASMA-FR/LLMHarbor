@@ -44,6 +44,9 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
+    if (this.platform === 'openai' && options?.oauth?.provider === 'openai') {
+      return this.chatGptSubscriptionCompletion(apiKey, messages, modelId, options);
+    }
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -80,6 +83,10 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
+    if (this.platform === 'openai' && options?.oauth?.provider === 'openai') {
+      yield* this.streamChatGptSubscriptionCompletion(apiKey, messages, modelId, options);
+      return;
+    }
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -147,6 +154,230 @@ export class OpenAICompatProvider extends BaseProvider {
     }, 10000);
     return res.status !== 401 && res.status !== 403;
   }
+
+  private chatGptHeaders(accessToken: string): Record<string, string> {
+    const accountId = extractOpenAIAccountId(accessToken);
+    return {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'LLMHarbor/0.1.0',
+      'originator': 'llmharbor',
+      ...(accountId ? { 'ChatGPT-Account-Id': accountId } : {}),
+    };
+  }
+
+  private responsesBody(messages: ChatMessage[], modelId: string, options?: CompletionOptions, stream = false): Record<string, unknown> {
+    return {
+      model: modelId,
+      instructions: 'You are Codex, a precise coding and reasoning assistant. Answer the user directly and concisely unless more detail is needed.',
+      input: messages.map(message => ({
+        role: message.role === 'assistant' ? 'assistant' : 'user',
+        content: [{
+          type: message.role === 'assistant' ? 'output_text' : 'input_text',
+          text: normalizeMessageText(message),
+        }],
+      })),
+      stream,
+      store: false,
+      temperature: options?.temperature,
+      top_p: options?.top_p,
+    };
+  }
+
+  private async chatGptSubscriptionCompletion(
+    accessToken: string,
+    messages: ChatMessage[],
+    modelId: string,
+    options?: CompletionOptions,
+  ): Promise<ChatCompletionResponse> {
+    const res = await this.fetchWithTimeout('https://chatgpt.com/backend-api/codex/responses', {
+      method: 'POST',
+      headers: this.chatGptHeaders(accessToken),
+      body: JSON.stringify(this.responsesBody(messages, modelId, options, true)),
+    }, 120000);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`);
+    }
+    const text = await collectCodexStreamText(res);
+    return {
+      id: this.makeId(),
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      _routed_via: { platform: this.platform, model: modelId },
+    } as ChatCompletionResponse;
+  }
+
+  private async *streamChatGptSubscriptionCompletion(
+    accessToken: string,
+    messages: ChatMessage[],
+    modelId: string,
+    options?: CompletionOptions,
+  ): AsyncGenerator<ChatCompletionChunk> {
+    const res = await this.fetchWithTimeout('https://chatgpt.com/backend-api/codex/responses', {
+      method: 'POST',
+      headers: this.chatGptHeaders(accessToken),
+      body: JSON.stringify(this.responsesBody(messages, modelId, options, true)),
+    }, 120000);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`);
+    }
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('No response body');
+    const decoder = new TextDecoder();
+    const id = this.makeId();
+    let buffer = '';
+    const accumulator = new CodexTextAccumulator();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const raw = trimmed.slice(6);
+        if (raw === '[DONE]') return;
+        try {
+          const event = JSON.parse(raw) as any;
+          const text = accumulator.push(event);
+          if (typeof text === 'string' && text.length > 0) {
+            yield {
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: modelId,
+              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+            };
+          }
+        } catch {}
+      }
+    }
+    yield {
+      id,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    };
+  }
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  const part = token.split('.')[1];
+  if (!part) return null;
+  try {
+    return JSON.parse(Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function extractOpenAIAccountId(accessToken: string): string | undefined {
+  const payload = decodeJwtPayload(accessToken);
+  if (!payload) return undefined;
+  for (const key of ['account_id', 'accountId', 'https://api.openai.com/auth']) {
+    const value = payload[key];
+    if (typeof value === 'string') return value;
+    if (value && typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      if (typeof obj.account_id === 'string') return obj.account_id;
+      if (typeof obj.accountId === 'string') return obj.accountId;
+    }
+  }
+  return undefined;
+}
+
+function normalizeMessageText(message: ChatMessage): string {
+  if (typeof message.content === 'string') return message.content;
+  if (message.content == null) return '';
+  if (Array.isArray(message.content)) {
+    return message.content.map((part: any) => typeof part === 'string' ? part : (part.text ?? '')).join('');
+  }
+  return String(message.content);
+}
+
+function extractResponsesText(data: any): string {
+  if (typeof data.output_text === 'string') return data.output_text;
+  const pieces: string[] = [];
+  for (const item of data.output ?? []) {
+    for (const part of item.content ?? []) {
+      if (typeof part.text === 'string') pieces.push(part.text);
+    }
+  }
+  return pieces.join('');
+}
+
+class CodexTextAccumulator {
+  private emitted = '';
+
+  push(event: any): string {
+    const candidates = codexEventTextCandidates(event);
+    for (const candidate of candidates) {
+      if (!candidate.text) continue;
+      const next = candidate.cumulative ? this.diffCumulative(candidate.text) : candidate.text;
+      if (!next) continue;
+      this.emitted += next;
+      return next;
+    }
+    return '';
+  }
+
+  private diffCumulative(text: string): string {
+    if (!this.emitted) return text;
+    if (text === this.emitted) return '';
+    if (text.startsWith(this.emitted)) return text.slice(this.emitted.length);
+    if (this.emitted.includes(text)) return '';
+    return text;
+  }
+}
+
+function codexEventTextCandidates(event: any): Array<{ text: string; cumulative: boolean }> {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  const isDeltaEvent = type.includes('delta');
+  const candidates: Array<{ text: string; cumulative: boolean }> = [];
+
+  if (typeof event?.delta === 'string') candidates.push({ text: event.delta, cumulative: false });
+  if (typeof event?.text === 'string') candidates.push({ text: event.text, cumulative: !isDeltaEvent });
+  if (typeof event?.response?.output_text === 'string') candidates.push({ text: event.response.output_text, cumulative: true });
+  if (typeof event?.item?.content?.[0]?.text === 'string') candidates.push({ text: event.item.content[0].text, cumulative: true });
+
+  for (const item of event?.response?.output ?? event?.output ?? []) {
+    for (const part of item?.content ?? []) {
+      if (typeof part?.text === 'string') candidates.push({ text: part.text, cumulative: true });
+    }
+  }
+
+  return candidates;
+}
+
+async function collectCodexStreamText(res: Response): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) return '';
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  const accumulator = new CodexTextAccumulator();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+      const raw = trimmed.slice(6);
+      if (raw === '[DONE]') return text;
+      try { text += accumulator.push(JSON.parse(raw)); } catch {}
+    }
+  }
+  return text;
 }
 
 /**

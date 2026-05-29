@@ -58,6 +58,7 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV12(db);
   migrateModelsV13(db);
   migrateModelsV14(db);
+  ensureBrowserAccountModels(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -158,19 +159,87 @@ function createTables(db: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       label TEXT NOT NULL DEFAULT 'Default key',
       key TEXT NOT NULL UNIQUE,
+      local_endpoint_id INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      last_used_at TEXT
+      last_used_at TEXT,
+      rpm_limit INTEGER,
+      rpd_limit INTEGER,
+      tpm_limit INTEGER,
+      tpd_limit INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS client_api_key_usage (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_api_key_id INTEGER NOT NULL REFERENCES client_api_keys(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('request', 'tokens')),
+      tokens INTEGER NOT NULL DEFAULT 0,
+      created_at_ms INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      provider TEXT NOT NULL,
+      label TEXT NOT NULL,
+      account_hint TEXT,
+      encrypted_access_token TEXT NOT NULL,
+      access_iv TEXT NOT NULL,
+      access_auth_tag TEXT NOT NULL,
+      encrypted_refresh_token TEXT,
+      refresh_iv TEXT,
+      refresh_auth_tag TEXT,
+      expires_at TEXT,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      last_used_at TEXT,
+      last_discovered_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_login_states (
+      state TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      code_verifier TEXT NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS local_endpoints (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      slug TEXT NOT NULL UNIQUE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS local_endpoint_domains (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      local_endpoint_id INTEGER NOT NULL REFERENCES local_endpoints(id) ON DELETE CASCADE,
+      domain TEXT NOT NULL UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS local_endpoint_provider_scopes (
+      local_endpoint_id INTEGER NOT NULL REFERENCES local_endpoints(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      PRIMARY KEY (local_endpoint_id, platform)
     );
 
     CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
     CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
   `);
 
   ensureRequestKeyIdColumn(db);
+  ensureClientApiKeyEndpointColumn(db);
+  ensureApiKeyOAuthColumns(db);
+  ensureOAuthAccountsProjectedAsKeys(db);
+  ensureDefaultLocalEndpoint(db);
 }
 
 function ensureRequestKeyIdColumn(db: Database.Database) {
@@ -179,6 +248,130 @@ function ensureRequestKeyIdColumn(db: Database.Database) {
     db.prepare('ALTER TABLE requests ADD COLUMN key_id INTEGER').run();
   }
   db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_key_id ON requests(key_id)').run();
+}
+
+function ensureClientApiKeyEndpointColumn(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(client_api_keys)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'local_endpoint_id')) {
+    db.prepare('ALTER TABLE client_api_keys ADD COLUMN local_endpoint_id INTEGER').run();
+  }
+  for (const column of ['rpm_limit', 'rpd_limit', 'tpm_limit', 'tpd_limit']) {
+    if (!columns.some(col => col.name === column)) {
+      db.prepare(`ALTER TABLE client_api_keys ADD COLUMN ${column} INTEGER`).run();
+    }
+  }
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_keys_endpoint ON client_api_keys(local_endpoint_id)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider)').run();
+}
+
+function ensureApiKeyOAuthColumns(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(api_keys)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'source')) {
+    db.prepare("ALTER TABLE api_keys ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'").run();
+  }
+  if (!columns.some(col => col.name === 'oauth_account_id')) {
+    db.prepare('ALTER TABLE api_keys ADD COLUMN oauth_account_id INTEGER').run();
+  }
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_api_keys_oauth_account ON api_keys(oauth_account_id)').run();
+}
+
+function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
+  db.prepare(`
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+    SELECT
+      CASE WHEN oa.provider = 'openai' THEN 'openai' ELSE 'google-oauth' END AS platform,
+      oa.label,
+      oa.encrypted_access_token,
+      oa.access_iv,
+      oa.access_auth_tag,
+      'healthy',
+      oa.enabled,
+      'oauth',
+      oa.id
+    FROM oauth_accounts oa
+    WHERE oa.provider IN ('openai', 'antigravity')
+      AND NOT EXISTS (SELECT 1 FROM api_keys ak WHERE ak.oauth_account_id = oa.id)
+  `).run();
+}
+
+function ensureBrowserAccountModels(db: Database.Database) {
+  db.prepare(`DELETE FROM api_keys WHERE source = 'oauth' AND oauth_account_id IN (SELECT id FROM oauth_accounts WHERE provider = 'google-ai-studio')`).run();
+  db.prepare("UPDATE oauth_accounts SET enabled = 0 WHERE provider = 'google-ai-studio'").run();
+  db.prepare(`
+    DELETE FROM fallback_config
+     WHERE model_db_id IN (
+       SELECT g.id
+         FROM models g
+        WHERE g.platform = 'google'
+          AND g.display_name LIKE '%Google browser account%'
+          AND EXISTS (
+            SELECT 1 FROM models go
+             WHERE go.platform = 'google-oauth'
+               AND go.model_id = g.model_id
+          )
+     )
+  `).run();
+  db.prepare(`
+    DELETE FROM models
+     WHERE platform = 'google'
+       AND display_name LIKE '%Google browser account%'
+       AND EXISTS (
+         SELECT 1 FROM models go
+          WHERE go.platform = 'google-oauth'
+            AND go.model_id = models.model_id
+       )
+  `).run();
+  db.prepare(`
+    UPDATE api_keys
+       SET platform = 'google-oauth'
+     WHERE source = 'oauth'
+       AND platform = 'google'
+       AND oauth_account_id IN (
+         SELECT id FROM oauth_accounts WHERE provider = 'antigravity'
+       )
+  `).run();
+  db.prepare(`
+    UPDATE models
+       SET platform = 'google-oauth', enabled = 1,
+           display_name = replace(display_name, 'Google browser account', 'Antigravity browser account')
+     WHERE platform = 'google'
+       AND display_name LIKE '%Google browser account%'
+  `).run();
+  db.prepare(`
+    UPDATE models
+       SET enabled = 1,
+           display_name = replace(display_name, 'Google browser account', 'Antigravity browser account')
+     WHERE platform = 'google-oauth'
+       AND display_name LIKE '%Google browser account%'
+  `).run();
+
+  db.prepare(`
+    DELETE FROM fallback_config
+    WHERE model_db_id IN (
+      SELECT id FROM models
+      WHERE platform = 'openai'
+        AND model_id IN ('gpt-5.1', 'gpt-5.1-codex', 'gpt-5', 'gpt-5-codex', 'gpt-5-mini', 'gpt-4.1')
+        AND display_name LIKE '%browser account%'
+    )
+  `).run();
+  db.prepare(`
+    UPDATE models SET enabled = 0
+    WHERE platform = 'openai'
+      AND model_id IN ('gpt-5.1', 'gpt-5.1-codex', 'gpt-5', 'gpt-5-codex', 'gpt-5-mini', 'gpt-4.1')
+      AND display_name LIKE '%browser account%'
+  `).run();
+}
+
+function ensureDefaultLocalEndpoint(db: Database.Database) {
+  db.prepare(`
+    INSERT OR IGNORE INTO local_endpoints (id, name, slug, enabled)
+    VALUES (1, 'Default endpoint', 'default', 1)
+  `).run();
+  db.prepare(`
+    INSERT OR IGNORE INTO local_endpoint_domains (local_endpoint_id, domain)
+    VALUES (1, '127.0.0.1:3001')
+  `).run();
 }
 
 function seedModels(db: Database.Database) {
@@ -1323,6 +1516,13 @@ function ensureUnifiedKey(db: Database.Database) {
   console.log('\n  Created a default LLMHarbor client key. Open the dashboard locally to copy it.\n');
 }
 
+export interface ClientApiKeyLimits {
+  rpm: number | null;
+  rpd: number | null;
+  tpm: number | null;
+  tpd: number | null;
+}
+
 export interface ClientApiKeyRecord {
   id: number;
   label: string;
@@ -1331,6 +1531,53 @@ export interface ClientApiKeyRecord {
   enabled: boolean;
   createdAt: string;
   lastUsedAt: string | null;
+  localEndpointId?: number | null;
+  limits: ClientApiKeyLimits;
+}
+
+export interface AuthenticatedClientApiKey {
+  id: number;
+  label: string;
+  localEndpointId: number | null;
+  limits: ClientApiKeyLimits;
+}
+
+export interface ClientApiKeyLimitBlock {
+  blocked: true;
+  metric: keyof ClientApiKeyLimits;
+  limit: number;
+  used: number;
+  requested: number;
+  retryAfterSeconds: number;
+  message: string;
+}
+
+function normalizeClientLimit(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
+}
+
+function rowToClientApiKeyLimits(row: any): ClientApiKeyLimits {
+  return {
+    rpm: normalizeClientLimit(row.rpm_limit),
+    rpd: normalizeClientLimit(row.rpd_limit),
+    tpm: normalizeClientLimit(row.tpm_limit),
+    tpd: normalizeClientLimit(row.tpd_limit),
+  };
+}
+
+function normalizeClientApiKeyLimits(limits: Partial<ClientApiKeyLimits> | undefined): ClientApiKeyLimits {
+  return {
+    rpm: normalizeClientLimit(limits?.rpm),
+    rpd: normalizeClientLimit(limits?.rpd),
+    tpm: normalizeClientLimit(limits?.tpm),
+    tpd: normalizeClientLimit(limits?.tpd),
+  };
+}
+
+export function clientApiKeyLimitsFromRow(row: any): ClientApiKeyLimits {
+  return rowToClientApiKeyLimits(row);
 }
 
 function rowToClientApiKey(row: any, includeSecret = false): ClientApiKeyRecord {
@@ -1340,6 +1587,8 @@ function rowToClientApiKey(row: any, includeSecret = false): ClientApiKeyRecord 
     ...(includeSecret ? { key: row.key } : {}),
     maskedKey: maskClientApiKey(row.key),
     enabled: row.enabled === 1,
+    localEndpointId: row.local_endpoint_id ?? null,
+    limits: rowToClientApiKeyLimits(row),
     createdAt: row.created_at,
     lastUsedAt: row.last_used_at,
   };
@@ -1360,18 +1609,34 @@ export function getUnifiedApiKey(): string {
   return fallback;
 }
 
-export function createNamedClientApiKey(label = 'Personal key'): ClientApiKeyRecord {
+export function createNamedClientApiKey(
+  label = 'Personal key',
+  localEndpointId: number | null = null,
+  limits?: Partial<ClientApiKeyLimits>,
+): ClientApiKeyRecord {
   const db = getDb();
   const key = createClientApiKey();
+  const normalizedLimits = normalizeClientApiKeyLimits(limits);
   const result = db.prepare(`
-    INSERT INTO client_api_keys (label, key, enabled)
-    VALUES (?, ?, 1)
-  `).run(label.trim() || 'Personal key', key);
+    INSERT INTO client_api_keys (label, key, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+  `).run(
+    label.trim() || 'Personal key',
+    key,
+    localEndpointId,
+    normalizedLimits.rpm,
+    normalizedLimits.rpd,
+    normalizedLimits.tpm,
+    normalizedLimits.tpd,
+  );
   const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(result.lastInsertRowid) as any;
   return rowToClientApiKey(row, true);
 }
 
-export function updateClientApiKey(id: number, updates: { label?: string; enabled?: boolean }): ClientApiKeyRecord | null {
+export function updateClientApiKey(
+  id: number,
+  updates: { label?: string; enabled?: boolean; limits?: Partial<ClientApiKeyLimits> },
+): ClientApiKeyRecord | null {
   const db = getDb();
   const existing = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id) as any | undefined;
   if (!existing) return null;
@@ -1381,6 +1646,14 @@ export function updateClientApiKey(id: number, updates: { label?: string; enable
   }
   if (typeof updates.enabled === 'boolean') {
     db.prepare('UPDATE client_api_keys SET enabled = ? WHERE id = ?').run(updates.enabled ? 1 : 0, id);
+  }
+  if (updates.limits !== undefined) {
+    const normalizedLimits = normalizeClientApiKeyLimits(updates.limits);
+    db.prepare(`
+      UPDATE client_api_keys
+         SET rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?
+       WHERE id = ?
+    `).run(normalizedLimits.rpm, normalizedLimits.rpd, normalizedLimits.tpm, normalizedLimits.tpd, id);
   }
 
   const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id) as any;
@@ -1407,14 +1680,109 @@ export function regenerateUnifiedKey(): string {
   return key;
 }
 
-export function isValidClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): boolean {
+export function authenticateClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): AuthenticatedClientApiKey | null {
   const db = getDb();
-  const rows = db.prepare('SELECT id, key FROM client_api_keys WHERE enabled = 1').all() as { id: number; key: string }[];
+  const rows = db.prepare(`
+    SELECT id, label, key, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit
+      FROM client_api_keys
+     WHERE enabled = 1
+  `).all() as any[];
   for (const row of rows) {
     if (compare(provided, row.key)) {
       db.prepare("UPDATE client_api_keys SET last_used_at = datetime('now') WHERE id = ?").run(row.id);
-      return true;
+      return {
+        id: row.id,
+        label: row.label,
+        localEndpointId: row.local_endpoint_id ?? null,
+        limits: rowToClientApiKeyLimits(row),
+      };
     }
   }
-  return false;
+  return null;
+}
+
+export function isValidClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): boolean {
+  return authenticateClientApiKey(provided, compare) !== null;
+}
+
+const CLIENT_USAGE_MINUTE_MS = 60_000;
+const CLIENT_USAGE_DAY_MS = 24 * 60 * 60 * 1000;
+
+function clientRequestCount(clientApiKeyId: number, windowMs: number, now = Date.now()): number {
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS count
+      FROM client_api_key_usage
+     WHERE client_api_key_id = ?
+       AND kind = 'request'
+       AND created_at_ms >= ?
+  `).get(clientApiKeyId, now - windowMs) as { count: number };
+  return row.count ?? 0;
+}
+
+function clientTokenCount(clientApiKeyId: number, windowMs: number, now = Date.now()): number {
+  const row = getDb().prepare(`
+    SELECT COALESCE(SUM(tokens), 0) AS tokens
+      FROM client_api_key_usage
+     WHERE client_api_key_id = ?
+       AND kind = 'tokens'
+       AND created_at_ms >= ?
+  `).get(clientApiKeyId, now - windowMs) as { tokens: number };
+  return row.tokens ?? 0;
+}
+
+function retryAfterForClientLimit(clientApiKeyId: number, kind: 'request' | 'tokens', windowMs: number, now = Date.now()): number {
+  const row = getDb().prepare(`
+    SELECT MIN(created_at_ms) AS oldest
+      FROM client_api_key_usage
+     WHERE client_api_key_id = ?
+       AND kind = ?
+       AND created_at_ms >= ?
+  `).get(clientApiKeyId, kind, now - windowMs) as { oldest: number | null };
+  if (!row.oldest) return Math.ceil(windowMs / 1000);
+  return Math.max(1, Math.ceil((row.oldest + windowMs - now) / 1000));
+}
+
+export function checkClientApiKeyLimits(
+  clientKey: AuthenticatedClientApiKey,
+  requestedTokens = 0,
+): ClientApiKeyLimitBlock | null {
+  const now = Date.now();
+  const checks: Array<{ metric: keyof ClientApiKeyLimits; limit: number | null; used: number; requested: number; kind: 'request' | 'tokens'; windowMs: number; label: string }> = [
+    { metric: 'rpm', limit: clientKey.limits.rpm, used: clientRequestCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now), requested: 1, kind: 'request', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'requests per minute' },
+    { metric: 'rpd', limit: clientKey.limits.rpd, used: clientRequestCount(clientKey.id, CLIENT_USAGE_DAY_MS, now), requested: 1, kind: 'request', windowMs: CLIENT_USAGE_DAY_MS, label: 'requests per day' },
+    { metric: 'tpm', limit: clientKey.limits.tpm, used: clientTokenCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now), requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'tokens per minute' },
+    { metric: 'tpd', limit: clientKey.limits.tpd, used: clientTokenCount(clientKey.id, CLIENT_USAGE_DAY_MS, now), requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_DAY_MS, label: 'tokens per day' },
+  ];
+
+  for (const check of checks) {
+    if (check.limit === null) continue;
+    if (check.used + check.requested > check.limit) {
+      return {
+        blocked: true,
+        metric: check.metric,
+        limit: check.limit,
+        used: check.used,
+        requested: check.requested,
+        retryAfterSeconds: retryAfterForClientLimit(clientKey.id, check.kind, check.windowMs, now),
+        message: `Client API key '${clientKey.label}' exceeded its ${check.label} limit (${check.used}/${check.limit} used, ${check.requested} requested).`,
+      };
+    }
+  }
+  return null;
+}
+
+export function recordClientApiKeyUsage(clientApiKeyId: number, totalTokens = 0) {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO client_api_key_usage (client_api_key_id, kind, tokens, created_at_ms)
+    VALUES (?, 'request', 0, ?)
+  `).run(clientApiKeyId, now);
+  if (totalTokens > 0) {
+    db.prepare(`
+      INSERT INTO client_api_key_usage (client_api_key_id, kind, tokens, created_at_ms)
+      VALUES (?, 'tokens', ?, ?)
+    `).run(clientApiKeyId, Math.ceil(totalTokens), now);
+  }
+  db.prepare('DELETE FROM client_api_key_usage WHERE created_at_ms < ?').run(now - (2 * CLIENT_USAGE_DAY_MS));
 }

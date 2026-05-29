@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils'
 import type { ApiKey, Platform } from '../../../shared/types'
 
 const BUILT_IN_PLATFORMS: { value: Platform; label: string }[] = [
+  { value: 'openai', label: 'OpenAI' },
   { value: 'google', label: 'Google AI Studio' },
   { value: 'groq', label: 'Groq' },
   { value: 'cerebras', label: 'Cerebras' },
@@ -62,6 +63,13 @@ interface EndpointSummary {
   keyCount: number
 }
 
+interface ClientKeyLimits {
+  rpm: number | null
+  rpd: number | null
+  tpm: number | null
+  tpd: number | null
+}
+
 interface ClientApiKey {
   id: number
   label: string
@@ -70,6 +78,45 @@ interface ClientApiKey {
   enabled: boolean
   createdAt: string
   lastUsedAt: string | null
+  localEndpointId?: number | null
+  limits: ClientKeyLimits
+}
+
+type LimitKey = keyof ClientKeyLimits
+
+type LimitDraft = Record<LimitKey, string>
+
+const LIMIT_FIELDS: Array<{ key: LimitKey; label: string; helper: string }> = [
+  { key: 'rpm', label: 'RPM', helper: 'requests/min' },
+  { key: 'rpd', label: 'RPD', helper: 'requests/day' },
+  { key: 'tpm', label: 'TPM', helper: 'tokens/min' },
+  { key: 'tpd', label: 'TPD', helper: 'tokens/day' },
+]
+
+const EMPTY_LIMIT_DRAFT: LimitDraft = { rpm: '', rpd: '', tpm: '', tpd: '' }
+
+function limitsToDraft(limits?: Partial<ClientKeyLimits>): LimitDraft {
+  return {
+    rpm: limits?.rpm ? String(limits.rpm) : '',
+    rpd: limits?.rpd ? String(limits.rpd) : '',
+    tpm: limits?.tpm ? String(limits.tpm) : '',
+    tpd: limits?.tpd ? String(limits.tpd) : '',
+  }
+}
+
+function draftToLimits(draft: LimitDraft): ClientKeyLimits {
+  return LIMIT_FIELDS.reduce((acc, field) => {
+    const value = draft[field.key].trim()
+    acc[field.key] = value ? Number(value) : null
+    return acc
+  }, { rpm: null, rpd: null, tpm: null, tpd: null } as ClientKeyLimits)
+}
+
+function limitSummary(limits: ClientKeyLimits) {
+  const active = LIMIT_FIELDS
+    .map(field => limits[field.key] ? `${field.label} ${limits[field.key]}` : null)
+    .filter(Boolean)
+  return active.length > 0 ? active.join(' · ') : 'Unlimited'
 }
 
 interface ProviderImportTarget {
@@ -87,12 +134,51 @@ interface BulkImportResult {
   skipped: number
 }
 
+function ClientKeyLimitEditor({ keyRecord, onSave, saving }: { keyRecord: ClientApiKey; onSave: (limits: ClientKeyLimits) => void; saving: boolean }) {
+  const [draft, setDraft] = useState<LimitDraft>(() => limitsToDraft(keyRecord.limits))
+
+  useEffect(() => {
+    setDraft(limitsToDraft(keyRecord.limits))
+  }, [keyRecord.limits.rpm, keyRecord.limits.rpd, keyRecord.limits.tpm, keyRecord.limits.tpd])
+
+  return (
+    <div className="mt-3 rounded-2xl border border-border/70 bg-card/60 p-3">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Local limits</p>
+          <p className="text-xs text-muted-foreground">{limitSummary(keyRecord.limits)}</p>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => onSave(draftToLimits(draft))} disabled={saving}>
+          {saving ? 'Saving...' : 'Save limits'}
+        </Button>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-4">
+        {LIMIT_FIELDS.map(field => (
+          <div key={field.key} className="grid gap-1">
+            <Label className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{field.label}</Label>
+            <Input
+              inputMode="numeric"
+              pattern="[0-9]*"
+              min={1}
+              value={draft[field.key]}
+              onChange={event => setDraft(prev => ({ ...prev, [field.key]: event.target.value.replace(/[^0-9]/g, '') }))}
+              placeholder="∞"
+            />
+            <span className="text-[10px] text-muted-foreground">{field.helper}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function ClientKeysSection() {
   const queryClient = useQueryClient()
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null)
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
   const [createdKey, setCreatedKey] = useState<ClientApiKey | null>(null)
   const [newKeyLabel, setNewKeyLabel] = useState('')
+  const [newKeyLimits, setNewKeyLimits] = useState<LimitDraft>(EMPTY_LIMIT_DRAFT)
 
   const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
@@ -100,15 +186,16 @@ function ClientKeysSection() {
   })
 
   const createKey = useMutation({
-    mutationFn: (label: string) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
+    mutationFn: ({ label, limits }: { label: string; limits: ClientKeyLimits }) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
       method: 'POST',
-      body: JSON.stringify({ label: label || 'Personal key' }),
+      body: JSON.stringify({ label: label || 'Personal key', limits }),
     }),
     onSuccess: (key) => {
       setCreatedKey(key)
       queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
       queryClient.invalidateQueries({ queryKey: ['unified-key'] })
       setNewKeyLabel('')
+      setNewKeyLimits(EMPTY_LIMIT_DRAFT)
     },
   })
 
@@ -116,6 +203,14 @@ function ClientKeysSection() {
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => apiFetch<ClientApiKey>(`/api/settings/api-keys/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ enabled }),
+    }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-api-keys'] }),
+  })
+
+  const updateKeyLimits = useMutation({
+    mutationFn: ({ id, limits }: { id: number; limits: ClientKeyLimits }) => apiFetch<ClientApiKey>(`/api/settings/api-keys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ limits }),
     }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-api-keys'] }),
   })
@@ -149,15 +244,31 @@ function ClientKeysSection() {
             Create one OpenAI-compatible key per app, agent, laptop, or experiment. Revoke a single client without touching provider credentials.
           </p>
         </div>
-        <div className="grid min-w-0 gap-2 sm:min-w-[320px] sm:grid-cols-[1fr_auto]">
-          <Input
-            placeholder="Label, e.g. Cursor on MacBook"
-            value={newKeyLabel}
-            onChange={(event) => setNewKeyLabel(event.target.value)}
-          />
-          <Button onClick={() => createKey.mutate(newKeyLabel)} disabled={createKey.isPending}>
-            {createKey.isPending ? 'Creating...' : 'New key'}
-          </Button>
+        <div className="grid min-w-0 gap-3 sm:min-w-[360px]">
+          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+            <Input
+              placeholder="Label, e.g. Cursor on MacBook"
+              value={newKeyLabel}
+              onChange={(event) => setNewKeyLabel(event.target.value)}
+            />
+            <Button onClick={() => createKey.mutate({ label: newKeyLabel, limits: draftToLimits(newKeyLimits) })} disabled={createKey.isPending}>
+              {createKey.isPending ? 'Creating...' : 'New key'}
+            </Button>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-4">
+            {LIMIT_FIELDS.map(field => (
+              <div key={field.key} className="grid gap-1">
+                <Label className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{field.label}</Label>
+                <Input
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={newKeyLimits[field.key]}
+                  onChange={event => setNewKeyLimits(prev => ({ ...prev, [field.key]: event.target.value.replace(/[^0-9]/g, '') }))}
+                  placeholder="∞"
+                />
+              </div>
+            ))}
+          </div>
         </div>
       </div>
 
@@ -209,6 +320,11 @@ function ClientKeysSection() {
                 <Button variant="ghost" size="sm" onClick={() => deleteClientKey.mutate(key.id)}>Delete</Button>
               </div>
             </div>
+            <ClientKeyLimitEditor
+              keyRecord={key}
+              saving={updateKeyLimits.isPending}
+              onSave={(limits) => updateKeyLimits.mutate({ id: key.id, limits })}
+            />
           </div>
         ))}
       </div>
@@ -578,6 +694,7 @@ export default function KeysPage() {
                           <code className="font-mono text-xs tabular-nums">{k.maskedKey}</code>
                           <div className="min-w-0 text-xs text-muted-foreground">
                             <span className="font-medium text-foreground">{k.label || 'Unlabeled key'}</span>
+                            {k.source === 'oauth' && <span className="ml-2 rounded-full border border-primary/20 bg-primary/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-primary">Browser account</span>}
                             <span className="ml-2">{statusLabel[status] ?? status}</span>
                           </div>
                           <span className="text-[11px] text-muted-foreground tabular-nums">{lastChecked ? new Date(lastChecked).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'not checked'}</span>

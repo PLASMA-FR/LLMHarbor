@@ -74,6 +74,8 @@ keysRouter.get('/', (_req: Request, res: Response) => {
       maskedKey,
       status: row.status,
       enabled: row.enabled === 1,
+      source: row.source ?? 'manual',
+      oauthAccountId: row.oauth_account_id ?? null,
       createdAt: row.created_at,
       lastCheckedAt: row.last_checked_at,
     };
@@ -205,6 +207,10 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
+  const row = db.prepare('SELECT oauth_account_id FROM api_keys WHERE id = ?').get(id) as { oauth_account_id: number | null } | undefined;
+  if (row?.oauth_account_id) {
+    db.prepare('DELETE FROM oauth_accounts WHERE id = ?').run(row.oauth_account_id);
+  }
   const result = db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
 
   if (result.changes === 0) {
@@ -231,6 +237,11 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
 
   const db = getDb();
   const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
+  db.prepare(`
+    UPDATE oauth_accounts
+    SET enabled = ?
+    WHERE id IN (SELECT oauth_account_id FROM api_keys WHERE platform = ? AND oauth_account_id IS NOT NULL)
+  `).run(enabled ? 1 : 0, platform);
 
   res.json({ success: true, enabled, updatedKeys: result.changes });
 });
@@ -250,7 +261,9 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
+  const row = db.prepare('SELECT oauth_account_id FROM api_keys WHERE id = ?').get(id) as { oauth_account_id: number | null } | undefined;
   const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
+  if (row?.oauth_account_id) db.prepare('UPDATE oauth_accounts SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, row.oauth_account_id);
 
   if (result.changes === 0) {
     res.status(404).json({ error: { message: 'Key not found' } });

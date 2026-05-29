@@ -233,7 +233,60 @@ describe('OpenAICompatProvider', () => {
     const result = await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm');
     expect(result.choices[0].message.content).toBe('normal answer');
   });
+
+  it('does not duplicate cumulative ChatGPT Codex OAuth stream snapshots', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    const stream = sseStream([
+      { response: { output_text: 'Hello' } },
+      { response: { output_text: 'Hello!' } },
+      { item: { content: [{ text: 'Hello!' }] } },
+    ]);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: stream } as any);
+
+    const result = await openai.chatCompletion(
+      'token',
+      [{ role: 'user', content: 'hello' }],
+      'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    );
+
+    expect(result.choices[0].message.content).toBe('Hello!');
+  });
+
+  it('streams only suffixes for cumulative ChatGPT Codex OAuth events', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    const stream = sseStream([
+      { response: { output_text: 'I’m' } },
+      { response: { output_text: 'I’m doing well' } },
+      { response: { output_text: 'I’m doing well, thanks!' } },
+    ]);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: stream } as any);
+
+    const chunks: string[] = [];
+    for await (const chunk of openai.streamChatCompletion(
+      'token',
+      [{ role: 'user', content: 'how are you' }],
+      'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    )) {
+      const content = chunk.choices[0]?.delta?.content;
+      if (content) chunks.push(content);
+    }
+
+    expect(chunks.join('')).toBe('I’m doing well, thanks!');
+  });
 });
+
+function sseStream(events: unknown[]) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+}
 
 describe('OpenAICompatProvider - platform instances', () => {
   // Mirrors the actual registrations in server/src/providers/index.ts.

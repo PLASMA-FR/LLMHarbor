@@ -73,6 +73,35 @@ describe('Migration idempotency', () => {
     expect(dups).toEqual([]);
   });
 
+  it('migrates legacy Google AI Studio OAuth accounts into disabled cleanup state and renames browser rows to Antigravity', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/llmharbor-antigravity-oauth-migration-${Date.now()}.db`;
+    const db1 = initDb(tmpPath);
+    const model = db1.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('google', 'gemini-legacy-oauth', 'Gemini Legacy (Google browser account)', 1, 1, 'Frontier', 1)
+    `).run();
+    db1.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 9999, 1)').run(Number(model.lastInsertRowid));
+    const account = db1.prepare(`
+      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, enabled)
+      VALUES ('google-ai-studio', 'Old Google OAuth', 'captain@example.com', 'enc', 'iv', 'tag', 1)
+    `).run();
+    db1.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('google', 'Old Google OAuth', 'enc', 'iv', 'tag', 'healthy', 1, 'oauth', ?)
+    `).run(Number(account.lastInsertRowid));
+    db1.close();
+
+    const db2 = initDb(tmpPath);
+    const migrated = db2.prepare("SELECT platform, display_name, enabled FROM models WHERE model_id = 'gemini-legacy-oauth'").get() as { platform: string; display_name: string; enabled: number };
+    expect(migrated).toEqual({ platform: 'google-oauth', display_name: 'Gemini Legacy (Antigravity browser account)', enabled: 1 });
+    const oldAccount = db2.prepare("SELECT enabled FROM oauth_accounts WHERE provider = 'google-ai-studio'").get() as { enabled: number };
+    expect(oldAccount.enabled).toBe(0);
+    const oldProjectedKeys = db2.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE source = 'oauth' AND oauth_account_id = ?").get(Number(account.lastInsertRowid)) as { c: number };
+    expect(oldProjectedKeys.c).toBe(0);
+    db2.close();
+  });
+
   it('V12: dead OR :free rows are absent and the four new rows are present', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     const db = initDb(':memory:');

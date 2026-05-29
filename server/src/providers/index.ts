@@ -13,8 +13,16 @@ function register(provider: BaseProvider) {
   providers.set(provider.platform, provider);
 }
 
-// Google - unique Gemini API format
+// Google - API-key Gemini API format and separate browser-account Code Assist surface.
 register(new GoogleProvider());
+register(new GoogleProvider({ platform: 'google-oauth', name: 'Antigravity Browser Account' }));
+
+// OpenAI - OpenAI-compatible chat, image, and audio endpoints.
+register(new OpenAICompatProvider({
+  platform: 'openai',
+  name: 'OpenAI',
+  baseUrl: 'https://api.openai.com/v1',
+}));
 
 // Groq - OpenAI-compatible
 register(new OpenAICompatProvider({

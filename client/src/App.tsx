@@ -8,6 +8,8 @@ import PlaygroundPage from '@/pages/PlaygroundPage'
 import FallbackPage from '@/pages/FallbackPage'
 import ModelsPage from '@/pages/ModelsPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
+import OAuthPage from '@/pages/OAuthPage'
+import SettingsPage from '@/pages/SettingsPage'
 import { cn } from '@/lib/utils'
 
 const queryClient = new QueryClient()
@@ -15,9 +17,11 @@ const queryClient = new QueryClient()
 const navItems = [
   { to: '/playground', label: 'Playground', helper: 'test routes' },
   { to: '/keys', label: 'Keys', helper: 'credentials' },
+  { to: '/oauth', label: 'OAuth', helper: 'accounts' },
   { to: '/models', label: 'Models', helper: 'registry' },
   { to: '/fallback', label: 'Fallback', helper: 'model chain' },
   { to: '/analytics', label: 'Analytics', helper: 'traffic' },
+  { to: '/settings', label: 'Settings', helper: 'endpoints' },
 ]
 
 function NavItem({ to, label, helper }: { to: string; label: string; helper: string }) {
@@ -103,9 +107,13 @@ function AppShell() {
           <Route path="/" element={<Navigate to="/playground" replace />} />
           <Route path="/playground" element={<PlaygroundPage />} />
           <Route path="/keys" element={<KeysPage />} />
+          <Route path="/image" element={<Navigate to="/settings" replace />} />
+          <Route path="/audio" element={<Navigate to="/settings" replace />} />
+          <Route path="/oauth" element={<OAuthPage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/fallback" element={<FallbackPage />} />
           <Route path="/analytics" element={<AnalyticsPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="/test" element={<Navigate to="/playground" replace />} />
           <Route path="/health" element={<Navigate to="/keys" replace />} />
         </Routes>

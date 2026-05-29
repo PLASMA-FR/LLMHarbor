@@ -6,7 +6,9 @@
 // (see server/src/db/index.ts). HuggingFace was dropped in V4 and re-added
 // in V13 via the router.huggingface.co Inference Providers meta-router.
 export type BuiltInPlatform =
+  | 'openai'
   | 'google'
+  | 'google-oauth'
   | 'groq'
   | 'cerebras'
   | 'sambanova'
@@ -53,6 +55,8 @@ export interface ApiKey {
   maskedKey: string;
   status: KeyStatus;
   enabled: boolean;
+  source?: 'manual' | 'oauth';
+  oauthAccountId?: number | null;
   createdAt: string;
   lastCheckedAt: string | null;
 }
