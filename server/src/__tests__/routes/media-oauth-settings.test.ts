@@ -11,6 +11,7 @@ async function request(app: Express, method: string, path: string, body?: any, h
     method,
     headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers },
     body: body ? JSON.stringify(body) : undefined,
+    redirect: path.startsWith('/api/oauth/callback/') ? 'manual' : 'follow',
   });
   const contentType = res.headers.get('content-type') ?? '';
   const raw = contentType.includes('application/octet-stream') || contentType.includes('audio/')
@@ -184,7 +185,8 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     });
 
     const callback = await request(app, 'GET', `/api/oauth/callback/openai?state=${state}&code=browser-code`);
-    expect(callback.status).toBe(200);
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get('location')).toBe('/oauth?connected=1');
 
     const accounts = await request(app, 'GET', '/api/oauth/accounts');
     expect(accounts.status).toBe(200);
