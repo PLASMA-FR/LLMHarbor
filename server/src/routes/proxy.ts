@@ -5,8 +5,9 @@ import { z } from 'zod';
 import type { ChatMessage } from '@llmharbor/shared/types.js';
 import { routeRequestAsync, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
-import { authenticateClientApiKey, checkClientApiKeyLimits, getDb, recordClientApiKeyUsage } from '../db/index.js';
+import { authenticateClientApiKey, checkClientApiKeyLimits, getDb, recordClientApiKeyUsage, type AuthenticatedClientApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
+import { getClientModelAccessDenial, isClientRouteAllowed, localApiRouteDenied, type ClientAccessDenial } from '../services/accessPolicy.js';
 
 export const proxyRouter = Router();
 
@@ -31,6 +32,28 @@ function timingSafeStringEqual(provided: string, expected: string): boolean {
   // end is what actually decides equality when lengths differ.
   const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
   return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
+}
+
+function sendAccessDenied(res: Response, denial: ClientAccessDenial) {
+  res.status(denial.status).json({
+    error: {
+      message: denial.message,
+      type: 'forbidden',
+      code: denial.code,
+    },
+  });
+}
+
+function authenticateProxyClient(req: Request, res: Response): AuthenticatedClientApiKey | null {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  const clientKey = token ? authenticateClientApiKey(token, timingSafeStringEqual) : null;
+  if (!clientKey) {
+    res.status(401).json({
+      error: { message: 'Invalid API key', type: 'authentication_error' },
+    });
+    return null;
+  }
+  return clientKey;
 }
 
 // Sticky sessions: track which model served each "session"
@@ -83,10 +106,18 @@ function setStickyModel(messages: ChatMessage[], modelDbId: number) {
 }
 
 // OpenAI-compatible /models endpoint (used by Hermes for metadata)
-proxyRouter.get('/models', (_req: Request, res: Response) => {
+proxyRouter.get('/models', (req: Request, res: Response) => {
+  const clientKey = authenticateProxyClient(req, res);
+  if (!clientKey) return;
+
+  if (!isClientRouteAllowed(clientKey.id, 'v1.models')) {
+    sendAccessDenied(res, localApiRouteDenied('v1.models'));
+    return;
+  }
+
   const db = getDb();
   const models = db.prepare(`
-    SELECT m.platform, m.model_id, m.display_name, m.context_window
+    SELECT m.id, m.platform, m.model_id, m.display_name, m.context_window
       FROM models m
      WHERE m.enabled = 1
        AND EXISTS (
@@ -103,6 +134,13 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
        )
      ORDER BY m.intelligence_rank
   `).all() as any[];
+  const allowedModels = models.filter(m => getClientModelAccessDenial(clientKey.id, {
+    id: m.id,
+    platform: m.platform,
+    modelId: m.model_id,
+    displayName: m.display_name,
+  }) === null);
+
   res.json({
     object: 'list',
     data: [
@@ -114,7 +152,7 @@ proxyRouter.get('/models', (_req: Request, res: Response) => {
         name: 'Auto (router picks the best available model)',
         context_window: null,
       },
-      ...models.map(m => ({
+      ...allowedModels.map(m => ({
         id: m.model_id,
         object: 'model',
         created: 0,
@@ -259,6 +297,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
+  if (!isClientRouteAllowed(clientKey.id, 'v1.chat.completions')) {
+    sendAccessDenied(res, localApiRouteDenied('v1.chat.completions'));
+    return;
+  }
+
   // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -344,7 +387,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   } else if (requestedModel) {
     const db = getDb();
     const enabled = db.prepare(`
-      SELECT m.id
+      SELECT m.id, m.platform, m.model_id, m.display_name
         FROM models m
        WHERE m.model_id = ?
          AND m.enabled = 1
@@ -361,8 +404,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
          )
        ORDER BY CASE WHEN m.display_name LIKE '%browser account%' THEN 0 ELSE 1 END, m.intelligence_rank ASC, m.id ASC
        LIMIT 1
-    `).get(requestedModel) as { id: number } | undefined;
+    `).get(requestedModel) as { id: number; platform: string; model_id: string; display_name: string } | undefined;
     if (enabled) {
+      const denial = getClientModelAccessDenial(clientKey.id, {
+        id: enabled.id,
+        platform: enabled.platform,
+        modelId: enabled.model_id,
+        displayName: enabled.display_name,
+      });
+      if (denial) {
+        sendAccessDenied(res, denial);
+        return;
+      }
       preferredModel = enabled.id;
     } else {
       const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
@@ -383,11 +436,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
   let lastError: any = null;
+  const accessFilter = (model: { id: number; platform: string; modelId: string; displayName: string }) => (
+    getClientModelAccessDenial(clientKey.id, model) === null
+  );
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = await routeRequestAsync(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, explicitModelStrict);
+      route = await routeRequestAsync(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, explicitModelStrict, accessFilter);
     } catch (err: any) {
       // No more models available
       if (lastError) {
@@ -404,7 +460,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
       } else {
         res.status(err.status ?? 503).json({
-          error: { message: err.message, type: 'routing_error' },
+          error: {
+            message: err.message,
+            type: err.status === 403 ? 'forbidden' : 'routing_error',
+            ...(err.code ? { code: err.code } : {}),
+          },
         });
       }
       return;

@@ -15,12 +15,12 @@ export function PageHeader({
   className?: string
 }) {
   return (
-    <div className={cn('mb-7 flex flex-col gap-5 border-b border-border pb-6 sm:flex-row sm:items-end sm:justify-between', className)}>
-      <div className="min-w-0 max-w-3xl">
+    <div className={cn('mb-7 flex min-w-0 max-w-full flex-col gap-5 border-b border-border pb-6 sm:flex-row sm:items-end sm:justify-between', className)}>
+      <div className="min-w-0 max-w-full sm:max-w-3xl">
         {eyebrow && <p className="mb-2 text-sm font-medium text-muted-foreground">{eyebrow}</p>}
-        <h1 className="text-balance text-3xl font-semibold tracking-[-0.045em] text-foreground sm:text-4xl">{title}</h1>
+        <h1 className="break-words text-balance text-3xl font-semibold tracking-[-0.045em] text-foreground sm:text-4xl">{title}</h1>
         {description && (
-          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">{description}</p>
+          <p className="mt-2 max-w-full break-words text-sm leading-6 text-muted-foreground sm:max-w-2xl">{description}</p>
         )}
       </div>
       {actions && <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>}
@@ -30,12 +30,12 @@ export function PageHeader({
 
 export function SectionTitle({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
   return (
-    <div className="mb-3 flex items-end justify-between gap-4">
-      <div>
+    <div className="mb-3 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <div className="min-w-0">
         <h2 className="text-sm font-semibold tracking-[-0.01em]">{title}</h2>
         {description && <p className="mt-1 text-xs leading-5 text-muted-foreground">{description}</p>}
       </div>
-      {action}
+      {action && <div className="flex shrink-0 flex-wrap gap-2">{action}</div>}
     </div>
   )
 }

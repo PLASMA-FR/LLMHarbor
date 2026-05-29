@@ -5,7 +5,7 @@
 
   **Drop one anchor. Route every model.**
 
-  A self-hosted personal API platform for free-tier and local LLM endpoints. Add your provider keys once, mint separate local client keys for every app or agent, and let LLMHarbor route requests across the models that still have budget left.
+  A self-hosted personal API platform for free-tier and local LLM endpoints. Add your provider keys once, mint separate local client keys for every app or agent, and let LLMHarbor route requests across the models that are healthy and allowed.
 
   <p>
     <a href="https://github.com/PLASMA-FR/LLMHarbor/actions"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/PLASMA-FR/LLMHarbor/ci.yml?branch=main&label=tests&style=for-the-badge"></a>
@@ -20,6 +20,7 @@
     <a href="#using-the-api">API</a> ·
     <a href="#supported-providers">Providers</a> ·
     <a href="#bulk-import-provider-keys">Bulk import</a> ·
+    <a href="#settings--access-policy">Access policy</a> ·
     <a href="https://plasma-fr.github.io/LLMHarbor/">Website</a> ·
     <a href="#contributing">Contributing</a>
   </p>
@@ -35,7 +36,7 @@
 
 ## What is LLMHarbor?
 
-LLMHarbor is a local personal API platform for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: multiple client API keys with request/token limits, encrypted provider keys, browser OAuth accounts, fallback order, health checks, per-key rate tracking, custom endpoints, model probes, streaming responses, tool calls, media routes, and request analytics.
+LLMHarbor is a local personal API platform for routing chat completions across many upstream LLM providers. It exposes the OpenAI API shape your apps already know, then handles the messy parts behind it: multiple client API keys with route/provider/model access policies, encrypted provider keys, browser OAuth accounts, fallback order, health checks, per-key traffic tracking, custom provider endpoints, model probes, streaming responses, tool calls, and request analytics.
 
 Use it when you want one stable local endpoint for experiments, coding agents, small tools, and personal workflows without wiring every provider into every app.
 
@@ -59,7 +60,8 @@ LLMHarbor puts a harbor in front of that traffic.
 
 - One local OpenAI-compatible base URL.
 - Multiple personal client API keys for apps, agents, laptops, and experiments.
-- Optional RPM/RPD/TPM/TPD limits per local client key.
+- Per-key route, provider, and model gates before any upstream quota is spent.
+- One llmharbor key per app, agent, laptop, or experiment with isolated access policy.
 - API-key providers and browser OAuth accounts behind it.
 - A fallback chain you can inspect and reorder.
 - A dashboard that shows what happened after each request.
@@ -75,10 +77,10 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 | Fallbacks | On 429, 5xx, timeout, or provider failure, LLMHarbor cools that key down and tries the next enabled route. |
 | Streaming | Server-Sent Events are supported for `stream: true`. |
 | Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
-| Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, add optional RPM/RPD/TPM/TPD limits, disable or delete one without rotating everything. |
+| Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, and set per-key route/provider/model access policies. |
 | Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT and Antigravity through loopback OAuth with encrypted refresh storage and live model discovery. |
 | Key storage | Provider keys and OAuth tokens are encrypted with AES-256-GCM before they are written to SQLite. |
-| Rate tracking | RPM, RPD, TPM, and TPD counters are tracked per provider, model, upstream key, and local client key. |
+| Rate tracking | RPM, RPD, TPM, and TPD counters are tracked for upstream providers, models, and routing health. |
 | Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
 | Custom providers | Add any OpenAI-compatible endpoint from the dashboard. Local vLLM, Ollama-compatible gateways, OpenCode Zen, and private gateways fit here. |
 | Model probes | Test whether a model works before putting traffic on it. |
@@ -96,7 +98,7 @@ Send a request through the router, inspect the routed provider, and see latency 
 
 ### Keys
 
-Store provider credentials, create personal client keys with limits, check health, connect browser OAuth accounts, and manage custom OpenAI-compatible endpoints.
+Store provider credentials, create personal client keys, check health, connect browser OAuth accounts, and manage custom OpenAI-compatible endpoints.
 
 <p align="center">
   <img src="repo-assets/keys.png" alt="LLMHarbor keys page" width="920" />
@@ -124,6 +126,14 @@ See traffic, latency, tokens, estimated savings, model breakdowns, and provider 
 
 <p align="center">
   <img src="repo-assets/analytics.png" alt="LLMHarbor analytics page" width="920" />
+</p>
+
+### Settings / access policy
+
+Scope each `llmharbor-*` key by route, provider, and model catalog while every app keeps using the same local `/v1` base URL.
+
+<p align="center">
+  <img src="repo-assets/settings.png" alt="LLMHarbor settings page showing local API access controls" width="920" />
 </p>
 
 ## Supported providers
@@ -238,8 +248,9 @@ Then:
 2. Go to **Models** and probe the models you want to use.
 3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT or Antigravity.
 4. Go to **Fallback** and order the route list.
-5. Create or copy a client API key from **Keys**. Add RPM/RPD/TPM/TPD limits if the key belongs to a specific app, agent, or shared device.
-6. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
+5. Create or copy a client API key from **Keys**.
+6. Open **Settings** and restrict that key to specific local routes, provider endpoints, or model rows.
+7. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
 
 ### Production build
 
@@ -257,11 +268,12 @@ LLMHarbor accepts OpenAI-style chat requests. Change the base URL and API key, t
 ### Python
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:3001/v1",
-    api_key="llmharbor-your-unified-key",
+    api_key=os.environ["LLMHARBOR_API_KEY"],
 )
 
 response = client.chat.completions.create(
@@ -278,7 +290,7 @@ print(response.choices[0].message.content)
 
 ```bash
 curl http://localhost:3001/v1/chat/completions \
-  -H "Authorization: Bearer llmharbor-your-unified-key" \
+  -H "Authorization: Bearer YOUR_LLMHARBOR_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "auto",
@@ -287,25 +299,34 @@ curl http://localhost:3001/v1/chat/completions \
 ```
 
 
-### Client key limits
+### Client key access policies
 
-Local `llmharbor-*` keys can be scoped without touching upstream provider credentials. Limits are nullable; omit or set a field to `null` for unlimited.
+Local `llmharbor-*` keys can be scoped without touching upstream provider credentials. Create one key per app, then decide which local routes, provider endpoints, and model rows that key may use.
 
 ```bash
 curl http://127.0.0.1:3001/api/settings/api-keys \
   -H "Content-Type: application/json" \
   -d '{
-    "label": "editor agent",
-    "limits": {
-      "rpm": 30,
-      "rpd": 500,
-      "tpm": 90000,
-      "tpd": 1000000
-    }
+    "label": "editor agent"
   }'
 ```
 
-When a client key crosses a request or token limit, LLMHarbor returns `429` with `error.code = "client_key_limit_exceeded"` and a `Retry-After` header before spending upstream quota.
+Access policies are stored per local key. They can block an OpenAI-compatible route such as `/v1/models`, deny a whole provider endpoint, or hide and reject a specific model before any upstream provider call is made.
+
+```bash
+# Inspect routes, provider endpoints, and model rows available to one key
+curl http://127.0.0.1:3001/api/settings/api-keys/1/access-policy
+
+# Block model catalog listing and one provider for that key
+curl -X PATCH http://127.0.0.1:3001/api/settings/api-keys/1/access-policy \
+  -H "Content-Type: application/json" \
+  -d '{
+    "routes": [{"route":"v1.models","enabled":false}],
+    "platforms": [{"platform":"google","enabled":false}]
+  }'
+```
+
+Custom local endpoint creation is intentionally retired: `POST /api/settings/local-endpoints` returns `410`. Keep using `/v1` and segment apps with key-specific policy instead.
 
 ### Browser OAuth accounts
 
@@ -404,24 +425,27 @@ Every successful response includes routing headers when available:
 | Page | Use it for |
 |---|---|
 | Playground | Send a test request and inspect the route result. |
-| Keys | Manage local client keys, per-key limits, provider keys, key health, and custom providers. |
+| Keys | Manage local client keys, provider keys, key health, and custom providers. |
 | OAuth | Connect browser accounts, refresh discovered models, inspect account limits, and handle reconnects. |
 | Models | Register endpoint models and run probes. |
 | Fallback | Reorder the chain and switch models on or off. |
 | Analytics | Watch volume, latency, tokens, savings, errors, and model usage. |
+| Settings | Tune local API access policies for each `llmharbor-*` key. |
 
 ## How routing works
 
 ```mermaid
 flowchart LR
   A[OpenAI SDK, curl, agents] -->|Bearer llmharbor key| B[Express API]
-  B --> L{Client key under limit?}
-  L -->|no| R[429 with Retry-After]
-  L -->|yes| C{Model requested?}
+  B --> P{Route allowed by key policy?}
+  P -->|no| Z[403 access denied]
+  P -->|yes| C{Model requested?}
   C -->|auto| D[Router picks highest priority healthy model]
   C -->|specific model| E[Router finds matching enabled model]
-  D --> F[Decrypt provider key in memory]
-  E --> F
+  D --> Q{Provider/model allowed?}
+  E --> Q
+  Q -->|no| Z
+  Q -->|yes| F[Decrypt provider key in memory]
   F --> G[Call provider adapter]
   G -->|success| H[Return OpenAI-shaped response]
   G -->|429, timeout, 5xx| I[Cooldown key and try next fallback]
@@ -438,9 +462,9 @@ Main pieces:
 | Rate limiter | `server/src/services/ratelimit.ts` | Provider-side RPM, RPD, TPM, TPD accounting and cooldowns. |
 | Providers | `server/src/providers/*.ts` | Provider-specific request and streaming adapters. |
 | Keys routes | `server/src/routes/keys.ts` | Provider credential management and bulk import. |
-| Settings routes | `server/src/routes/settings.ts` | Local client API keys, per-key limits, and local endpoint keys. |
+| Settings routes | `server/src/routes/settings.ts` | Local client API keys, route/provider/model access policies, and legacy endpoint compatibility. |
 | OAuth routes | `server/src/routes/oauth.ts` | Browser-account OAuth flows, encrypted account storage, and discovered inventory. |
-| Media routes | `server/src/routes/media.ts` | OpenAI-style image and speech proxy routes. |
+| Access policy service | `server/src/services/accessPolicy.ts` | Per-client-key policy snapshots, persistence, and enforcement helpers. |
 | Endpoint routes | `server/src/routes/endpoints.ts` | Custom providers and model registry. |
 | Database | `server/src/db/index.ts` | SQLite schema, seed catalog, encrypted key storage. |
 | Dashboard | `client/src` | React control plane. |
@@ -454,7 +478,7 @@ LLMHarbor is local-first and single-user by design.
 - The encryption key comes from `ENCRYPTION_KEY` in `.env` for real use.
 - The development fallback key is only for local experimentation. Do not use it with real provider credentials.
 - Clients call LLMHarbor with one `llmharbor-...` token.
-- Each local client token can have independent request and token limits.
+- Each local client token can have independent route, provider, and model policy.
 - Upstream provider keys and OAuth refresh tokens never leave the server process.
 - The server binds to `127.0.0.1` by default. Set `HOST=0.0.0.0` only behind your own firewall, VPN, or authenticated reverse proxy.
 - The dashboard/control-plane API stays loopback-only by default even when the authenticated `/v1` proxy is remotely bound. Set `LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE=1` only behind your own network controls.
@@ -462,13 +486,26 @@ LLMHarbor is local-first and single-user by design.
 
 ## What is not supported yet
 
-LLMHarbor focuses on chat completions and a small set of OpenAI-style media routes. These endpoint families are still out of scope:
+LLMHarbor focuses on OpenAI-compatible chat completions. These endpoint families are out of scope:
 
+- Images: `/v1/images/generations`
+- Audio speech: `/v1/audio/speech`
 - Embeddings: `/v1/embeddings`
 - Moderation: `/v1/moderations`
 - Legacy completions: `/v1/completions`
 - `n > 1` multi-completion requests
 - Multi-tenant auth, billing, orgs, or team management
+
+## Verification status
+
+This rebrand was verified locally with automated scans and live app dogfooding:
+
+- `npm run build` for server TypeScript and the production Vite dashboard.
+- Server Vitest coverage for routing, rate limits, OAuth discovery, proxy behavior, and client-key access policies.
+- Client ESLint and dependency audit with zero reported vulnerabilities.
+- Secret-pattern scan across tracked and untracked non-generated files.
+- In-process API smoke against a mock OpenAI-compatible provider covering provider keys, custom endpoints, model registration, health checks, per-key access policies, `/v1/models`, non-streaming chat, streaming chat, fallback ordering, analytics, OAuth surfaces, and cleanup paths.
+- Headless Chromium responsive sweep across Playground, Keys, OAuth, Models, Fallback, Analytics, and Settings at desktop, tablet, mobile, and 320px narrow widths. The sweep checks page titles, headings, root/body overflow, offscreen content outside scroll containers, and console/runtime errors.
 
 ## Development
 

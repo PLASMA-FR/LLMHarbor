@@ -43,7 +43,7 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
 
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '1'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'test-antigravity-client-secret';
+    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
     initDb(':memory:');
     app = createApp();
   });
@@ -59,48 +59,30 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  it('proxies OpenAI-compatible image generations through a configured provider key', async () => {
-    await addOpenAIKey(app);
+  it('does not expose the removed image generation proxy route', async () => {
+    let upstreamCalled = false;
     const origFetch = global.fetch;
-    let providerBody: any = null;
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
-      if (urlStr === 'https://api.openai.com/v1/images/generations') {
-        providerBody = JSON.parse((init as any).body);
-        expect((init as any).headers.Authorization).toBe('Bearer sk-media-test');
-        return Response.json({
-          created: 123,
-          data: [{ b64_json: Buffer.from('fake-png').toString('base64'), revised_prompt: 'anchor logo' }],
-        });
-      }
+      if (urlStr === 'https://api.openai.com/v1/images/generations') upstreamCalled = true;
       return origFetch(url, init);
     });
 
     const res = await request(app, 'POST', '/v1/images/generations', {
       model: 'gpt-image-1',
       prompt: 'anchor shaped harbor logo',
-      size: '1024x1024',
-      response_format: 'b64_json',
     }, authHeaders());
 
-    expect(res.status).toBe(200);
-    expect(providerBody.model).toBe('gpt-image-1');
-    expect(providerBody.prompt).toContain('anchor');
-    expect(res.body.data[0].b64_json).toBeTruthy();
-    expect(res.headers.get('x-routed-via')).toBe('openai/gpt-image-1');
+    expect(res.status).toBe(404);
+    expect(upstreamCalled).toBe(false);
   });
 
-  it('proxies OpenAI-compatible audio speech as binary audio', async () => {
-    await addOpenAIKey(app);
+  it('does not expose the removed audio speech proxy route', async () => {
+    let upstreamCalled = false;
     const origFetch = global.fetch;
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
-      if (urlStr === 'https://api.openai.com/v1/audio/speech') {
-        const body = JSON.parse((init as any).body);
-        expect(body.model).toBe('tts-1');
-        expect(body.voice).toBe('alloy');
-        return new Response(Buffer.from('fake-mp3'), { status: 200, headers: { 'content-type': 'audio/mpeg' } });
-      }
+      if (urlStr === 'https://api.openai.com/v1/audio/speech') upstreamCalled = true;
       return origFetch(url, init);
     });
 
@@ -108,13 +90,10 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
       model: 'tts-1',
       input: 'LLMHarbor audio smoke test',
       voice: 'alloy',
-      response_format: 'mp3',
     }, authHeaders());
 
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('audio/mpeg');
-    expect((res.raw as Buffer).toString()).toBe('fake-mp3');
-    expect(res.headers.get('x-routed-via')).toBe('openai/tts-1');
+    expect(res.status).toBe(404);
+    expect(upstreamCalled).toBe(false);
   });
 
   it('starts browser OAuth directly, exchanges callback codes, and stores encrypted account tokens', async () => {
@@ -217,30 +196,26 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(models.body.limits[0].usedPercent).toBe(12);
   });
 
-  it('creates domains, scoped local endpoints, and dedicated local endpoint keys', async () => {
+  it('keeps local endpoint creation read-only while client API keys carry advanced access policy', async () => {
+    const list = await request(app, 'GET', '/api/settings/local-endpoints');
+    expect(list.status).toBe(200);
+    expect(list.body.endpoints[0]).toMatchObject({ slug: 'default', basePath: '/v1' });
+
     const endpoint = await request(app, 'POST', '/api/settings/local-endpoints', {
       name: 'OpenAI only harbor',
       slug: 'openai-only',
       providerScopes: ['openai'],
       domains: ['openai.localhost'],
     });
-    expect(endpoint.status).toBe(201);
-    expect(endpoint.body.slug).toBe('openai-only');
-    expect(endpoint.body.providerScopes).toEqual(['openai']);
-    expect(endpoint.body.domains).toEqual(['openai.localhost']);
+    expect(endpoint.status).toBe(410);
+    expect(endpoint.body.error.code).toBe('local_endpoint_creation_removed');
 
-    const key = await request(app, 'POST', `/api/settings/local-endpoints/${endpoint.body.id}/keys`, {
+    const key = await request(app, 'POST', '/api/settings/api-keys', {
       label: 'OpenAI app key',
       limits: { rpm: 5, rpd: null, tpm: 1000, tpd: null },
     });
     expect(key.status).toBe(201);
     expect(key.body.key).toMatch(/^llmharbor-/);
-    expect(key.body.localEndpointId).toBe(endpoint.body.id);
     expect(key.body.limits).toEqual({ rpm: 5, rpd: null, tpm: 1000, tpd: null });
-
-    const list = await request(app, 'GET', '/api/settings/local-endpoints');
-    expect(list.status).toBe(200);
-    expect(list.body.endpoints[0].keys[0].maskedKey).toBeTruthy();
-    expect(list.body.endpoints[0].keys[0].limits.rpm).toBe(5);
   });
 });

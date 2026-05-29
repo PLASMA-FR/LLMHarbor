@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -71,14 +71,12 @@ export default function ModelsPage() {
     queryFn: () => apiFetch('/api/endpoints'),
   })
 
-  useEffect(() => {
-    if (!selectedEndpoint && endpoints.length > 0) setSelectedEndpoint(endpoints[0].platform)
-  }, [endpoints, selectedEndpoint])
+  const activeEndpoint = selectedEndpoint || endpoints[0]?.platform || ''
 
   const { data: endpointModels = [] } = useQuery<EndpointModel[]>({
-    queryKey: ['custom-endpoint-models', selectedEndpoint],
-    queryFn: () => apiFetch(`/api/endpoints/${encodeURIComponent(selectedEndpoint)}/models`),
-    enabled: Boolean(selectedEndpoint),
+    queryKey: ['custom-endpoint-models', activeEndpoint],
+    queryFn: () => apiFetch(`/api/endpoints/${encodeURIComponent(activeEndpoint)}/models`),
+    enabled: Boolean(activeEndpoint),
   })
 
   const addModel = useMutation({
@@ -95,7 +93,7 @@ export default function ModelsPage() {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', selectedEndpoint] })
+      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', activeEndpoint] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
       setModelId('')
       setModelDisplayName('')
@@ -123,12 +121,12 @@ export default function ModelsPage() {
       apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}/models/${modelDbId}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', selectedEndpoint] })
+      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', activeEndpoint] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
     },
   })
 
-  const selectedEndpointInfo = endpoints.find(endpoint => endpoint.platform === selectedEndpoint)
+  const selectedEndpointInfo = endpoints.find(endpoint => endpoint.platform === activeEndpoint)
   const totalModels = endpoints.reduce((sum, endpoint) => sum + endpoint.modelCount, 0)
   const readyEndpoints = endpoints.filter(endpoint => endpoint.keyCount > 0).length
 
@@ -161,7 +159,7 @@ export default function ModelsPage() {
                     type="button"
                     key={endpoint.platform}
                     onClick={() => setSelectedEndpoint(endpoint.platform)}
-                    className={cn('w-full rounded-2xl border px-4 py-3 text-left transition-colors', selectedEndpoint === endpoint.platform ? 'border-primary bg-primary/8' : 'border-border bg-card hover:bg-muted/45')}
+                    className={cn('w-full rounded-2xl border px-4 py-3 text-left transition-colors', activeEndpoint === endpoint.platform ? 'border-primary bg-primary/8' : 'border-border bg-card hover:bg-muted/45')}
                   >
                     <span className="flex items-center justify-between gap-3 text-sm font-semibold">
                       <span className="truncate">{endpoint.name}</span>

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import type {
   ChatMessage,
   ChatCompletionResponse,
@@ -58,6 +59,6 @@ export abstract class BaseProvider {
   }
 
   protected makeId(): string {
-    return `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return `chatcmpl-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
   }
 }

@@ -178,6 +178,27 @@ function createTables(db: Database.Database) {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS client_api_key_route_policies (
+      client_api_key_id INTEGER NOT NULL REFERENCES client_api_keys(id) ON DELETE CASCADE,
+      route TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (client_api_key_id, route)
+    );
+
+    CREATE TABLE IF NOT EXISTS client_api_key_platform_policies (
+      client_api_key_id INTEGER NOT NULL REFERENCES client_api_keys(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (client_api_key_id, platform)
+    );
+
+    CREATE TABLE IF NOT EXISTS client_api_key_model_policies (
+      client_api_key_id INTEGER NOT NULL REFERENCES client_api_keys(id) ON DELETE CASCADE,
+      model_db_id INTEGER NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (client_api_key_id, model_db_id)
+    );
+
     CREATE TABLE IF NOT EXISTS oauth_accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       provider TEXT NOT NULL,
@@ -262,6 +283,9 @@ function ensureClientApiKeyEndpointColumn(db: Database.Database) {
   }
   db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_keys_endpoint ON client_api_keys(local_endpoint_id)').run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_route_policies_lookup ON client_api_key_route_policies(client_api_key_id, route)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_platform_policies_lookup ON client_api_key_platform_policies(client_api_key_id, platform)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_model_policies_lookup ON client_api_key_model_policies(client_api_key_id, model_db_id)').run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider)').run();
 }
 

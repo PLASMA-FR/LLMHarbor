@@ -176,9 +176,7 @@ function codeAssistBody(modelId: string, messages: ChatMessage[], options?: Comp
     sessionId: codeAssistSessionId(options),
     systemInstruction: { role: 'user', parts: systemParts },
   };
-  const requestId = typeof globalThis.crypto?.randomUUID === 'function'
-    ? globalThis.crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const requestId = crypto.randomUUID();
   return {
     project: projectId,
     model: modelId,

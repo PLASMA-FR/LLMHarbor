@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -10,6 +10,56 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { PageHeader } from '@/components/page-header'
 
 type TimeRange = '24h' | '7d' | '30d'
+
+interface AnalyticsSummary {
+  totalRequests: number
+  successRate: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  avgLatencyMs: number
+  estimatedCostSavings: string | number
+}
+
+interface PlatformStats {
+  platform: string
+  requests: number
+  avgLatencyMs: number
+}
+
+interface TimelinePoint {
+  timestamp: string
+  successCount: number
+  failureCount: number
+}
+
+interface ModelStats {
+  displayName: string
+  platform: string
+  requests: number
+  successRate: number
+  avgLatencyMs: number
+  totalInputTokens: number
+  totalOutputTokens: number
+}
+
+interface ErrorEntry {
+  id: number | string
+  platform: string
+  error: string
+  createdAt: string
+}
+
+interface ErrorBucket {
+  platform?: string
+  category?: string
+  count: number
+}
+
+interface ErrorDistribution {
+  byCategory: ErrorBucket[]
+  byPlatform: ErrorBucket[]
+  detailed: ErrorEntry[]
+}
 
 function formatTokens(n?: number): string {
   if (!n) return '0'
@@ -27,7 +77,7 @@ function Stat({ label, value, className }: { label: string; value: string | numb
   )
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="panel-card overflow-hidden rounded-2xl">
       <div className="border-b border-border bg-card px-5 py-4">
@@ -47,32 +97,32 @@ export default function AnalyticsPage() {
 
   const { data: summary } = useQuery({
     queryKey: ['analytics', 'summary', range],
-    queryFn: () => apiFetch<any>(`/api/analytics/summary?range=${range}`),
+    queryFn: () => apiFetch<AnalyticsSummary>(`/api/analytics/summary?range=${range}`),
   })
 
   const { data: byPlatform = [] } = useQuery({
     queryKey: ['analytics', 'by-platform', range],
-    queryFn: () => apiFetch<any[]>(`/api/analytics/by-platform?range=${range}`),
+    queryFn: () => apiFetch<PlatformStats[]>(`/api/analytics/by-platform?range=${range}`),
   })
 
   const { data: timeline = [] } = useQuery({
     queryKey: ['analytics', 'timeline', range],
-    queryFn: () => apiFetch<any[]>(`/api/analytics/timeline?range=${range}`),
+    queryFn: () => apiFetch<TimelinePoint[]>(`/api/analytics/timeline?range=${range}`),
   })
 
   const { data: byModel = [] } = useQuery({
     queryKey: ['analytics', 'by-model', range],
-    queryFn: () => apiFetch<any[]>(`/api/analytics/by-model?range=${range}`),
+    queryFn: () => apiFetch<ModelStats[]>(`/api/analytics/by-model?range=${range}`),
   })
 
   const { data: errors = [] } = useQuery({
     queryKey: ['analytics', 'errors', range],
-    queryFn: () => apiFetch<any[]>(`/api/analytics/errors?range=${range}`),
+    queryFn: () => apiFetch<ErrorEntry[]>(`/api/analytics/errors?range=${range}`),
   })
 
   const { data: errorDist } = useQuery({
     queryKey: ['analytics', 'error-distribution', range],
-    queryFn: () => apiFetch<{ byCategory: any[]; byPlatform: any[]; detailed: any[] }>(`/api/analytics/error-distribution?range=${range}`),
+    queryFn: () => apiFetch<ErrorDistribution>(`/api/analytics/error-distribution?range=${range}`),
   })
 
   return (
@@ -180,7 +230,7 @@ export default function AnalyticsPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {byModel.map((m: any, i: number) => (
+                      {byModel.map((m, i) => (
                         <TableRow key={i}>
                           <TableCell className="pl-4 text-sm font-medium">{m.displayName}</TableCell>
                           <TableCell className="text-xs text-muted-foreground">{m.platform}</TableCell>
@@ -228,7 +278,7 @@ export default function AnalyticsPage() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {errors.slice(0, 20).map((e: any) => (
+                    {errors.slice(0, 20).map((e) => (
                       <TableRow key={e.id}>
                         <TableCell className="pl-4 text-xs">{e.platform}</TableCell>
                         <TableCell className="text-xs max-w-[200px] truncate">{e.error}</TableCell>

@@ -6,7 +6,7 @@ import { routeRequest, routeRequestAsync } from '../../services/router.js';
 describe('Router', () => {
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'test-antigravity-client-secret';
+    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
     initDb(':memory:');
   });
 

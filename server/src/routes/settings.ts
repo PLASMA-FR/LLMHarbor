@@ -3,6 +3,13 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import {
+  getClientApiKeyPolicySnapshot,
+  isKnownClientPolicyPlatform,
+  isKnownLocalApiRoute,
+  updateClientApiKeyPolicy,
+  type ClientAccessPolicyPatch,
+} from '../services/accessPolicy.js';
+import {
   clientApiKeyLimitsFromRow,
   createNamedClientApiKey,
   deleteClientApiKey,
@@ -36,6 +43,23 @@ const updateClientKeySchema = z.object({
   message: 'Provide label, enabled, or limits',
 });
 
+const accessPolicyPatchSchema = z.object({
+  routes: z.array(z.object({
+    route: z.string().min(1).max(80).refine(isKnownLocalApiRoute, 'Unknown local API route'),
+    enabled: z.boolean(),
+  })).optional(),
+  platforms: z.array(z.object({
+    platform: z.string().trim().min(1).max(80).refine(isKnownClientPolicyPlatform, 'Unknown provider platform'),
+    enabled: z.boolean(),
+  })).optional(),
+  models: z.array(z.object({
+    modelDbId: z.number().int().positive(),
+    enabled: z.boolean(),
+  })).optional(),
+}).strict().refine(body => body.routes !== undefined || body.platforms !== undefined || body.models !== undefined, {
+  message: 'Provide routes, platforms, or models',
+});
+
 // Backward-compatible primary key endpoint for older clients and docs.
 settingsRouter.get('/api-key', (_req: Request, res: Response) => {
   res.json({ apiKey: getUnifiedApiKey() });
@@ -50,6 +74,54 @@ settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
 // Personal API platform keys. Multiple enabled keys can authenticate against /v1.
 settingsRouter.get('/api-keys', (_req: Request, res: Response) => {
   res.json(listClientApiKeys());
+});
+
+settingsRouter.get('/api-keys/:id/access-policy', (req: Request, res: Response) => {
+  const id = Number.parseInt(req.params.id as string, 10);
+  if (Number.isNaN(id)) {
+    res.status(400).json({ error: { message: 'Invalid key ID' } });
+    return;
+  }
+
+  const snapshot = getClientApiKeyPolicySnapshot(id);
+  if (!snapshot) {
+    res.status(404).json({ error: { message: 'Client key not found' } });
+    return;
+  }
+
+  res.json(snapshot);
+});
+
+settingsRouter.patch('/api-keys/:id/access-policy', (req: Request, res: Response) => {
+  const id = Number.parseInt(req.params.id as string, 10);
+  if (Number.isNaN(id)) {
+    res.status(400).json({ error: { message: 'Invalid key ID' } });
+    return;
+  }
+
+  const parsed = accessPolicyPatchSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  const db = getDb();
+  if (parsed.data.models?.length) {
+    const modelExists = db.prepare('SELECT id FROM models WHERE id = ?');
+    const missing = parsed.data.models.find(item => !modelExists.get(item.modelDbId));
+    if (missing) {
+      res.status(400).json({ error: { message: `Unknown model DB id ${missing.modelDbId}` } });
+      return;
+    }
+  }
+
+  const snapshot = updateClientApiKeyPolicy(id, parsed.data as ClientAccessPolicyPatch);
+  if (!snapshot) {
+    res.status(404).json({ error: { message: 'Client key not found' } });
+    return;
+  }
+
+  res.json(snapshot);
 });
 
 settingsRouter.post('/api-keys', (req: Request, res: Response) => {
@@ -126,6 +198,18 @@ const createEndpointKeySchema = z.object({
   limits: clientKeyLimitsSchema,
 });
 
+function ensureDefaultLocalEndpointRow() {
+  const db = getDb();
+  db.prepare(`
+    INSERT OR IGNORE INTO local_endpoints (id, name, slug, enabled)
+    VALUES (1, 'Default endpoint', 'default', 1)
+  `).run();
+  db.prepare(`
+    INSERT OR IGNORE INTO local_endpoint_domains (local_endpoint_id, domain)
+    VALUES (1, '127.0.0.1:3001')
+  `).run();
+}
+
 function endpointRowToJson(row: any) {
   const db = getDb();
   const providerScopes = db.prepare('SELECT platform FROM local_endpoint_provider_scopes WHERE local_endpoint_id = ? ORDER BY platform').all(row.id).map((r: any) => r.platform);
@@ -154,34 +238,18 @@ function endpointRowToJson(row: any) {
 }
 
 settingsRouter.get('/local-endpoints', (_req: Request, res: Response) => {
+  ensureDefaultLocalEndpointRow();
   const rows = getDb().prepare('SELECT * FROM local_endpoints ORDER BY id ASC').all() as any[];
   res.json({ endpoints: rows.map(endpointRowToJson) });
 });
 
-settingsRouter.post('/local-endpoints', (req: Request, res: Response) => {
-  const parsed = createLocalEndpointSchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-  const db = getDb();
-  const existing = db.prepare('SELECT id FROM local_endpoints WHERE slug = ?').get(parsed.data.slug);
-  if (existing) {
-    res.status(409).json({ error: { message: `Local endpoint '${parsed.data.slug}' already exists` } });
-    return;
-  }
-  const run = db.transaction(() => {
-    const result = db.prepare('INSERT INTO local_endpoints (name, slug, enabled) VALUES (?, ?, 1)').run(parsed.data.name.trim(), parsed.data.slug);
-    const id = Number(result.lastInsertRowid);
-    const scopeStmt = db.prepare('INSERT OR IGNORE INTO local_endpoint_provider_scopes (local_endpoint_id, platform) VALUES (?, ?)');
-    for (const platform of parsed.data.providerScopes) scopeStmt.run(id, platform);
-    const domainStmt = db.prepare('INSERT OR IGNORE INTO local_endpoint_domains (local_endpoint_id, domain) VALUES (?, ?)');
-    for (const domain of parsed.data.domains) domainStmt.run(id, domain.trim().toLowerCase());
-    return id;
+settingsRouter.post('/local-endpoints', (_req: Request, res: Response) => {
+  res.status(410).json({
+    error: {
+      message: 'Custom local endpoint creation has moved to per-key access policies. Use /api/settings/api-keys/:id/access-policy to limit routes, providers, and models.',
+      code: 'local_endpoint_creation_removed',
+    },
   });
-  const id = run();
-  const row = db.prepare('SELECT * FROM local_endpoints WHERE id = ?').get(id) as any;
-  res.status(201).json(endpointRowToJson(row));
 });
 
 settingsRouter.patch('/local-endpoints/:id', (req: Request, res: Response) => {

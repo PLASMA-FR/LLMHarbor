@@ -19,12 +19,19 @@ function removeDbFile(dbPath: string) {
   }
 }
 
+let uniqueId = Date.now();
+
+function nextUniqueId() {
+  uniqueId += 1;
+  return uniqueId;
+}
+
 describe('Rate Limiter', () => {
   // Use unique identifiers per test to avoid cross-contamination
   let testId: number;
 
   beforeEach(() => {
-    testId = Math.floor(Math.random() * 1_000_000);
+    testId = nextUniqueId();
   });
 
   describe('canMakeRequest', () => {
@@ -92,7 +99,7 @@ describe('Rate Limiter', () => {
 
   describe('escalating cooldown', () => {
     it('escalates the 2nd/3rd/4th hit within 24h to 10m / 1h / 24h', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
+      const id = nextUniqueId();
       const args = ['cerebras', `escalating-model-${id}`, id] as const;
       // 1st: 2 minutes
       expect(getNextCooldownDuration(...args)).toBe(2 * 60 * 1000);
@@ -107,7 +114,7 @@ describe('Rate Limiter', () => {
     });
 
     it('counts independently per (platform, model, key)', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
+      const id = nextUniqueId();
       // Different keys for the same model should each start at 2m, not share state.
       expect(getNextCooldownDuration('groq', `m-${id}`, id)).toBe(2 * 60 * 1000);
       expect(getNextCooldownDuration('groq', `m-${id}`, id + 1)).toBe(2 * 60 * 1000);
@@ -118,7 +125,7 @@ describe('Rate Limiter', () => {
   describe('persistent state', () => {
     it('preserves per-key usage and cooldowns after the limiter module reloads', async () => {
       process.env.ENCRYPTION_KEY = '0'.repeat(64);
-      const dbPath = `/tmp/llmharbor-ratelimit-${Date.now()}-${Math.random()}.db`;
+      const dbPath = `/tmp/llmharbor-ratelimit-${nextUniqueId()}.db`;
       const keyId = 4242;
       let db: { close: () => void } | undefined;
 

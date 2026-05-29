@@ -14,6 +14,12 @@ import { cn } from '@/lib/utils'
 
 const queryClient = new QueryClient()
 
+function getInitialDarkMode() {
+  if (typeof window === 'undefined') return false
+  const stored = localStorage.getItem('theme')
+  return stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
+}
+
 const navItems = [
   { to: '/playground', label: 'Playground', helper: 'test routes' },
   { to: '/keys', label: 'Keys', helper: 'credentials' },
@@ -21,7 +27,7 @@ const navItems = [
   { to: '/models', label: 'Models', helper: 'registry' },
   { to: '/fallback', label: 'Fallback', helper: 'model chain' },
   { to: '/analytics', label: 'Analytics', helper: 'traffic' },
-  { to: '/settings', label: 'Settings', helper: 'endpoints' },
+  { to: '/settings', label: 'Settings', helper: 'access policy' },
 ]
 
 function NavItem({ to, label, helper }: { to: string; label: string; helper: string }) {
@@ -30,7 +36,7 @@ function NavItem({ to, label, helper }: { to: string; label: string; helper: str
       to={to}
       className={({ isActive }) =>
         cn(
-          'group flex min-w-0 items-center gap-3 rounded-2xl px-3 py-2.5 text-sm transition-all',
+          'group flex min-w-fit shrink-0 items-center gap-3 rounded-2xl px-3 py-2.5 text-sm transition-all lg:shrink',
           isActive
             ? 'bg-muted text-foreground ring-1 ring-border'
             : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
@@ -51,16 +57,11 @@ function NavItem({ to, label, helper }: { to: string; label: string; helper: str
 }
 
 function DarkModeToggle() {
-  const [dark, setDark] = useState(() =>
-    typeof window !== 'undefined' && document.documentElement.classList.contains('dark')
-  )
+  const [dark, setDark] = useState(getInitialDarkMode)
 
   useEffect(() => {
-    const stored = localStorage.getItem('theme')
-    const next = stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
-    document.documentElement.classList.toggle('dark', next)
-    setDark(next)
-  }, [])
+    document.documentElement.classList.toggle('dark', dark)
+  }, [dark])
 
   function toggle() {
     const next = !dark
@@ -82,27 +83,27 @@ function DarkModeToggle() {
 
 function AppShell() {
   return (
-    <div className="min-h-screen overflow-hidden bg-background text-foreground">
+    <div className="min-h-screen w-full min-w-0 overflow-x-hidden bg-background text-foreground">
       <header className="sticky top-0 z-40 border-b border-border bg-background">
-        <div className="mx-auto flex max-w-7xl items-center gap-5 px-4 py-3 sm:px-6 lg:px-8">
+        <div className="mx-auto box-border flex max-w-7xl min-w-0 items-center gap-3 px-4 py-3 sm:gap-5 sm:px-6 lg:px-8">
           <NavLink to="/playground" className="rounded-2xl outline-none focus-visible:ring-3 focus-visible:ring-ring/40">
             <HarborLogo showWordmark />
           </NavLink>
-          <nav className="ml-auto hidden items-center gap-1 md:flex">
+          <nav className="no-scrollbar ml-auto hidden min-w-0 items-center gap-1 overflow-x-auto overscroll-x-contain lg:flex">
             {navItems.map(item => <NavItem key={item.to} {...item} />)}
           </nav>
-          <div className="ml-auto flex items-center gap-2 md:ml-2">
-            <div className="hidden rounded-lg border border-border bg-card px-3 py-1.5 text-[11px] font-medium text-muted-foreground sm:block">
+          <div className="ml-auto flex items-center gap-2 lg:ml-2">
+            <div className="hidden rounded-lg border border-border bg-card px-3 py-1.5 text-[11px] font-medium text-muted-foreground xl:block">
               Local router, OpenAI compatible
             </div>
             <DarkModeToggle />
           </div>
         </div>
-        <nav className="flex gap-1 overflow-x-auto px-4 pb-3 md:hidden">
+        <nav className="no-scrollbar flex gap-1 overflow-x-auto overscroll-x-contain px-4 pb-3 lg:hidden">
           {navItems.map(item => <NavItem key={item.to} {...item} />)}
         </nav>
       </header>
-      <main className="mx-auto max-w-7xl px-4 py-7 sm:px-6 lg:px-8 lg:py-9">
+      <main className="mx-auto box-border max-w-7xl min-w-0 px-4 py-7 sm:px-6 lg:px-8 lg:py-9">
         <Routes>
           <Route path="/" element={<Navigate to="/playground" replace />} />
           <Route path="/playground" element={<PlaygroundPage />} />

@@ -1,9 +1,17 @@
-<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect width="256" height="256" rx="56" fill="#F7F4EE"/>
-  <path d="M128 42a27 27 0 1 0 0 54 27 27 0 0 0 0-54Zm0 17a10 10 0 1 1 0 20 10 10 0 0 1 0-20Z" fill="#193944"/>
-  <path d="M118 89h20v91h-20V89Z" fill="#193944"/>
-  <path d="M75 117h106v20H75z" fill="#0F5F78"/>
-  <path d="M57 151c9 37 36 59 71 59s62-22 71-59h-22c-8 23-25 38-49 38s-41-15-49-38H57Z" fill="#193944"/>
-  <path d="M58 134c7 0 13 6 13 13v28H45v-28c0-7 6-13 13-13ZM198 134c7 0 13 6 13 13v28h-26v-28c0-7 6-13 13-13Z" fill="#193944"/>
-  <path d="M64 218h128" stroke="#0F5F78" stroke-width="12" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">LLMHarbor anchor logo</title>
+  <desc id="desc">A flat anchor-shaped mark for LLMHarbor, combining a safe harbor, local routing, and model fallback paths.</desc>
+  <rect x="10" y="10" width="236" height="236" rx="54" fill="#F7F4EE"/>
+  <rect x="10.75" y="10.75" width="234.5" height="234.5" rx="53.25" fill="none" stroke="#D7DED8" stroke-width="1.5"/>
+  <path d="M45 165c17.8 39.4 45.5 59.1 83 59.1S193.2 204.4 211 165" fill="none" stroke="#D7DED8" stroke-width="26" stroke-linecap="round"/>
+  <g fill="none" stroke="#193944" stroke-width="20" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="128" cy="58" r="22"/>
+    <path d="M128 82v121"/>
+    <path d="M83 117h90"/>
+    <path d="M54 164c15.6 34.6 40.3 51.9 74 51.9S186.4 198.6 202 164"/>
+    <path d="M54 164l38-7"/>
+    <path d="M202 164l-38-7"/>
+  </g>
+  <path d="M155 102h31l-24.5 29h29" fill="none" stroke="#0F5F78" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M84 202c13.3 9.2 28 13.8 44 13.8s30.7-4.6 44-13.8" fill="none" stroke="#0F5F78" stroke-width="5" stroke-linecap="round" opacity="0.65"/>
 </svg>

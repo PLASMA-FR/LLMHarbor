@@ -56,7 +56,7 @@ describe('Virtual "auto" model', () => {
   });
 
   it('lists "auto" as the first /v1/models entry', async () => {
-    const { status, body } = await request(app, 'GET', '/v1/models');
+    const { status, body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
     expect(status).toBe(200);
     expect(body.object).toBe('list');
     expect(body.data[0]).toMatchObject({
@@ -76,7 +76,7 @@ describe('Virtual "auto" model', () => {
     `).run();
     db.prepare("UPDATE models SET enabled = 1 WHERE platform = 'openai' AND model_id = 'gpt-browser-routeable-test'").run();
 
-    const withoutKey = await request(app, 'GET', '/v1/models');
+    const withoutKey = await request(app, 'GET', '/v1/models', undefined, authHeaders());
     expect(withoutKey.body.data.map((m: any) => m.id)).not.toContain('gpt-browser-routeable-test');
 
     const token = encrypt('oauth-access-token');
@@ -89,11 +89,11 @@ describe('Virtual "auto" model', () => {
       VALUES ('openai', 'ChatGPT browser', ?, ?, ?, 'healthy', 1, 'oauth', ?)
     `).run(token.encrypted, token.iv, token.authTag, Number(account.lastInsertRowid));
 
-    const reconnecting = await request(app, 'GET', '/v1/models');
+    const reconnecting = await request(app, 'GET', '/v1/models', undefined, authHeaders());
     expect(reconnecting.body.data.map((m: any) => m.id)).not.toContain('gpt-browser-routeable-test');
 
     db.prepare("UPDATE oauth_accounts SET metadata_json = '{}' WHERE id = ?").run(Number(account.lastInsertRowid));
-    const routeable = await request(app, 'GET', '/v1/models');
+    const routeable = await request(app, 'GET', '/v1/models', undefined, authHeaders());
     expect(routeable.body.data.map((m: any) => m.id)).toContain('gpt-browser-routeable-test');
   });
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -63,13 +63,6 @@ interface EndpointSummary {
   keyCount: number
 }
 
-interface ClientKeyLimits {
-  rpm: number | null
-  rpd: number | null
-  tpm: number | null
-  tpd: number | null
-}
-
 interface ClientApiKey {
   id: number
   label: string
@@ -79,44 +72,6 @@ interface ClientApiKey {
   createdAt: string
   lastUsedAt: string | null
   localEndpointId?: number | null
-  limits: ClientKeyLimits
-}
-
-type LimitKey = keyof ClientKeyLimits
-
-type LimitDraft = Record<LimitKey, string>
-
-const LIMIT_FIELDS: Array<{ key: LimitKey; label: string; helper: string }> = [
-  { key: 'rpm', label: 'RPM', helper: 'requests/min' },
-  { key: 'rpd', label: 'RPD', helper: 'requests/day' },
-  { key: 'tpm', label: 'TPM', helper: 'tokens/min' },
-  { key: 'tpd', label: 'TPD', helper: 'tokens/day' },
-]
-
-const EMPTY_LIMIT_DRAFT: LimitDraft = { rpm: '', rpd: '', tpm: '', tpd: '' }
-
-function limitsToDraft(limits?: Partial<ClientKeyLimits>): LimitDraft {
-  return {
-    rpm: limits?.rpm ? String(limits.rpm) : '',
-    rpd: limits?.rpd ? String(limits.rpd) : '',
-    tpm: limits?.tpm ? String(limits.tpm) : '',
-    tpd: limits?.tpd ? String(limits.tpd) : '',
-  }
-}
-
-function draftToLimits(draft: LimitDraft): ClientKeyLimits {
-  return LIMIT_FIELDS.reduce((acc, field) => {
-    const value = draft[field.key].trim()
-    acc[field.key] = value ? Number(value) : null
-    return acc
-  }, { rpm: null, rpd: null, tpm: null, tpd: null } as ClientKeyLimits)
-}
-
-function limitSummary(limits: ClientKeyLimits) {
-  const active = LIMIT_FIELDS
-    .map(field => limits[field.key] ? `${field.label} ${limits[field.key]}` : null)
-    .filter(Boolean)
-  return active.length > 0 ? active.join(' · ') : 'Unlimited'
 }
 
 interface ProviderImportTarget {
@@ -134,51 +89,12 @@ interface BulkImportResult {
   skipped: number
 }
 
-function ClientKeyLimitEditor({ keyRecord, onSave, saving }: { keyRecord: ClientApiKey; onSave: (limits: ClientKeyLimits) => void; saving: boolean }) {
-  const [draft, setDraft] = useState<LimitDraft>(() => limitsToDraft(keyRecord.limits))
-
-  useEffect(() => {
-    setDraft(limitsToDraft(keyRecord.limits))
-  }, [keyRecord.limits.rpm, keyRecord.limits.rpd, keyRecord.limits.tpm, keyRecord.limits.tpd])
-
-  return (
-    <div className="mt-3 rounded-2xl border border-border/70 bg-card/60 p-3">
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Local limits</p>
-          <p className="text-xs text-muted-foreground">{limitSummary(keyRecord.limits)}</p>
-        </div>
-        <Button size="sm" variant="outline" onClick={() => onSave(draftToLimits(draft))} disabled={saving}>
-          {saving ? 'Saving...' : 'Save limits'}
-        </Button>
-      </div>
-      <div className="mt-3 grid gap-2 sm:grid-cols-4">
-        {LIMIT_FIELDS.map(field => (
-          <div key={field.key} className="grid gap-1">
-            <Label className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{field.label}</Label>
-            <Input
-              inputMode="numeric"
-              pattern="[0-9]*"
-              min={1}
-              value={draft[field.key]}
-              onChange={event => setDraft(prev => ({ ...prev, [field.key]: event.target.value.replace(/[^0-9]/g, '') }))}
-              placeholder="∞"
-            />
-            <span className="text-[10px] text-muted-foreground">{field.helper}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  )
-}
-
 function ClientKeysSection() {
   const queryClient = useQueryClient()
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null)
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
   const [createdKey, setCreatedKey] = useState<ClientApiKey | null>(null)
   const [newKeyLabel, setNewKeyLabel] = useState('')
-  const [newKeyLimits, setNewKeyLimits] = useState<LimitDraft>(EMPTY_LIMIT_DRAFT)
 
   const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
@@ -186,16 +102,15 @@ function ClientKeysSection() {
   })
 
   const createKey = useMutation({
-    mutationFn: ({ label, limits }: { label: string; limits: ClientKeyLimits }) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
+    mutationFn: (label: string) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
       method: 'POST',
-      body: JSON.stringify({ label: label || 'Personal key', limits }),
+      body: JSON.stringify({ label: label || 'Personal key' }),
     }),
     onSuccess: (key) => {
       setCreatedKey(key)
       queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
       queryClient.invalidateQueries({ queryKey: ['unified-key'] })
       setNewKeyLabel('')
-      setNewKeyLimits(EMPTY_LIMIT_DRAFT)
     },
   })
 
@@ -203,14 +118,6 @@ function ClientKeysSection() {
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) => apiFetch<ClientApiKey>(`/api/settings/api-keys/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ enabled }),
-    }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-api-keys'] }),
-  })
-
-  const updateKeyLimits = useMutation({
-    mutationFn: ({ id, limits }: { id: number; limits: ClientKeyLimits }) => apiFetch<ClientApiKey>(`/api/settings/api-keys/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ limits }),
     }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-api-keys'] }),
   })
@@ -241,7 +148,7 @@ function ClientKeysSection() {
           <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-primary/80">Personal API platform</p>
           <h2 className="mt-2 text-xl font-semibold tracking-[-0.035em]">Client API keys</h2>
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
-            Create one OpenAI-compatible key per app, agent, laptop, or experiment. Revoke a single client without touching provider credentials.
+            Create one OpenAI-compatible key per app, agent, laptop, or experiment. Then tune routes, provider endpoints, and models per key.
           </p>
         </div>
         <div className="grid min-w-0 gap-3 sm:min-w-[360px]">
@@ -251,23 +158,12 @@ function ClientKeysSection() {
               value={newKeyLabel}
               onChange={(event) => setNewKeyLabel(event.target.value)}
             />
-            <Button onClick={() => createKey.mutate({ label: newKeyLabel, limits: draftToLimits(newKeyLimits) })} disabled={createKey.isPending}>
+            <Button onClick={() => createKey.mutate(newKeyLabel)} disabled={createKey.isPending}>
               {createKey.isPending ? 'Creating...' : 'New key'}
             </Button>
           </div>
-          <div className="grid gap-2 sm:grid-cols-4">
-            {LIMIT_FIELDS.map(field => (
-              <div key={field.key} className="grid gap-1">
-                <Label className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{field.label}</Label>
-                <Input
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  value={newKeyLimits[field.key]}
-                  onChange={event => setNewKeyLimits(prev => ({ ...prev, [field.key]: event.target.value.replace(/[^0-9]/g, '') }))}
-                  placeholder="∞"
-                />
-              </div>
-            ))}
+          <div className="rounded-2xl border border-border/70 bg-background px-3 py-2 text-xs leading-5 text-muted-foreground">
+            Use Access policy to block Antigravity, allow one provider endpoint, or hide a single model from a specific llmharbor key.
           </div>
         </div>
       </div>
@@ -316,15 +212,14 @@ function ClientKeysSection() {
               <div className="flex flex-wrap items-center gap-2">
                 <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)} disabled={!key.key}>{visibleKeyId === key.id && key.key ? 'Hide' : 'Show'}</Button>
                 <Button variant="default" size="sm" onClick={() => copy(key)} disabled={!key.key}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
+                <Button variant="outline" size="sm" onClick={() => { window.location.href = `/settings?key=${key.id}` }}>Access policy</Button>
                 <Switch checked={key.enabled} onCheckedChange={(enabled) => toggleKey.mutate({ id: key.id, enabled })} />
                 <Button variant="ghost" size="sm" onClick={() => deleteClientKey.mutate(key.id)}>Delete</Button>
               </div>
             </div>
-            <ClientKeyLimitEditor
-              keyRecord={key}
-              saving={updateKeyLimits.isPending}
-              onSave={(limits) => updateKeyLimits.mutate({ id: key.id, limits })}
-            />
+            <div className="mt-3 rounded-2xl border border-border/70 bg-card/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
+              Policy is isolated to this key. Other local apps keep their own route, provider, and model permissions.
+            </div>
           </div>
         ))}
       </div>
@@ -602,7 +497,7 @@ export default function KeysPage() {
         <section className="panel-card rounded-2xl p-5 sm:p-6">
           <SectionTitle
             title="Bulk import provider keys"
-            description="Upload a .txt file with one key per line. Select the numbered provider target first — Google is 1, Groq is 2, and custom providers continue after the built-ins. Blank lines and # comments are ignored."
+            description="Upload a .txt file with one key per line. Select the numbered provider target first: Google is 1, Groq is 2, and custom providers continue after the built-ins. Blank lines and # comments are ignored."
           />
           <div className="grid gap-3 lg:grid-cols-[240px_1fr_180px_auto] lg:items-end">
             <div className="space-y-1.5">

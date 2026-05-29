@@ -273,7 +273,15 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
  * @param preferredModelDbId - try this model first (sticky session)
  */
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, strictPreferredModel = false): RouteResult {
+export type RouteModelAccessFilter = (model: { id: number; platform: string; modelId: string; displayName: string }) => boolean;
+
+export function routeRequest(
+  estimatedTokens = 1000,
+  skipKeys?: Set<string>,
+  preferredModelDbId?: number,
+  strictPreferredModel = false,
+  accessFilter?: RouteModelAccessFilter,
+): RouteResult {
   const db = getDb();
 
   // Get fallback chain ordered by priority
@@ -309,6 +317,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     }
   }
 
+  let sawDeniedRouteableCandidate = false;
+  let sawAllowedRouteableCandidate = false;
+
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
 
@@ -335,6 +346,13 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     ).all(model.platform) as KeyRow[];
 
     if (keys.length === 0) continue;
+
+    if (accessFilter && !accessFilter({ id: model.id, platform: model.platform, modelId: model.model_id, displayName: model.display_name })) {
+      sawDeniedRouteableCandidate = true;
+      continue;
+    }
+
+    sawAllowedRouteableCandidate = true;
 
     // Get limits once for this model
     const limits = {
@@ -393,13 +411,26 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // in the `sortedChain` for THIS specific request.
   }
 
+  if (sawDeniedRouteableCandidate && !sawAllowedRouteableCandidate) {
+    const err = new Error('No routeable models are allowed by this local API key access policy.') as any;
+    err.status = 403;
+    err.code = 'client_access_policy_denied';
+    throw err;
+  }
+
   const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
   err.status = 429;
   throw err;
 }
 
-export async function routeRequestAsync(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, strictPreferredModel = false): Promise<RouteResult> {
-  const route = routeRequest(estimatedTokens, skipKeys, preferredModelDbId, strictPreferredModel);
+export async function routeRequestAsync(
+  estimatedTokens = 1000,
+  skipKeys?: Set<string>,
+  preferredModelDbId?: number,
+  strictPreferredModel = false,
+  accessFilter?: RouteModelAccessFilter,
+): Promise<RouteResult> {
+  const route = routeRequest(estimatedTokens, skipKeys, preferredModelDbId, strictPreferredModel, accessFilter);
   const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
   if (key?.oauth_account_id) {
     const refreshed = await refreshOAuthKeyIfNeeded(key);

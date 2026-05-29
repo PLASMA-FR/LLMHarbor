@@ -129,9 +129,17 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+    box-sizing: border-box;
+  }
+  *::before,
+  *::after {
+    box-sizing: border-box;
   }
   html {
     @apply font-sans antialiased;
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
     font-feature-settings: 'ss01', 'cv11';
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
@@ -139,8 +147,16 @@
   }
   body {
     @apply bg-background text-foreground;
+    width: 100%;
+    max-width: 100%;
     min-width: 320px;
     font-feature-settings: 'ss01', 'cv11', 'tnum';
+    overflow-x: hidden;
+  }
+  #root {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden;
   }
   code, pre, kbd, samp {
     font-family: var(--font-mono);
@@ -159,5 +175,12 @@
   }
   .harbor-grid {
     background: transparent;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
   }
 }

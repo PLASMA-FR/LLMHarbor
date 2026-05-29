@@ -4,9 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>LLMHarbor - local OpenAI-compatible routing for every model and account</title>
-  <meta name="description" content="LLMHarbor is a self-hosted OpenAI-compatible LLM router with browser OAuth accounts, provider key management, per-client-key limits, fallback routing, analytics, and a practical local dashboard." />
+  <meta name="description" content="LLMHarbor is a self-hosted OpenAI-compatible LLM router with browser OAuth accounts, provider key management, per-key access policy, fallback routing, analytics, and a practical local dashboard." />
   <meta property="og:title" content="LLMHarbor" />
-  <meta property="og:description" content="One local OpenAI-compatible harbor for provider keys, browser OAuth accounts, per-client limits, model fallback, analytics, and safer routing." />
+  <meta property="og:description" content="One local OpenAI-compatible harbor for provider keys, browser OAuth accounts, per-key access policy, model fallback, analytics, and safer routing." />
   <meta property="og:type" content="website" />
   <link rel="icon" href="./assets/logo.svg" />
   <link rel="stylesheet" href="./styles.css" />
@@ -22,7 +22,7 @@
       <a href="#why">Why</a>
       <a href="#features">Features</a>
       <a href="#docs">Docs</a>
-      <a href="#oauth-limits">OAuth &amp; limits</a>
+      <a href="#access-policy">Policies</a>
       <a href="#importer">Bulk import</a>
       <a href="https://github.com/PLASMA-FR/LLMHarbor">GitHub</a>
     </nav>
@@ -33,7 +33,7 @@
       <div class="hero-copy">
         <p class="eyebrow">Self-hosted, local-first, OpenAI compatible</p>
         <h1>Bring every LLM key into one quiet harbor.</h1>
-        <p class="lead">LLMHarbor sits between your apps and model providers. Add provider keys, connect browser accounts, set per-client-key limits, choose fallback order, watch traffic, and keep one stable OpenAI-compatible endpoint for your agents, editors, and experiments.</p>
+        <p class="lead">LLMHarbor gives every app one local OpenAI-compatible endpoint, then handles keys, browser accounts, limits, fallback, and per-key access policy.</p>
         <div class="hero-actions">
           <a class="button primary" href="#install">Install in one command</a>
           <a class="button" href="#docs">Read the docs</a>
@@ -65,7 +65,7 @@
           <div class="provider provider-c">Antigravity</div>
           <div class="client-node">Your app</div>
         </div>
-        <p class="scene-caption">A small local control plane routes requests to healthy provider keys and OAuth-backed accounts, enforces client limits, and falls back without changing your client code.</p>
+        <p class="scene-caption">A small local control plane routes requests to healthy provider keys and OAuth-backed accounts, applies per-client access policy, and falls back without changing your client code.</p>
       </div>
     </section>
 
@@ -73,7 +73,7 @@
       <div><strong>OpenAI-compatible</strong><span>/v1/chat/completions</span></div>
       <div><strong>Local by default</strong><span>127.0.0.1 control plane</span></div>
       <div><strong>Provider-aware</strong><span>health, fallback, limits</span></div>
-      <div><strong>Guardrailed</strong><span>per-client RPM/RPD/TPM/TPD</span></div>
+      <div><strong>Guardrailed</strong><span>per-key route, provider, model policy</span></div>
     </section>
 
     <section id="why" class="section-grid split">
@@ -83,12 +83,12 @@
       </div>
       <div class="body-copy">
         <p>Most AI tools want one base URL and one API key. Real life is different: API providers use different formats, browser subscriptions expose different model inventories, Cloudflare needs account-scoped keys, local servers move around, and free tiers get rate-limited.</p>
-        <p>LLMHarbor gives you one stable local endpoint while it handles encrypted credentials, browser OAuth accounts, model registration, per-client limits, fallback order, health checks, and request analytics behind the scenes.</p>
+        <p>LLMHarbor gives you one stable local endpoint while it handles encrypted credentials, browser OAuth accounts, model registration, per-client access policy, fallback order, health checks, and request analytics behind the scenes.</p>
       </div>
     </section>
 
     <section id="features" class="feature-grid">
-      <article><span>01</span><h3>Scoped client keys</h3><p>Create revocable <code>llmharbor-*</code> keys for apps and agents, each with optional RPM, RPD, TPM, and TPD limits.</p></article>
+      <article><span>01</span><h3>Scoped client keys</h3><p>Create revocable <code>llmharbor-*</code> keys for apps and agents, each with its own route, provider, and model allow/block policy.</p></article>
       <article><span>02</span><h3>Provider key vault</h3><p>Add Google, Groq, Mistral, OpenRouter, Cloudflare, NVIDIA, HuggingFace, and custom OpenAI-compatible endpoints.</p></article>
       <article><span>03</span><h3>Browser OAuth accounts</h3><p>Connect ChatGPT/OpenAI and Antigravity accounts through loopback OAuth, then discover their actual model inventory.</p></article>
       <article><span>04</span><h3>Fallback routing</h3><p>Order models by preference. The router skips unhealthy, disabled, rate-limited, reconnect-required, and incompatible routes.</p></article>
@@ -96,29 +96,30 @@
       <article><span>06</span><h3>Readable analytics</h3><p>See model usage, latency, error reasons, token use, and traffic patterns from a local dashboard.</p></article>
     </section>
 
-    <section id="oauth-limits" class="callout section-grid">
+    <section id="access-policy" class="callout section-grid">
       <div>
-        <p class="eyebrow">Account capacity, without raw token paste</p>
-        <h2>Browser OAuth and local key guardrails.</h2>
-        <p>Connect supported browser accounts from the OAuth page. LLMHarbor handles PKCE, local callback listeners, encrypted storage, refresh, provider-reported limits, and inventory cleanup so stale models do not leak into <code>/v1/models</code>.</p>
-        <p>Create one local API key per app, device, or agent. Set request and token caps at the edge before the router spends upstream quota.</p>
+        <p class="eyebrow">Account access, without raw token paste</p>
+        <h2>Browser OAuth and local key policy.</h2>
+        <p>Connect supported browser accounts from OAuth. LLMHarbor handles PKCE, local callback listeners, encrypted storage, refresh, provider-reported limits, and inventory cleanup so stale models do not leak into <code>/v1/models</code>.</p>
+        <p>Create one local API key per app, device, or agent. Keep the same <code>/v1</code> base URL, then restrict that key to specific local routes, providers, or models before an upstream call is attempted.</p>
       </div>
       <div class="code-panel">
-        <p>Client key limits</p>
+        <p>Client key</p>
         <pre><code>POST /api/settings/api-keys
 {
-  "label": "editor agent",
-  "limits": {
-    "rpm": 30,
-    "rpd": 500,
-    "tpm": 90000,
-    "tpd": 1000000
-  }
+  "label": "editor agent"
 }</code></pre>
         <p>OAuth accounts</p>
         <pre><code>POST /api/oauth/connect/openai/start
 POST /api/oauth/connect/antigravity/start
 GET  /api/oauth/accounts/:id/models</code></pre>
+        <p>Access policy</p>
+        <pre><code>GET   /api/settings/api-keys/:id/access-policy
+PATCH /api/settings/api-keys/:id/access-policy
+{
+  "platforms": [{ "platform": "groq", "enabled": false }],
+  "models": [{ "modelDbId": 42, "enabled": false }]
+}</code></pre>
       </div>
     </section>
 
@@ -149,9 +150,10 @@ AIzaSy...three</code></pre>
         <a href="#quickstart">Quickstart</a>
         <a href="#concepts">Concepts</a>
         <a href="#providers">Providers</a>
-        <a href="#oauth-docs">OAuth &amp; limits</a>
+        <a href="#oauth-docs">OAuth &amp; policy</a>
         <a href="#routing">Routing</a>
         <a href="#api">API reference</a>
+        <a href="#verification">Verification</a>
         <a href="#security">Security</a>
         <a href="#ops">Operations</a>
       </aside>
@@ -164,12 +166,12 @@ AIzaSy...three</code></pre>
           <ol>
             <li>Install with the curl command above.</li>
             <li>Start the app with <code>llmharbor start</code> or run from the repo with <code>npm run dev</code>.</li>
-            <li>Open the local dashboard and create a client key on the Keys page. Add optional RPM/RPD/TPM/TPD caps if the key is for an agent or shared tool.</li>
+            <li>Open the local dashboard and create a client key on the Keys page. Use Settings to scope that key by route, provider, and model if it is for an agent or shared tool.</li>
             <li>Add at least one provider key or connect a supported OAuth account, then run Check all or refresh account inventory.</li>
             <li>Point any OpenAI-compatible client at <code>http://127.0.0.1:3001/v1</code>.</li>
           </ol>
           <pre><code>curl http://127.0.0.1:3001/v1/chat/completions \
-  -H &quot;Authorization: Bearer llmharbor-...&quot; \
+  -H &quot;Authorization: Bearer YOUR_LLMHARBOR_KEY&quot; \
   -H &quot;Content-Type: application/json&quot; \
   -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'</code></pre>
         </article>
@@ -177,7 +179,7 @@ AIzaSy...three</code></pre>
         <article id="concepts" class="doc-section">
           <h3>Core concepts</h3>
           <dl>
-            <dt>Client API keys</dt><dd>Keys used by your apps to call LLMHarbor. They are separate from provider credentials, can be revoked independently, and can carry request/token limits.</dd>
+            <dt>Client API keys</dt><dd>Keys used by your apps to call LLMHarbor. They are separate from provider credentials, can be revoked independently, and can carry route, provider, and model access policies.</dd>
             <dt>Provider keys</dt><dd>Encrypted upstream credentials for Google, Groq, Mistral, OpenRouter, custom endpoints, and other providers.</dd>
             <dt>OAuth accounts</dt><dd>Browser-account connections for providers such as OpenAI/ChatGPT and Antigravity, with automatic model discovery and reconnect handling.</dd>
             <dt>Models</dt><dd>Provider model rows with limits, context windows, display names, and routing metadata.</dd>
@@ -192,9 +194,9 @@ AIzaSy...three</code></pre>
         </article>
 
         <article id="oauth-docs" class="doc-section">
-          <h3>OAuth accounts and client limits</h3>
+          <h3>OAuth accounts and client policy</h3>
           <p>The OAuth page starts provider login through local callback listeners and stores encrypted refresh credentials. Discovery refreshes account models and provider-reported usage windows; accounts that need reconnect are hidden from routing until fixed. Antigravity also needs <code>LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET</code> configured on the server.</p>
-          <p>Local API keys accept nullable <code>rpm</code>, <code>rpd</code>, <code>tpm</code>, and <code>tpd</code> values. Unlimited is represented by leaving a value empty.</p>
+          <p>Local API keys keep a single OpenAI-compatible <code>/v1</code> base URL while Settings scopes each key independently. Block <code>/v1/models</code>, an upstream provider family, or an individual model row for a selected key without changing other apps.</p>
         </article>
 
         <article id="routing" class="doc-section">
@@ -210,19 +212,24 @@ AIzaSy...three</code></pre>
             <div><code>POST /api/keys</code><span>Add one provider credential.</span></div>
             <div><code>GET /api/keys/providers</code><span>List provider ids for bulk import.</span></div>
             <div><code>POST /api/keys/import</code><span>Import provider credentials from text lines.</span></div>
-            <div><code>GET /api/settings/api-keys</code><span>List local client keys and limits.</span></div>
-            <div><code>POST /api/settings/api-keys</code><span>Create local client keys with optional limits.</span></div>
+            <div><code>GET /api/settings/api-keys</code><span>List local client keys.</span></div>
+            <div><code>POST /api/settings/api-keys</code><span>Create local client keys for apps and agents.</span></div>
+            <div><code>GET /api/settings/api-keys/:id/access-policy</code><span>Inspect routes, providers, and models scoped to one local key.</span></div>
+            <div><code>PATCH /api/settings/api-keys/:id/access-policy</code><span>Allow or block local routes, provider endpoints, and model rows.</span></div>
             <div><code>GET /api/oauth/accounts</code><span>List connected browser OAuth accounts.</span></div>
             <div><code>GET /api/endpoints</code><span>List built-in and custom endpoints.</span></div>
             <div><code>POST /v1/chat/completions</code><span>OpenAI-compatible chat completions proxy.</span></div>
-            <div><code>POST /v1/images/generations</code><span>OpenAI-style image generation proxy.</span></div>
-            <div><code>POST /v1/audio/speech</code><span>OpenAI-style speech proxy.</span></div>
           </div>
+        </article>
+
+        <article id="verification" class="doc-section">
+          <h3>Verification</h3>
+          <p>The current rebrand build passed the production TypeScript/Vite build, server tests for routing/OAuth/rate-limit/proxy/policy paths, client lint, dependency audit, a staged secret-pattern scan, an API dogfood pass against a mock OpenAI-compatible provider, and a headless Chromium responsive sweep across seven dashboard routes at desktop, tablet, mobile, and 320px widths.</p>
         </article>
 
         <article id="security" class="doc-section">
           <h3>Security model</h3>
-          <p>The dashboard/control-plane API is loopback-only by default. Provider keys and OAuth tokens are encrypted before storage and never returned in plaintext from listing endpoints. Per-client-key limits are edge guardrails, not a substitute for a private network boundary. Do not expose the server directly to the public internet; if you bind to <code>0.0.0.0</code>, put it behind your own VPN, firewall, reverse proxy, and authentication layer.</p>
+          <p>The dashboard/control-plane API is loopback-only by default. Provider keys and OAuth tokens are encrypted before storage and never returned in plaintext from listing endpoints. Per-client access policies are edge guardrails, not a substitute for a private network boundary. Do not expose the server directly to the public internet; if you bind to <code>0.0.0.0</code>, put it behind your own VPN, firewall, reverse proxy, and authentication layer.</p>
         </article>
 
         <article id="ops" class="doc-section">

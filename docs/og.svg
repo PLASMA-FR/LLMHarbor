@@ -1,47 +1,35 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-labelledby="title desc">
   <title id="title">LLMHarbor</title>
-  <desc id="desc">LLMHarbor brand card with anchor-shaped logo and unified LLM routing message.</desc>
-  <defs>
-    <linearGradient id="mark" x1="476" y1="165" x2="706" y2="461" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#7FF0DE"/>
-      <stop offset="0.5" stop-color="#2AA99B"/>
-      <stop offset="1" stop-color="#D4A94E"/>
-    </linearGradient>
-    <radialGradient id="bg" cx="50%" cy="44%" r="78%">
-      <stop offset="0" stop-color="#12302C"/>
-      <stop offset="0.62" stop-color="#071514"/>
-      <stop offset="1" stop-color="#04100F"/>
-    </radialGradient>
-    <pattern id="grain" width="110" height="110" patternUnits="userSpaceOnUse">
-      <path d="M0 17h110M0 54h110M0 91h110M17 0v110M54 0v110M91 0v110" stroke="#BCEFE5" stroke-opacity="0.035" stroke-width="1"/>
-    </pattern>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="22" stdDeviation="28" flood-color="#020B0A" flood-opacity="0.34"/>
-    </filter>
-  </defs>
-  <rect width="1200" height="630" fill="url(#bg)"/>
-  <rect width="1200" height="630" fill="url(#grain)"/>
+  <desc id="desc">LLMHarbor brand card with a flat anchor logo and local model routing message.</desc>
+  <rect width="1200" height="630" fill="#071514"/>
+  <path d="M0 528h1200" stroke="#11322F" stroke-width="1"/>
+  <path d="M0 102h1200" stroke="#11322F" stroke-width="1"/>
+  <g opacity="0.45" stroke="#11322F" stroke-width="1">
+    <path d="M120 0v630M240 0v630M360 0v630M480 0v630M600 0v630M720 0v630M840 0v630M960 0v630M1080 0v630"/>
+    <path d="M0 210h1200M0 315h1200M0 420h1200"/>
+  </g>
   <g transform="translate(136 120)">
-    <text x="0" y="0" fill="#7FF0DE" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="5">LOCAL ROUTING HARBOR</text>
-    <text x="0" y="96" fill="#F6F1DF" font-family="Geist, Inter, system-ui, sans-serif" font-size="86" font-weight="760" letter-spacing="-3">LLMHarbor</text>
-    <text x="4" y="153" fill="#A9C9C1" font-family="Geist, Inter, system-ui, sans-serif" font-size="31">Drop one anchor. Route every model.</text>
-    <g transform="translate(6 223)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22">
-      <rect width="530" height="72" rx="18" fill="#0B1B19" stroke="#24544D"/>
-      <text x="28" y="45" fill="#D4A94E">Bearer llmharbor-...</text>
-      <text x="292" y="45" fill="#7FF0DE">/v1/chat/completions</text>
+    <text x="0" y="0" fill="#71D4C6" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="5">LOCAL ROUTING HARBOR</text>
+    <text x="0" y="96" fill="#F7F1DF" font-family="Geist, Inter, system-ui, sans-serif" font-size="88" font-weight="760" letter-spacing="-3">LLMHarbor</text>
+    <text x="4" y="154" fill="#A9C9C1" font-family="Geist, Inter, system-ui, sans-serif" font-size="31">Drop one anchor. Route every model.</text>
+    <g transform="translate(6 224)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22">
+      <rect width="550" height="74" rx="18" fill="#0B1B19" stroke="#24544D"/>
+      <text x="28" y="46" fill="#D4A94E">Bearer llmharbor-...</text>
+      <text x="292" y="46" fill="#71D4C6">/v1/chat/completions</text>
     </g>
   </g>
-  <g transform="translate(775 128) scale(1.5)" filter="url(#shadow)">
-    <rect width="196" height="196" rx="48" fill="#071514" stroke="#25534C" stroke-width="2"/>
-    <path d="M38 128c13.8 32.2 34 48.3 60 48.3s46.2-16.1 60-48.3" fill="none" stroke="#183A35" stroke-width="27" stroke-linecap="round"/>
-    <g fill="none" stroke="url(#mark)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round">
-      <circle cx="98" cy="42" r="17"/>
-      <path d="M98 60v94"/>
-      <path d="M66 86h64"/>
-      <path d="M42 125c11.8 26.6 30.5 39.9 56 39.9s44.2-13.3 56-39.9"/>
-      <path d="M42 125l29-5.5"/>
-      <path d="M154 125l-29-5.5"/>
+  <g transform="translate(772 128) scale(1.5)">
+    <rect width="196" height="196" rx="48" fill="#F7F4EE"/>
+    <rect x="1" y="1" width="194" height="194" rx="47" fill="none" stroke="#D7DED8" stroke-width="2"/>
+    <path d="M35 127c13.8 30.6 35 45.9 63 45.9s49.2-15.3 63-45.9" fill="none" stroke="#D7DED8" stroke-width="21" stroke-linecap="round"/>
+    <g fill="none" stroke="#193944" stroke-width="15.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="98" cy="43" r="17"/>
+      <path d="M98 61v92"/>
+      <path d="M64 88h68"/>
+      <path d="M42 126c11.8 26.4 30.5 39.6 56 39.6s44.2-13.2 56-39.6"/>
+      <path d="M42 126l29-5.5"/>
+      <path d="M154 126l-29-5.5"/>
     </g>
-    <path d="M119 76h24l-19 22h23" fill="none" stroke="#F2D88B" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M119 77h24l-19 22h23" fill="none" stroke="#0F5F78" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
 </svg>

@@ -7,202 +7,367 @@ import { Label } from '@/components/ui/label'
 import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
+import { cn } from '@/lib/utils'
 
-interface ClientKeyLimits { rpm: number | null; rpd: number | null; tpm: number | null; tpd: number | null }
-interface LocalEndpointKey { id: number; label: string; key?: string; maskedKey: string; enabled: boolean; localEndpointId: number; limits: ClientKeyLimits }
+interface ClientApiKey { id: number; label: string; key?: string; maskedKey: string; enabled: boolean; createdAt: string; lastUsedAt: string | null; localEndpointId?: number | null }
+interface LocalEndpointKey { id: number; label: string; maskedKey: string; enabled: boolean; localEndpointId: number; createdAt?: string; lastUsedAt?: string | null }
 interface LocalEndpoint { id: number; name: string; slug: string; basePath: string; enabled: boolean; providerScopes: string[]; domains: string[]; keys: LocalEndpointKey[] }
+interface PolicyRoute { id: string; method: string; path: string; name: string; description: string; enabled: boolean }
+interface PolicyPlatform { platform: string; name: string; baseUrl: string | null; timeoutMs: number | null; source: 'built-in' | 'custom' | 'catalog'; enabled: boolean }
+interface PolicyModel { modelDbId: number; platform: string; modelId: string; displayName: string; contextWindow: number | null; catalogEnabled: boolean; enabled: boolean }
+interface AccessPolicySnapshot { key: ClientApiKey; routes: PolicyRoute[]; platforms: PolicyPlatform[]; models: PolicyModel[] }
 
-type LimitKey = keyof ClientKeyLimits
-const LIMIT_FIELDS: Array<{ key: LimitKey; label: string }> = [
-  { key: 'rpm', label: 'RPM' },
-  { key: 'rpd', label: 'RPD' },
-  { key: 'tpm', label: 'TPM' },
-  { key: 'tpd', label: 'TPD' },
-]
-const EMPTY_LIMIT_DRAFT: Record<LimitKey, string> = { rpm: '', rpd: '', tpm: '', tpd: '' }
-function draftToLimits(draft: Record<LimitKey, string>): ClientKeyLimits {
-  return LIMIT_FIELDS.reduce((acc, field) => {
-    const value = draft[field.key].trim()
-    acc[field.key] = value ? Number(value) : null
-    return acc
-  }, { rpm: null, rpd: null, tpm: null, tpd: null } as ClientKeyLimits)
-}
-function limitSummary(limits: ClientKeyLimits) {
-  const parts = LIMIT_FIELDS.map(field => limits[field.key] ? `${field.label} ${limits[field.key]}` : null).filter(Boolean)
-  return parts.length ? parts.join(' · ') : 'Unlimited'
+type PolicyPatch = Partial<{
+  routes: Array<{ route: string; enabled: boolean }>
+  platforms: Array<{ platform: string; enabled: boolean }>
+  models: Array<{ modelDbId: number; enabled: boolean }>
+}>
+
+function policyTone(enabled: boolean) {
+  return enabled ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-rose-500/25 bg-rose-500/5'
 }
 
-const PROVIDER_HINTS = ['openai', 'google', 'openrouter', 'anthropic', 'github', 'groq', 'mistral', 'cohere']
+function formatContextWindow(value: number | null) {
+  if (!value) return null
+  if (value >= 1_000_000) return `${Number((value / 1_000_000).toFixed(1)).toString()}M ctx`
+  if (value >= 1_000) return `${Math.round(value / 1_000)}K ctx`
+  return `${value} ctx`
+}
 
-function splitList(value: string) {
-  return value.split(',').map(item => item.trim()).filter(Boolean)
+function PolicyStateBadge({ enabled }: { enabled: boolean }) {
+  return (
+    <Badge variant={enabled ? 'default' : 'secondary'} className={cn('shrink-0', enabled ? 'bg-emerald-600 text-white dark:bg-emerald-500 dark:text-background' : 'bg-rose-500/10 text-rose-700 dark:text-rose-200')}>
+      {enabled ? 'Allowed' : 'Blocked'}
+    </Badge>
+  )
+}
+
+function SummaryTile({ label, value, detail, tone = 'default' }: { label: string; value: string | number; detail: string; tone?: 'default' | 'good' | 'warn' }) {
+  return (
+    <div className={cn(
+      'panel-card min-w-0 rounded-2xl p-4',
+      tone === 'good' && 'border-emerald-500/20 bg-emerald-500/5',
+      tone === 'warn' && 'border-amber-500/25 bg-amber-500/10',
+    )}>
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 text-2xl font-semibold tracking-[-0.04em] tabular-nums">{value}</p>
+      <p className="mt-1 text-xs leading-5 text-muted-foreground">{detail}</p>
+    </div>
+  )
+}
+
+function PolicyActionButton({ children, onClick, disabled, variant = 'outline' }: { children: string; onClick: () => void; disabled?: boolean; variant?: 'default' | 'outline' }) {
+  return (
+    <Button type="button" variant={variant} size="sm" className="shrink-0 rounded-[var(--radius-button)] whitespace-nowrap" disabled={disabled} onClick={onClick}>
+      {children}
+    </Button>
+  )
 }
 
 export default function SettingsPage() {
   const queryClient = useQueryClient()
-  const [name, setName] = useState('')
-  const [slug, setSlug] = useState('')
-  const [providers, setProviders] = useState('')
-  const [initialDomain, setInitialDomain] = useState('')
-  const [domainDrafts, setDomainDrafts] = useState<Record<number, string>>({})
-  const [keyLabels, setKeyLabels] = useState<Record<number, string>>({})
-  const [keyLimitDrafts, setKeyLimitDrafts] = useState<Record<number, Record<LimitKey, string>>>({})
-  const [createdKey, setCreatedKey] = useState<LocalEndpointKey | null>(null)
+  const [selectedKeyId, setSelectedKeyId] = useState<number | null>(() => {
+    const keyParam = new URLSearchParams(window.location.search).get('key')
+    const keyId = Number.parseInt(keyParam ?? '', 10)
+    return Number.isNaN(keyId) ? null : keyId
+  })
+  const [modelSearch, setModelSearch] = useState('')
+  const [platformFilter, setPlatformFilter] = useState('all')
+  const [showBlockedOnly, setShowBlockedOnly] = useState(false)
 
-  const { data } = useQuery<{ endpoints: LocalEndpoint[] }>({ queryKey: ['local-endpoints'], queryFn: () => apiFetch('/api/settings/local-endpoints') })
-  const endpoints = data?.endpoints ?? []
-  const totalDomains = useMemo(() => endpoints.reduce((sum, endpoint) => sum + endpoint.domains.length, 0), [endpoints])
-  const totalKeys = useMemo(() => endpoints.reduce((sum, endpoint) => sum + endpoint.keys.length, 0), [endpoints])
-
-  const createEndpoint = useMutation({
-    mutationFn: () => apiFetch<LocalEndpoint>('/api/settings/local-endpoints', {
-      method: 'POST',
-      body: JSON.stringify({ name: name || slug, slug, providerScopes: splitList(providers), domains: splitList(initialDomain) }),
-    }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['local-endpoints'] })
-      setName('')
-      setSlug('')
-      setProviders('')
-      setInitialDomain('')
-    },
+  const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
+    queryKey: ['client-api-keys'],
+    queryFn: () => apiFetch('/api/settings/api-keys'),
   })
 
-  const updateEndpoint = useMutation({
-    mutationFn: ({ endpoint, body }: { endpoint: LocalEndpoint; body: Partial<LocalEndpoint> }) => apiFetch<LocalEndpoint>(`/api/settings/local-endpoints/${endpoint.id}`, {
+  const { data: endpointData } = useQuery<{ endpoints: LocalEndpoint[] }>({
+    queryKey: ['local-endpoints'],
+    queryFn: () => apiFetch('/api/settings/local-endpoints'),
+  })
+
+  const activeKeyId = clientKeys.some(key => key.id === selectedKeyId) ? selectedKeyId : clientKeys[0]?.id ?? null
+  const selectedKey = useMemo(() => clientKeys.find(key => key.id === activeKeyId) ?? null, [clientKeys, activeKeyId])
+
+  const { data: policy, isLoading: policyLoading } = useQuery<AccessPolicySnapshot>({
+    queryKey: ['client-api-key-access-policy', activeKeyId],
+    queryFn: () => apiFetch(`/api/settings/api-keys/${activeKeyId}/access-policy`),
+    enabled: activeKeyId !== null,
+  })
+
+  const patchPolicy = useMutation({
+    mutationFn: ({ keyId, patch }: { keyId: number; patch: PolicyPatch }) => apiFetch<AccessPolicySnapshot>(`/api/settings/api-keys/${keyId}/access-policy`, {
       method: 'PATCH',
-      body: JSON.stringify(body),
-    }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['local-endpoints'] }),
-  })
-
-  const addDomain = useMutation({
-    mutationFn: ({ endpoint, domain }: { endpoint: LocalEndpoint; domain: string }) => apiFetch<LocalEndpoint>(`/api/settings/local-endpoints/${endpoint.id}/domains`, {
-      method: 'POST',
-      body: JSON.stringify({ domain }),
+      body: JSON.stringify(patch),
     }),
     onSuccess: (_, variables) => {
-      setDomainDrafts(prev => ({ ...prev, [variables.endpoint.id]: '' }))
-      queryClient.invalidateQueries({ queryKey: ['local-endpoints'] })
+      queryClient.invalidateQueries({ queryKey: ['client-api-key-access-policy', variables.keyId] })
+      queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
     },
   })
 
-  const removeDomain = useMutation({
-    mutationFn: ({ endpoint, domain }: { endpoint: LocalEndpoint; domain: string }) => apiFetch(`/api/settings/local-endpoints/${endpoint.id}/domains/${encodeURIComponent(domain)}`, { method: 'DELETE' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['local-endpoints'] }),
-  })
+  const totalEndpoints = endpointData?.endpoints.length ?? 0
+  const legacyDomains = endpointData?.endpoints.reduce((sum, endpoint) => sum + endpoint.domains.length, 0) ?? 0
+  const blockedRoutes = policy?.routes.filter(route => !route.enabled).length ?? 0
+  const allowedRoutes = policy?.routes.filter(route => route.enabled).length ?? 0
+  const blockedProviders = policy?.platforms.filter(platform => !platform.enabled).length ?? 0
+  const allowedProviders = policy ? policy.platforms.length - blockedProviders : 0
+  const blockedModels = policy?.models.filter(model => !model.enabled).length ?? 0
+  const allowedModels = policy ? policy.models.length - blockedModels : 0
+  const totalBlocked = blockedRoutes + blockedProviders + blockedModels
+  const providerOptions = useMemo(() => Array.from(new Set(policy?.models.map(model => model.platform) ?? [])).sort((a, b) => a.localeCompare(b)), [policy?.models])
+  const visibleModels = useMemo(() => {
+    const query = modelSearch.trim().toLowerCase()
+    return (policy?.models ?? [])
+      .filter(model => platformFilter === 'all' || model.platform === platformFilter)
+      .filter(model => !showBlockedOnly || !model.enabled)
+      .filter(model => !query || `${model.modelId} ${model.displayName} ${model.platform}`.toLowerCase().includes(query))
+      .slice(0, 160)
+  }, [modelSearch, platformFilter, policy?.models, showBlockedOnly])
 
-  const createKey = useMutation({
-    mutationFn: (endpoint: LocalEndpoint) => apiFetch<LocalEndpointKey>(`/api/settings/local-endpoints/${endpoint.id}/keys`, {
-      method: 'POST',
-      body: JSON.stringify({ label: keyLabels[endpoint.id] || `${endpoint.name} key`, limits: draftToLimits(keyLimitDrafts[endpoint.id] ?? EMPTY_LIMIT_DRAFT) }),
-    }),
-    onSuccess: (key) => {
-      setCreatedKey(key)
-      setKeyLabels(prev => ({ ...prev, [key.localEndpointId]: '' }))
-      setKeyLimitDrafts(prev => ({ ...prev, [key.localEndpointId]: EMPTY_LIMIT_DRAFT }))
-      queryClient.invalidateQueries({ queryKey: ['local-endpoints'] })
-    },
-  })
+  function updatePolicy(patch: PolicyPatch) {
+    if (!activeKeyId) return
+    patchPolicy.mutate({ keyId: activeKeyId, patch })
+  }
+
+  function setAllRoutes(enabled: boolean) {
+    if (!policy) return
+    updatePolicy({ routes: policy.routes.map(route => ({ route: route.id, enabled })) })
+  }
+
+  function setAllPlatforms(enabled: boolean) {
+    if (!policy) return
+    updatePolicy({ platforms: policy.platforms.map(platform => ({ platform: platform.platform, enabled })) })
+  }
+
+  function setVisibleModels(enabled: boolean) {
+    if (!visibleModels.length) return
+    updatePolicy({ models: visibleModels.map(model => ({ modelDbId: model.modelDbId, enabled })) })
+  }
 
   return (
     <div className="space-y-6">
-      <PageHeader eyebrow="Settings" title="Endpoint control plane" description="Create production-ready local endpoints, attach custom domains, scope providers, and issue dedicated client keys without touching upstream provider secrets." />
+      <PageHeader
+        eyebrow="Settings"
+        title="Local API access controls"
+        description="Give every app its own route, provider, and model policy. One local /v1 endpoint, many isolated permissions."
+        actions={
+          <Button variant="outline" onClick={() => { window.location.href = '/keys' }}>
+            Manage keys
+          </Button>
+        }
+      />
 
-      <section className="grid gap-4 md:grid-cols-3">
-        <div className="panel-card rounded-2xl p-4"><p className="text-xs text-muted-foreground">Endpoints</p><p className="mt-1 text-2xl font-semibold">{endpoints.length}</p></div>
-        <div className="panel-card rounded-2xl p-4"><p className="text-xs text-muted-foreground">Custom domains</p><p className="mt-1 text-2xl font-semibold">{totalDomains}</p></div>
-        <div className="panel-card rounded-2xl p-4"><p className="text-xs text-muted-foreground">Dedicated keys</p><p className="mt-1 text-2xl font-semibold">{totalKeys}</p></div>
+      <section className="grid min-w-0 max-w-full gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <SummaryTile label="Client keys" value={clientKeys.length} detail="Per app, agent, laptop, or experiment." />
+        <SummaryTile label="Routes allowed" value={`${allowedRoutes}/${policy?.routes.length ?? 0}`} detail="OpenAI-compatible surface area." tone={blockedRoutes ? 'warn' : 'good'} />
+        <SummaryTile label="Providers allowed" value={`${allowedProviders}/${policy?.platforms.length ?? 0}`} detail="Whole endpoint families for this key." tone={blockedProviders ? 'warn' : 'good'} />
+        <SummaryTile label="Model blocks" value={blockedModels} detail="Explicit per-key catalog denies." tone={blockedModels ? 'warn' : 'default'} />
       </section>
 
-      <section className="grid gap-5 xl:grid-cols-[minmax(320px,0.8fr)_minmax(0,1.2fr)]">
-        <div className="panel-card rounded-2xl p-5 sm:p-6">
-          <SectionTitle title="New local endpoint" description="Use a sub-endpoint when an app should only see one provider group, domain, or key set." />
-          <div className="mt-5 grid gap-4">
-            <div className="grid gap-2"><Label>Name</Label><Input value={name} onChange={e => setName(e.target.value)} placeholder="OpenAI work endpoint" /></div>
-            <div className="grid gap-2"><Label>Slug</Label><Input value={slug} onChange={e => setSlug(e.target.value)} placeholder="openai-work" /></div>
-            <div className="grid gap-2"><Label>Provider scopes</Label><Input value={providers} onChange={e => setProviders(e.target.value)} placeholder="openai, openrouter" /></div>
-            <div className="flex flex-wrap gap-1.5">{PROVIDER_HINTS.map(provider => <button key={provider} type="button" onClick={() => setProviders(prev => splitList(prev).includes(provider) ? prev : [...splitList(prev), provider].join(', '))} className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted">{provider}</button>)}</div>
-            <div className="grid gap-2"><Label>Initial custom domains</Label><Input value={initialDomain} onChange={e => setInitialDomain(e.target.value)} placeholder="api.example.com, openai.localhost:3001" /></div>
-            <Button onClick={() => createEndpoint.mutate()} disabled={createEndpoint.isPending || !slug}>{createEndpoint.isPending ? 'Creating...' : 'Create endpoint'}</Button>
-            {createEndpoint.error && <p className="text-sm text-destructive">{createEndpoint.error.message}</p>}
+      <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 xl:grid-cols-[minmax(260px,0.72fr)_minmax(0,1.28fr)]">
+        <aside className="min-w-0 space-y-4 xl:sticky xl:top-28 xl:self-start">
+          <div className="panel-card rounded-2xl p-5">
+            <SectionTitle title="Choose a local key" description="Policies are isolated. Blocking a provider here will not affect other apps." />
+            {clientKeys.length === 0 ? (
+              <EmptyState
+                title="No local API keys"
+                description="Create a client key on the Keys page, then return here to set route, provider, and model policy."
+                action={<Button onClick={() => { window.location.href = '/keys' }}>Create a key</Button>}
+              />
+            ) : (
+              <div className="mt-4 space-y-2">
+                {clientKeys.map(key => (
+                  <button
+                    key={key.id}
+                    type="button"
+                    onClick={() => setSelectedKeyId(key.id)}
+                    className={cn(
+                      'w-full rounded-2xl border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/30',
+                      activeKeyId === key.id ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-muted/60',
+                    )}
+                  >
+                    <div className="flex min-w-0 items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold">{key.label}</p>
+                        <code className="mt-1 block truncate font-mono text-[11px] text-muted-foreground">{key.maskedKey}</code>
+                      </div>
+                      <Badge variant={key.enabled ? 'default' : 'secondary'}>{key.enabled ? 'On' : 'Off'}</Badge>
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {key.lastUsedAt ? `Last used ${new Date(key.lastUsedAt).toLocaleString()}` : 'Ready for route, provider, and model policy'}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
-        </div>
 
-        <div className="space-y-5">
-          {createdKey?.key && <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm"><p className="font-semibold">Copy this key now. It will only be shown once.</p><code className="mt-2 block truncate rounded-xl bg-background px-3 py-2 text-xs">{createdKey.key}</code></div>}
-          {endpoints.length === 0 ? <EmptyState title="No endpoints" description="The default endpoint will appear after server initialization." /> : endpoints.map(endpoint => (
-            <article key={endpoint.id} className="panel-card rounded-2xl p-5 sm:p-6">
-              <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h2 className="text-lg font-semibold tracking-[-0.03em]">{endpoint.name}</h2>
-                    <Badge variant="outline">{endpoint.basePath}</Badge>
-                    {endpoint.id === 1 && <Badge>Default</Badge>}
-                    <Badge variant={endpoint.enabled ? 'default' : 'secondary'}>{endpoint.enabled ? 'Enabled' : 'Disabled'}</Badge>
-                  </div>
-                  <p className="mt-2 text-sm text-muted-foreground">Provider scopes: {endpoint.providerScopes.join(', ') || 'all providers'}</p>
-                </div>
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <span>{endpoint.enabled ? 'Accepting traffic' : 'Paused'}</span>
-                  <Switch checked={endpoint.enabled} onCheckedChange={(enabled) => updateEndpoint.mutate({ endpoint, body: { enabled } })} />
-                </div>
+          <div className="panel-card rounded-2xl p-5">
+            <SectionTitle title="Compatibility surface" description="The router keeps the default /v1 path and host mappings. New segmentation happens through per-key policy." />
+            <div className="grid gap-2 text-sm">
+              <div className="flex justify-between gap-3 rounded-xl bg-background px-3 py-2"><span className="text-muted-foreground">Endpoint rows</span><span className="font-medium tabular-nums">{totalEndpoints}</span></div>
+              <div className="flex justify-between gap-3 rounded-xl bg-background px-3 py-2"><span className="text-muted-foreground">Host mappings</span><span className="font-medium tabular-nums">{legacyDomains}</span></div>
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
+                Custom local endpoint creation is closed. Create one client key per app, then scope it here.
               </div>
+            </div>
+          </div>
+        </aside>
 
-              <div className="mt-5 grid gap-4 lg:grid-cols-2">
-                <div className="rounded-2xl border border-border bg-background p-4">
-                  <p className="font-medium">Custom domains</p>
-                  <p className="mt-1 text-xs text-muted-foreground">Point these hosts at LLMHarbor and route them to this endpoint.</p>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {endpoint.domains.length === 0 ? <span className="text-sm text-muted-foreground">No custom domains yet.</span> : endpoint.domains.map(domain => (
-                      <Badge key={domain} variant="outline" className="gap-2">{domain}<button onClick={() => removeDomain.mutate({ endpoint, domain })} aria-label={`Remove ${domain}`}>×</button></Badge>
-                    ))}
+        <div className="space-y-5 min-w-0">
+          {!selectedKey ? (
+            <EmptyState title="Select a key" description="Choose a local client key to edit its access policy." />
+          ) : policyLoading ? (
+            <div className="panel-card rounded-2xl p-6 text-sm text-muted-foreground">Loading access policy…</div>
+          ) : !policy ? (
+            <EmptyState title="Policy unavailable" description="The selected key could not be loaded." />
+          ) : (
+            <>
+              <section className="panel-card rounded-2xl p-5 sm:p-6">
+                <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-primary/80">Active policy</p>
+                    <h2 className="mt-1 truncate text-xl font-semibold tracking-[-0.035em]">{policy.key.label}</h2>
+                    <code className="mt-2 block truncate rounded-xl bg-muted/70 px-3 py-2 font-mono text-xs text-muted-foreground">{policy.key.maskedKey}</code>
                   </div>
-                  <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_auto]">
-                    <Input value={domainDrafts[endpoint.id] ?? ''} onChange={e => setDomainDrafts(prev => ({ ...prev, [endpoint.id]: e.target.value }))} placeholder="api.yourdomain.com" />
-                    <Button variant="outline" onClick={() => addDomain.mutate({ endpoint, domain: domainDrafts[endpoint.id] ?? '' })} disabled={!(domainDrafts[endpoint.id] ?? '').trim()}>Add domain</Button>
+                  <div className="grid min-w-0 max-w-full gap-2 text-xs sm:grid-cols-3 lg:min-w-[460px]">
+                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Base URL</span><code className="mt-1 block truncate font-mono">/v1</code></div>
+                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Providers</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedProviders}/{policy.platforms.length} allowed</span></div>
+                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Models</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedModels}/{policy.models.length} allowed</span></div>
                   </div>
                 </div>
+                <div className="mt-5 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+                  <p className="text-sm leading-6 text-muted-foreground">
+                    {totalBlocked === 0
+                      ? 'This key can call every available route, provider, and catalog model.'
+                      : `This key has ${totalBlocked.toLocaleString()} active policy block${totalBlocked === 1 ? '' : 's'} across routes, providers, and models.`}
+                  </p>
+                  <div className="grid grid-cols-1 gap-2 sm:flex sm:flex-wrap md:justify-end">
+                    <PolicyActionButton disabled={patchPolicy.isPending} onClick={() => setAllRoutes(true)}>Open routes</PolicyActionButton>
+                    <PolicyActionButton disabled={patchPolicy.isPending} onClick={() => setAllPlatforms(true)}>Allow providers</PolicyActionButton>
+                    <PolicyActionButton disabled={patchPolicy.isPending || visibleModels.length === 0} onClick={() => setVisibleModels(true)}>Allow visible models</PolicyActionButton>
+                  </div>
+                </div>
+              </section>
 
-                <div className="rounded-2xl border border-border bg-background p-4">
-                  <p className="font-medium">Dedicated local keys</p>
-                  <p className="mt-1 text-xs text-muted-foreground">Issue keys per app. Revoke one app without rotating the default endpoint.</p>
-                  <div className="mt-3 space-y-2">
-                    {endpoint.keys.length === 0 ? <span className="text-sm text-muted-foreground">No keys on this endpoint.</span> : endpoint.keys.map(key => (
-                      <div key={key.id} className="rounded-xl bg-muted px-3 py-2 text-xs">
-                        <code className="block truncate">{key.label}: {key.maskedKey}</code>
-                        <span className="mt-1 block text-muted-foreground">{limitSummary(key.limits)}</span>
+              <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
+                  <SectionTitle
+                    title="Route access"
+                    description="Keep the proxy surface small for untrusted tools. Denied routes fail with a 403 before routing."
+                    action={<PolicyActionButton disabled={patchPolicy.isPending} onClick={() => setAllRoutes(true)}>Allow all</PolicyActionButton>}
+                  />
+                  <div className="space-y-3">
+                    {policy.routes.map(route => (
+                      <div key={route.id} className={cn('min-w-0 rounded-2xl border p-4 transition-colors', policyTone(route.enabled))}>
+                        <div className="flex min-w-0 items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="font-medium">{route.name}</p>
+                              <Badge variant="outline">{route.method}</Badge>
+                            </div>
+                            <code className="mt-2 block font-mono text-xs text-muted-foreground">{route.path}</code>
+                            <p className="mt-2 text-xs leading-5 text-muted-foreground">{route.description}</p>
+                          </div>
+                          <Switch checked={route.enabled} onCheckedChange={(enabled) => updatePolicy({ routes: [{ route: route.id, enabled }] })} disabled={patchPolicy.isPending} />
+                        </div>
                       </div>
                     ))}
                   </div>
-                  <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_auto]">
-                    <Input value={keyLabels[endpoint.id] ?? ''} onChange={e => setKeyLabels(prev => ({ ...prev, [endpoint.id]: e.target.value }))} placeholder="Production app key" />
-                    <Button variant="outline" onClick={() => createKey.mutate(endpoint)}>Create key</Button>
-                  </div>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-4">
-                    {LIMIT_FIELDS.map(field => (
-                      <div key={field.key} className="grid gap-1">
-                        <Label className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{field.label}</Label>
-                        <Input
-                          inputMode="numeric"
-                          pattern="[0-9]*"
-                          value={(keyLimitDrafts[endpoint.id] ?? EMPTY_LIMIT_DRAFT)[field.key]}
-                          onChange={e => setKeyLimitDrafts(prev => ({
-                            ...prev,
-                            [endpoint.id]: {
-                              ...(prev[endpoint.id] ?? EMPTY_LIMIT_DRAFT),
-                              [field.key]: e.target.value.replace(/[^0-9]/g, ''),
-                            },
-                          }))}
-                          placeholder="∞"
-                        />
+                </div>
+
+                <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
+                  <SectionTitle
+                    title="Provider endpoints"
+                    description="Block whole upstream families while leaving the key valid for approved providers."
+                    action={<PolicyActionButton disabled={patchPolicy.isPending} onClick={() => setAllPlatforms(true)}>Allow all</PolicyActionButton>}
+                  />
+                  <div className="max-h-[440px] space-y-2 overflow-y-auto pr-1">
+                    {policy.platforms.map(provider => (
+                      <div key={provider.platform} className={cn('min-w-0 rounded-2xl border p-3 transition-colors', provider.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
+                        <div className="flex min-w-0 items-center justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="truncate text-sm font-medium">{provider.name}</p>
+                              <Badge variant="outline">{provider.source}</Badge>
+                            </div>
+                            <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{provider.platform}</p>
+                            {provider.baseUrl && <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground">{provider.baseUrl}</p>}
+                          </div>
+                          <div className="flex shrink-0 items-center gap-3">
+                            <PolicyStateBadge enabled={provider.enabled} />
+                            <Switch checked={provider.enabled} onCheckedChange={(enabled) => updatePolicy({ platforms: [{ platform: provider.platform, enabled }] })} disabled={patchPolicy.isPending} />
+                          </div>
+                        </div>
                       </div>
                     ))}
                   </div>
                 </div>
-              </div>
-            </article>
-          ))}
+              </section>
+
+              <section className="panel-card rounded-2xl p-5 sm:p-6">
+                <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-end 2xl:justify-between">
+                  <SectionTitle title="Model scope" description="Fine tune the catalog visible to this key. Explicit blocked model requests fail before any upstream call." />
+                  <div className="grid w-full min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(180px,1fr)_minmax(140px,180px)_max-content] 2xl:max-w-[620px]">
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-muted-foreground">Search</Label>
+                      <Input value={modelSearch} onChange={event => setModelSearch(event.target.value)} placeholder="gpt, gemini, llama…" />
+                    </div>
+                    <div className="grid gap-1">
+                      <Label className="text-xs text-muted-foreground">Provider</Label>
+                      <select className="h-10 rounded-[var(--radius-input)] border border-input bg-background px-3 text-sm" value={platformFilter} onChange={event => setPlatformFilter(event.target.value)}>
+                        <option value="all">All</option>
+                        {providerOptions.map(platform => <option key={platform} value={platform}>{platform}</option>)}
+                      </select>
+                    </div>
+                    <Button type="button" className="h-10 w-full self-end whitespace-nowrap sm:col-span-2 lg:col-span-1 lg:w-auto" variant={showBlockedOnly ? 'default' : 'outline'} onClick={() => setShowBlockedOnly(prev => !prev)}>
+                      {showBlockedOnly ? 'Show all models' : 'Blocked only'}
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background p-3">
+                  <p className="text-sm text-muted-foreground">
+                    Showing <span className="font-medium text-foreground tabular-nums">{visibleModels.length}</span> of <span className="font-medium text-foreground tabular-nums">{policy.models.length}</span> models. <span className="font-medium text-foreground tabular-nums">{allowedModels}</span> currently allowed.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <PolicyActionButton disabled={patchPolicy.isPending || visibleModels.length === 0} onClick={() => setVisibleModels(true)}>Allow visible</PolicyActionButton>
+                    <PolicyActionButton disabled={patchPolicy.isPending || visibleModels.length === 0} onClick={() => setVisibleModels(false)} variant="outline">Block visible</PolicyActionButton>
+                  </div>
+                </div>
+
+                <div className="mt-4 max-h-[620px] space-y-2 overflow-y-auto pr-1">
+                  {visibleModels.length === 0 ? (
+                    <EmptyState title="No matching models" description="Adjust the provider filter or search query." />
+                  ) : visibleModels.map(model => {
+                    const contextLabel = formatContextWindow(model.contextWindow)
+                    return (
+                      <div key={model.modelDbId} className={cn('rounded-2xl border p-3 transition-colors', model.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
+                        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <p className="truncate text-sm font-medium">{model.displayName}</p>
+                              <Badge variant="outline">{model.platform}</Badge>
+                              {contextLabel && <Badge variant="secondary">{contextLabel}</Badge>}
+                              {!model.catalogEnabled && <Badge variant="secondary">Catalog off</Badge>}
+                            </div>
+                            <code className="mt-1 block truncate font-mono text-xs text-muted-foreground">{model.modelId}</code>
+                          </div>
+                          <div className="flex shrink-0 items-center justify-between gap-3 md:justify-end">
+                            <PolicyStateBadge enabled={model.enabled} />
+                            <Switch checked={model.enabled} onCheckedChange={(enabled) => updatePolicy({ models: [{ modelDbId: model.modelDbId, enabled }] })} disabled={patchPolicy.isPending} />
+                          </div>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+                {(policy.models.length > visibleModels.length) && (
+                  <p className="mt-3 text-xs text-muted-foreground">Showing {visibleModels.length} filtered models out of {policy.models.length}. Use search or provider filters to narrow the catalog.</p>
+                )}
+              </section>
+            </>
+          )}
         </div>
       </section>
     </div>

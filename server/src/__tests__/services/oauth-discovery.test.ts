@@ -11,7 +11,7 @@ function insertFallback(db: any, modelId: number) {
 describe('OAuth model discovery', () => {
   beforeEach(() => {
     process.env.ENCRYPTION_KEY = '2'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'test-antigravity-client-secret';
+    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -129,14 +129,14 @@ describe('OAuth model discovery', () => {
         expect(params.get('client_id')).toBe('1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com');
         expect(params.get('refresh_token')).toBe('antigravity-refresh-token');
         expect(params.get('client_secret')).toBeTruthy();
-        return Response.json({ access_token: 'fresh-antigravity-access-token', expires_in: 3600, token_type: 'Bearer' });
+        return Response.json({ access_token: 'fresh', expires_in: 3600, token_type: 'Bearer' });
       }
       if (urlStr.endsWith('/v1internal:loadCodeAssist')) {
-        expect((init as any).headers.Authorization).toBe('Bearer fresh-antigravity-access-token');
+        expect((init as any).headers.Authorization).toBe('Bearer fresh');
         return Response.json({ cloudaicompanionProject: 'project-from-load' });
       }
       if (urlStr.endsWith('/v1internal:fetchAvailableModels')) {
-        expect((init as any).headers.Authorization).toBe('Bearer fresh-antigravity-access-token');
+        expect((init as any).headers.Authorization).toBe('Bearer fresh');
         return Response.json({ models: { 'gemini-2.5-pro': { displayName: 'Gemini 2.5 Pro', contextWindow: 1048576 } } });
       }
       throw new Error(`unexpected URL ${urlStr}`);
@@ -146,7 +146,7 @@ describe('OAuth model discovery', () => {
 
     expect(discovered.models.map(model => model.id)).toEqual(['gemini-2.5-pro']);
     const updatedKey = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(Number(key.lastInsertRowid)) as any;
-    expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh-antigravity-access-token');
+    expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh');
   });
 
   it('keeps OAuth keys healthy without validating browser tokens against API-key endpoints', async () => {
