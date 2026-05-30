@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { refreshOAuthAccountInventory } from '../services/oauth-discovery.js';
-import { ANTIGRAVITY_OAUTH_CLIENT_ID, ANTIGRAVITY_OAUTH_TOKEN_URL, OPENAI_OAUTH_CLIENT_ID, OPENAI_OAUTH_TOKEN_URL, QWEN_DEFAULT_RESOURCE_URL, QWEN_OAUTH_CLIENT_ID, QWEN_OAUTH_DEVICE_CODE_URL, QWEN_OAUTH_TOKEN_URL, oauthTokenClient } from '../services/oauth-clients.js';
+import { ANTIGRAVITY_OAUTH_CLIENT_ID, ANTIGRAVITY_OAUTH_TOKEN_URL, OPENAI_OAUTH_CLIENT_ID, OPENAI_OAUTH_TOKEN_URL, oauthTokenClient } from '../services/oauth-clients.js';
 
 export const oauthRouter = Router();
 
@@ -14,9 +14,8 @@ type BrowserOAuthProvider = {
   id: string;
   name: string;
   kind: string;
-  loginMode: 'browser-oauth' | 'device-oauth';
+  loginMode: 'browser-oauth';
   authorizationUrl: string;
-  deviceCodeUrl?: string;
   tokenUrl: string;
   clientId: string;
   clientSecret?: string;
@@ -54,20 +53,6 @@ const BROWSER_OAUTH_PROVIDERS: BrowserOAuthProvider[] = [
     supportsDiscovery: true,
     notes: 'Antigravity-native Google OAuth using the public native client from antigravity-claude-proxy: localhost:51121/oauth-callback, Code Assist scopes, live model discovery only, encrypted local storage.',
   },
-  {
-    id: 'qwen',
-    name: 'Qwen Chat',
-    kind: 'qwen',
-    loginMode: 'device-oauth',
-    authorizationUrl: 'https://chat.qwen.ai/authorize',
-    deviceCodeUrl: QWEN_OAUTH_DEVICE_CODE_URL,
-    tokenUrl: QWEN_OAUTH_TOKEN_URL,
-    clientId: QWEN_OAUTH_CLIENT_ID,
-    modelsUrl: `${QWEN_DEFAULT_RESOURCE_URL}/models`,
-    scopes: ['openid', 'profile', 'email', 'model.completion'],
-    supportsDiscovery: true,
-    notes: 'Qwen Code-compatible RFC 8628 device OAuth: approve at chat.qwen.ai/authorize, encrypted local storage, OpenAI-compatible runtime via the token resource_url. Qwen upstream notes the old free OAuth tier was discontinued on 2026-04-15, so availability depends on the account.',
-  },
 ];
 
 const callbackSchema = z.object({
@@ -75,10 +60,6 @@ const callbackSchema = z.object({
   code: z.string().min(1).optional(),
   error: z.string().optional(),
   error_description: z.string().optional(),
-});
-
-const deviceCompleteSchema = z.object({
-  state: z.string().min(16),
 });
 
 const updateAccountSchema = z.object({
@@ -94,7 +75,6 @@ const googleCallbackServers = new Map<string, HttpServer>();
 function runtimePlatformFor(providerId: string) {
   if (providerId === 'openai') return 'openai';
   if (providerId === 'antigravity') return 'google-oauth';
-  if (providerId === 'qwen') return 'qwen-oauth';
   return providerId;
 }
 
@@ -220,39 +200,15 @@ function antigravityCallbackPort() {
   return 51121;
 }
 
-function normalizeQwenResourceUrl(resourceUrl: unknown) {
-  let value = typeof resourceUrl === 'string' && resourceUrl.trim().length > 0
-    ? resourceUrl.trim()
-    : QWEN_DEFAULT_RESOURCE_URL;
-  value = value.replace(/\/+$/, '');
-  if (!value.endsWith('/v1')) value = `${value}/v1`;
-  return value;
-}
-
-function encryptDeviceCode(deviceCode: string) {
-  return JSON.stringify(encrypt(deviceCode));
-}
-
-function decryptDeviceCode(payload: string) {
-  const parsed = JSON.parse(payload) as { encrypted: string; iv: string; authTag: string };
-  return decrypt(parsed.encrypted, parsed.iv, parsed.authTag);
-}
-
-function metadataForToken(provider: BrowserOAuthProvider, tokenData: any, connectedVia: 'browser-oauth' | 'device-oauth') {
-  const metadata: Record<string, unknown> = {
+function metadataForToken(provider: BrowserOAuthProvider, tokenData: any, connectedVia: 'browser-oauth') {
+  return {
     tokenType: tokenData.token_type ?? 'Bearer',
     connectedVia,
     runtimePlatform: runtimePlatformFor(provider.id),
   };
-  if (provider.id === 'qwen') {
-    metadata.resourceUrl = normalizeQwenResourceUrl(tokenData.resource_url ?? tokenData.resourceUrl);
-    metadata.qwenOAuthDiscontinuedNotice = 'Qwen Code upstream notes the old free OAuth tier was discontinued on 2026-04-15; connected-account availability may vary.';
-  }
-  return metadata;
 }
 
 function accountHintForToken(provider: BrowserOAuthProvider, tokenData: any) {
-  if (provider.id === 'qwen') return tokenData.email ?? tokenData.account_hint ?? 'Qwen account';
   return tokenData.email ?? tokenData.account_hint ?? `${provider.name} account`;
 }
 
@@ -318,7 +274,7 @@ function publicProvider(provider: BrowserOAuthProvider) {
     supportsDiscovery: provider.supportsDiscovery,
     loginMode: provider.loginMode,
     authorizationUrl: provider.authorizationUrl,
-    callbackPath: provider.loginMode === 'device-oauth' ? `/api/oauth/connect/${provider.id}/complete` : `/api/oauth/callback/${provider.id}`,
+    callbackPath: `/api/oauth/callback/${provider.id}`,
     configured: Boolean(provider.clientId) && (provider.kind !== 'google' || Boolean(antigravityOAuthSecret(provider))),
     canConnect: Boolean(provider.clientId) && (provider.kind !== 'google' || Boolean(antigravityOAuthSecret(provider))),
     notes: provider.notes,
@@ -368,50 +324,6 @@ oauthRouter.get('/accounts', (_req: Request, res: Response) => {
   res.json({ accounts: rows.map(rowToAccount) });
 });
 
-async function startDeviceOAuth(provider: BrowserOAuthProvider, res: Response) {
-  if (!provider.deviceCodeUrl) {
-    res.status(409).json({ error: { message: `${provider.name} does not expose a device-code authorization endpoint.` } });
-    return;
-  }
-  const state = crypto.randomUUID?.() ?? crypto.randomBytes(16).toString('hex');
-  const verifier = base64Url(crypto.randomBytes(48));
-  const params = new URLSearchParams({
-    client_id: provider.clientId,
-    scope: provider.scopes.join(' '),
-    code_challenge: sha256(verifier),
-    code_challenge_method: 'S256',
-  });
-  const upstream = await fetch(provider.deviceCodeUrl, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-  if (!upstream.ok) {
-    res.status(502).json({ error: { message: `${provider.name} device authorization failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}` } });
-    return;
-  }
-  const device = await upstream.json() as any;
-  if (!device.device_code || !device.user_code || !device.verification_uri) {
-    res.status(502).json({ error: { message: `${provider.name} device authorization response was missing required fields.` } });
-    return;
-  }
-  const expiresInSeconds = typeof device.expires_in === 'number' ? device.expires_in : 900;
-  getDb().prepare(`
-    INSERT INTO oauth_login_states (state, provider, code_verifier, redirect_uri, expires_at)
-    VALUES (?, ?, ?, ?, datetime('now', ?))
-  `).run(state, provider.id, verifier, encryptDeviceCode(String(device.device_code)), `+${Math.max(1, Math.floor(expiresInSeconds))} seconds`);
-  res.json({
-    loginMode: 'device-oauth',
-    state,
-    userCode: String(device.user_code),
-    verificationUri: String(device.verification_uri),
-    verificationUriComplete: String(device.verification_uri_complete ?? device.verification_uri),
-    authUrl: String(device.verification_uri_complete ?? device.verification_uri),
-    expiresInSeconds,
-    intervalSeconds: typeof device.interval === 'number' ? device.interval : 5,
-  });
-}
-
 oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response) => {
   const provider = providerById(String(req.params.provider));
   if (!provider) {
@@ -424,10 +336,6 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
   }
   if (provider.kind === 'google' && !antigravityOAuthSecret(provider)) {
     res.status(409).json({ error: { message: 'Antigravity OAuth client secret was not found. Set LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET.' } });
-    return;
-  }
-  if (provider.loginMode === 'device-oauth') {
-    await startDeviceOAuth(provider, res);
     return;
   }
   if (process.env.NODE_ENV !== 'test' && provider.id === 'openai') {
@@ -471,77 +379,6 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
   }
 
   res.json({ authUrl: authUrl.toString(), state, expiresInSeconds: 600, callbackUrl: redirectUri, loginMode: 'browser-oauth' });
-});
-
-oauthRouter.post('/connect/:provider/complete', async (req: Request, res: Response) => {
-  const provider = providerById(String(req.params.provider));
-  const parsed = deviceCompleteSchema.safeParse(req.body ?? {});
-  if (!provider || provider.loginMode !== 'device-oauth') {
-    res.status(404).json({ error: { message: 'Device OAuth provider not found' } });
-    return;
-  }
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-  const stateRow = getDb().prepare(`
-    SELECT * FROM oauth_login_states
-    WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
-  `).get(parsed.data.state, provider.id) as any;
-  if (!stateRow) {
-    res.status(410).json({ error: { message: 'OAuth device login expired. Start the connection again.' } });
-    return;
-  }
-  let deviceCode = '';
-  try { deviceCode = decryptDeviceCode(stateRow.redirect_uri); }
-  catch {
-    res.status(410).json({ error: { message: 'OAuth device login state could not be read. Start the connection again.' } });
-    return;
-  }
-  const params = new URLSearchParams({
-    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-    client_id: provider.clientId,
-    device_code: deviceCode,
-    code_verifier: stateRow.code_verifier,
-  });
-  const upstream = await fetch(provider.tokenUrl, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-  if (!upstream.ok) {
-    const raw = await upstream.text().catch(() => '');
-    let upstreamError = '';
-    try { upstreamError = JSON.parse(raw).error ?? ''; } catch {}
-    if (upstreamError === 'authorization_pending' || upstreamError === 'slow_down') {
-      res.status(202).json({ pending: true, error: { message: upstreamError === 'slow_down' ? 'Authorization is still pending. Wait a few seconds, then try again.' : 'Authorization is still pending. Approve the code in Qwen, then complete the connection.' } });
-      return;
-    }
-    res.status(502).json({ error: { message: `${provider.name} token exchange failed with HTTP ${upstream.status}. ${raw.slice(0, 300)}` } });
-    return;
-  }
-  const tokenData = await upstream.json() as any;
-  if (!tokenData.access_token) {
-    res.status(502).json({ error: { message: `${provider.name} token response did not contain an access token.` } });
-    return;
-  }
-  const access = encrypt(String(tokenData.access_token));
-  const refresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
-  const expiresAt = typeof tokenData.expires_in === 'number' ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : null;
-  const accountHint = accountHintForToken(provider, tokenData);
-  let accountId = 0;
-  getDb().transaction(() => {
-    const result = getDb().prepare(`
-      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, metadata_json, enabled)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(provider.id, `${provider.name} - ${accountHint}`, accountHint, access.encrypted, access.iv, access.authTag, refresh?.encrypted ?? null, refresh?.iv ?? null, refresh?.authTag ?? null, expiresAt, JSON.stringify(metadataForToken(provider, tokenData, 'device-oauth')));
-    accountId = Number(result.lastInsertRowid);
-    syncProviderKeyForOAuthAccount(accountId, String(tokenData.access_token));
-    getDb().prepare("UPDATE oauth_login_states SET consumed_at = datetime('now') WHERE state = ?").run(parsed.data.state);
-  })();
-  try { await refreshOAuthAccountInventory(getDb(), accountId); } catch {}
-  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(accountId) as any;
-  res.status(201).json({ account: rowToAccount(row) });
 });
 
 oauthRouter.get('/callback/:provider', async (req: Request, res: Response) => {
