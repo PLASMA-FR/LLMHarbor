@@ -5,7 +5,6 @@ import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
 import { getDb } from '../db/index.js';
-import { QWEN_DEFAULT_RESOURCE_URL } from '../services/oauth-clients.js';
 
 const providers = new Map<string, BaseProvider>();
 const dynamicProviders = new Map<string, BaseProvider>();
@@ -25,14 +24,6 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://api.openai.com/v1',
 }));
 
-// Qwen browser-account OAuth — OpenAI-compatible runtime. The static URL is
-// a safe fallback; connected accounts can override it with token metadata.
-register(new OpenAICompatProvider({
-  platform: 'qwen-oauth',
-  name: 'Qwen Browser Account',
-  baseUrl: QWEN_DEFAULT_RESOURCE_URL,
-  timeoutMs: 120000,
-}));
 
 // Groq - OpenAI-compatible
 register(new OpenAICompatProvider({

@@ -187,14 +187,14 @@ export default function OAuthPage() {
               ) : (
                 <>
                   <p className="font-medium text-foreground">Device authorization started</p>
-                  <p className="mt-2 text-muted-foreground">Approve this code in Qwen, then return here to complete the connection.</p>
+                  <p className="mt-2 text-muted-foreground">Approve this device code with the provider, then return here to complete the connection.</p>
                   <div className="mt-3 rounded-xl border border-border bg-background px-3 py-3 text-center font-mono text-lg tracking-[0.18em] text-foreground">{activeConnection.userCode}</div>
                   <a className="mt-3 block break-all text-xs underline" href={activeConnection.authUrl} target="_blank" rel="noreferrer">{activeConnection.authUrl}</a>
                   <p className="mt-2 text-xs text-muted-foreground">Expires in {Math.round(activeConnection.expiresInSeconds / 60)} minutes.</p>
-                  {completeDeviceLogin.data?.pending && <p className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">Qwen has not confirmed the approval yet. Wait a moment, then try again.</p>}
+                  {completeDeviceLogin.data?.pending && <p className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">The provider has not confirmed the approval yet. Wait a moment, then try again.</p>}
                   {completeDeviceLogin.error && <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">{completeDeviceLogin.error.message}</p>}
                   <Button className="mt-4 w-full" disabled={completeDeviceLogin.isPending} onClick={() => completeDeviceLogin.mutate({ providerId: activeConnection.providerId, state: activeConnection.state })}>
-                    {completeDeviceLogin.isPending ? 'Checking approval...' : 'I approved it in Qwen'}
+                    {completeDeviceLogin.isPending ? 'Checking approval...' : 'I approved the device code'}
                   </Button>
                 </>
               )}

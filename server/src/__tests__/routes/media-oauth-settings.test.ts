@@ -108,7 +108,9 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
 
     const openai = catalog.body.providers.find((p: any) => p.id === 'openai');
     const antigravity = catalog.body.providers.find((p: any) => p.id === 'antigravity');
-    const qwen = catalog.body.providers.find((p: any) => p.id === 'qwen');
+
+    const removedQwen = await request(app, 'POST', '/api/oauth/connect/qwen/start');
+    expect(removedQwen.status).toBe(404);
 
     const start = await request(app, 'POST', '/api/oauth/connect/openai/start');
     expect(start.status).toBe(200);

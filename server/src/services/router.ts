@@ -34,22 +34,6 @@ function refreshTokenForProvider(provider: string, rawRefreshToken: string) {
   return provider === 'antigravity' ? rawRefreshToken.split('|')[0] : rawRefreshToken;
 }
 
-function normalizeQwenResourceUrl(resourceUrl: unknown) {
-  if (typeof resourceUrl !== 'string' || resourceUrl.trim().length === 0) return null;
-  const withoutTrailing = resourceUrl.trim().replace(/\/+$/, '');
-  return withoutTrailing.endsWith('/v1') ? withoutTrailing : `${withoutTrailing}/v1`;
-}
-
-function metadataJsonWithQwenResource(account: any, tokenData: any) {
-  if (account.provider !== 'qwen') return account.metadata_json ?? '{}';
-  const resourceUrl = normalizeQwenResourceUrl(tokenData.resource_url ?? tokenData.resourceUrl);
-  if (!resourceUrl) return account.metadata_json ?? '{}';
-  let metadata: Record<string, unknown> = {};
-  try { metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {}; } catch {}
-  metadata.resourceUrl = resourceUrl;
-  metadata.qwenResourceUrl = resourceUrl;
-  return JSON.stringify(metadata);
-}
 
 function markOAuthAccountNeedsReconnect(db: ReturnType<typeof getDb>, account: any, message: string) {
   let metadata: Record<string, unknown> = {};
@@ -87,7 +71,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   const expiresAt = account.expires_at ? Date.parse(account.expires_at) : 0;
   if (!expiresAt || expiresAt - Date.now() > 5 * 60 * 1000) return null;
   if (!account.encrypted_refresh_token || !account.refresh_iv || !account.refresh_auth_tag) {
-    const providerName = account.provider === 'antigravity' ? 'Antigravity' : account.provider === 'qwen' ? 'Qwen' : 'ChatGPT';
+    const providerName = account.provider === 'antigravity' ? 'Antigravity' : 'ChatGPT';
     const message = `${providerName} OAuth access token expired and no refresh token is available.`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
@@ -128,7 +112,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   const access = encrypt(String(tokenData.access_token));
   const nextRefresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
   const expires = typeof tokenData.expires_in === 'number' ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : account.expires_at;
-  const metadataJson = metadataJsonWithQwenResource(account, tokenData);
+  const metadataJson = account.metadata_json ?? '{}';
   db.prepare(`
     UPDATE oauth_accounts
     SET encrypted_access_token = ?, access_iv = ?, access_auth_tag = ?,

@@ -1,42 +1,25 @@
-# Terms of Use — LLMHarbor
+# Terms of Use: LLMHarbor
 
-**Last updated: May 2026**
+Last updated: May 2026
 
-LLMHarbor is an open-source, self-hosted routing proxy. You are responsible for your own use of this tool and your upstream provider accounts.
+LLMHarbor is a self-hosted routing tool. It does not bypass provider terms, quota systems, paid access requirements, or account policies. You are responsible for how every upstream API key and browser account is used.
 
-## Provider Accounts
+## Antigravity account warning
 
-LLMHarbor supports multiple LLM provider integrations including direct API keys, browser OAuth flows, and local endpoints. Each provider has its own terms of service and usage policies.
+Paid Antigravity accounts may be banned for using this tool. Antigravity uses Google OAuth and Google Code Assist account surfaces that can flag automated routing, shared OAuth-client behavior, repeated refreshes, or non-standard access patterns.
 
-## Antigravity (Google OAuth)
+Use a free Google account for Antigravity OAuth instead of your primary, paid, work, school, or Google Workspace account. Do not connect an account you cannot afford to lose.
 
-**Paid Antigravity accounts may be banned by Google for using this tool.** If you connect an Antigravity/Google OAuth account through LLMHarbor, Google may flag or suspend the account because:
+## Removed Qwen OAuth
 
-- The bundled OAuth client used by LLMHarbor is shared across many users and not a Google-verified first-party application.
-- The device-code OAuth flow may not match expected usage patterns for normal consumer accounts.
-- Repeated token refreshes and automated model discovery requests can resemble bot-like activity.
+Qwen OAuth was removed from LLMHarbor because the device-code approval path no longer provides a usable free approval flow and can require a paid Qwen account before approval. Use Qwen-family models through supported providers such as OpenRouter, Groq, or Cerebras when available.
 
-**Advice: Use a free Google account — not your primary or work account — when connecting Antigravity OAuth through LLMHarbor.** Free accounts are less likely to be permanently suspended for OAuth pattern violations. Do not connect a Google Workspace account or an account tied to paid Google services.
+## Safe defaults
 
-LLMHarbor is not affiliated with, endorsed by, or sponsored by Google LLC.
+- Use one disposable or low-risk account per provider.
+- Do not resell access or expose a public shared endpoint.
+- Do not depend on trial-only APIs for production.
+- Do not use traffic volume that looks like a commercial relay.
+- Read the terms for every provider you connect.
 
-## Free-Tier Providers
-
-- **Google AI Studio (free tier)**: Rate limits and availability are subject to Google's policies.
-- **OpenAI (free tier)**: API access requires an OpenAI account with acceptable usage history.
-- **OpenRouter (free tier)**: Model availability and quotas are controlled by OpenRouter.
-
-LLMHarbor is not responsible for account bans, rate limit changes, or service disruptions from upstream providers.
-
-## Your Responsibility
-
-By using LLMHarbor, you agree that:
-
-1. You are responsible for complying with each provider's terms of service.
-2. You will not use LLMHarbor to exceed fair-use limits or circumvent paid access requirements.
-3. You accept that upstream providers may change their OAuth policies, rate limits, or API availability at any time without notice.
-4. LLMHarbor contributors are not liable for any account suspension, data loss, or service interruption caused by upstream provider decisions.
-
-## Changes to These Terms
-
-These terms may be updated as provider integrations evolve. Check the source repository for the most recent version.
+This is not legal advice. LLMHarbor contributors are not responsible for provider bans, quota changes, account suspensions, or service interruptions.

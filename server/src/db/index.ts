@@ -306,7 +306,6 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
     SELECT
       CASE
         WHEN oa.provider = 'openai' THEN 'openai'
-        WHEN oa.provider = 'qwen' THEN 'qwen-oauth'
         ELSE 'google-oauth'
       END AS platform,
       oa.label,
@@ -318,12 +317,16 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
       'oauth',
       oa.id
     FROM oauth_accounts oa
-    WHERE oa.provider IN ('openai', 'antigravity', 'qwen')
+    WHERE oa.provider IN ('openai', 'antigravity')
       AND NOT EXISTS (SELECT 1 FROM api_keys ak WHERE ak.oauth_account_id = oa.id)
   `).run();
 }
 
 function ensureBrowserAccountModels(db: Database.Database) {
+  db.prepare(`DELETE FROM api_keys WHERE platform = 'qwen-oauth' OR oauth_account_id IN (SELECT id FROM oauth_accounts WHERE provider = 'qwen')`).run();
+  db.prepare(`DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'qwen-oauth')`).run();
+  db.prepare(`DELETE FROM models WHERE platform = 'qwen-oauth'`).run();
+  db.prepare("UPDATE oauth_accounts SET enabled = 0 WHERE provider = 'qwen'").run();
   db.prepare(`DELETE FROM api_keys WHERE source = 'oauth' AND oauth_account_id IN (SELECT id FROM oauth_accounts WHERE provider = 'google-ai-studio')`).run();
   db.prepare("UPDATE oauth_accounts SET enabled = 0 WHERE provider = 'google-ai-studio'").run();
   db.prepare(`

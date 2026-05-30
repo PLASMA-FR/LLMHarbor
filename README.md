@@ -21,6 +21,7 @@
     <a href="#supported-providers">Providers</a> ·
     <a href="#bulk-import-provider-keys">Bulk import</a> ·
     <a href="#settings--access-policy">Access policy</a> ·
+    <a href="#terms-of-use">Terms of Use</a> ·
     <a href="https://plasma-fr.github.io/LLMHarbor/">Website</a> ·
     <a href="#contributing">Contributing</a>
   </p>
@@ -78,7 +79,7 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 | Streaming | Server-Sent Events are supported for `stream: true`. |
 | Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
 | Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, and set per-key route/provider/model access policies. |
-| Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT, Antigravity, and Qwen through loopback or device OAuth with encrypted refresh storage and live model discovery. |
+| Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT and Antigravity through loopback OAuth with encrypted refresh storage and live model discovery. |
 | Key storage | Provider keys and OAuth tokens are encrypted with AES-256-GCM before they are written to SQLite. |
 | Rate tracking | RPM, RPD, TPM, and TPD counters are tracked for upstream providers, models, and routing health. |
 | Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
@@ -145,7 +146,6 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 | Google API keys | Gemini Flash and Pro family | Native adapter with OpenAI shape translation. |
 | OpenAI / ChatGPT OAuth | Account-discovered GPT and Codex routes | Browser OAuth account flow with loopback callback and live inventory. |
 | Antigravity OAuth | Google Code Assist / Gemini routes | Browser OAuth account flow with Code Assist inventory and reconnect handling. |
-| Qwen OAuth | Qwen Chat / Qwen Code-compatible completion routes | Device-code OAuth flow with encrypted refresh storage and OpenAI-compatible runtime discovery from the token `resource_url`. Availability depends on Qwen account policy. |
 | Groq | Llama, GPT-OSS, Qwen | Fast OpenAI-compatible route. |
 | Cerebras | Qwen and Llama routes | Fast inference, quota-dependent. |
 | SambaNova | DeepSeek, Llama, Gemma | OpenAI-compatible route. |
@@ -247,7 +247,7 @@ Then:
    - For one key, paste it into **Add a provider key**.
    - For many keys, use **Bulk import provider keys** with a `.txt` file: one key per line. The provider id follows the visible list, so Google is `1`, Groq is `2`, and custom providers continue after built-ins.
 2. Go to **Models** and probe the models you want to use.
-3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT, Antigravity, or Qwen.
+3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT or Antigravity.
 4. Go to **Fallback** and order the route list.
 5. Create or copy a client API key from **Keys**.
 6. Open **Settings** and restrict that key to specific local routes, provider endpoints, or model rows.
@@ -331,14 +331,14 @@ Custom local endpoint creation is intentionally retired: `POST /api/settings/loc
 
 ### Browser OAuth accounts
 
-The OAuth page connects supported browser accounts through loopback callbacks or device-code approval and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native desktop client by default, so the Connect button is available on a fresh local install; set `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` only if Google rotates that public client credential and you need to override it. Qwen uses the Qwen Code-compatible RFC 8628 device flow (`openid profile email model.completion`) and routes through the OpenAI-compatible `resource_url` returned by Qwen's token response. Qwen Code upstream notes that its old free OAuth tier was discontinued on 2026-04-15, so the device flow may only work for accounts Qwen still permits.
+The OAuth page connects supported browser accounts through loopback callbacks and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native desktop client by default, so the Connect button is available on a fresh local install; set `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` only if Google rotates that public client credential and you need to override it.
+
+Qwen OAuth was removed because the device-code path no longer provides a usable free approval flow and can require a paid Qwen account before approval. Use Qwen-family models through supported free-tier providers such as OpenRouter, Groq, or Cerebras when available.
 
 ```bash
 # Start browser-account login flows from the local dashboard/API
 POST /api/oauth/connect/openai/start
 POST /api/oauth/connect/antigravity/start
-POST /api/oauth/connect/qwen/start
-POST /api/oauth/connect/qwen/complete  # body: {"state":"..."} after approving the device code
 
 # Refresh discovered account models and limits
 GET /api/oauth/accounts/:id/models
@@ -610,19 +610,25 @@ server/src/__tests__/providers/<provider>.test.ts
 
 Please keep PRs focused and include tests for routing behavior when possible.
 
-## Terms of Service reminder
+## Terms of Use
 
-LLMHarbor does not bypass provider terms. You are still responsible for how each upstream key is used.
+LLMHarbor is a self-hosted routing tool. It does not bypass provider terms, quota systems, paid access requirements, or account policies. You are responsible for how every upstream API key and browser account is used.
 
-Safe defaults:
+### Antigravity account warning
 
-- One account per provider.
-- No reselling.
-- No shared public endpoint.
-- No production dependency on trial-only APIs.
-- No traffic volume that looks like a commercial relay.
+**Paid Antigravity accounts may be banned for using this tool.** Antigravity uses Google OAuth and Google Code Assist account surfaces that can flag automated routing, shared OAuth-client behavior, repeated refreshes, or non-standard access patterns.
 
-This is not legal advice. Read the terms for every provider you connect.
+Use a free Google account for Antigravity OAuth instead of your primary, paid, work, school, or Google Workspace account. Do not connect an account you cannot afford to lose.
+
+### Safe defaults
+
+- Use one disposable or low-risk account per provider.
+- Do not resell access or expose a public shared endpoint.
+- Do not depend on trial-only APIs for production.
+- Do not use traffic volume that looks like a commercial relay.
+- Read the terms for every provider you connect.
+
+This is not legal advice. LLMHarbor contributors are not responsible for provider bans, quota changes, account suspensions, or service interruptions.
 
 ## Star history
 
