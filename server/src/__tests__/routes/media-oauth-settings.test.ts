@@ -43,7 +43,7 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
 
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '1'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
+    delete process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET;
     initDb(':memory:');
     app = createApp();
   });
@@ -104,13 +104,16 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(JSON.stringify(catalog.body)).not.toContain('Gemini CLI');
     expect(JSON.stringify(catalog.body)).not.toContain('oauth.llmharbor.app');
     expect(JSON.stringify(catalog.body)).not.toContain('opencode auth login');
+    expect(JSON.stringify(catalog.body)).not.toContain('GOCSPX');
 
     const openai = catalog.body.providers.find((p: any) => p.id === 'openai');
     const antigravity = catalog.body.providers.find((p: any) => p.id === 'antigravity');
     expect(openai.canConnect).toBe(true);
+    expect(openai.configured).toBe(true);
     expect(openai.loginMode).toBe('browser-oauth');
     expect(openai.authorizationUrl).toBe('https://auth.openai.com/oauth/authorize');
     expect(antigravity.canConnect).toBe(true);
+    expect(antigravity.configured).toBe(true);
     expect(antigravity.loginMode).toBe('browser-oauth');
     expect(antigravity.authorizationUrl).toBe('https://accounts.google.com/o/oauth2/v2/auth');
 
@@ -194,6 +197,57 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(models.status).toBe(200);
     expect(models.body.models.map((m: any) => m.id).sort()).toEqual(['gpt-5', 'gpt-5.4-mini', 'gpt-5.5']);
     expect(models.body.limits[0].usedPercent).toBe(12);
+  });
+
+  it('exchanges Antigravity callback codes with the bundled desktop client when env secret is unset', async () => {
+    delete process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET;
+
+    const start = await request(app, 'POST', '/api/oauth/connect/antigravity/start');
+    expect(start.status).toBe(200);
+    const state = new URL(start.body.authUrl).searchParams.get('state');
+    expect(state).toBeTruthy();
+
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr === 'https://oauth2.googleapis.com/token') {
+        const body = new URLSearchParams(String((init as any).body));
+        expect(body.get('grant_type')).toBe('authorization_code');
+        expect(body.get('code')).toBe('antigravity-code');
+        expect(body.get('client_id')).toBe('1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com');
+        expect(body.get('redirect_uri')).toBe('http://localhost:51121/oauth-callback');
+        expect(body.get('code_verifier')).toBeTruthy();
+        expect(body.get('client_secret')).toMatch(/^GOCSPX-/);
+        return Response.json({ access_token: 'antigravity-access-token', refresh_token: 'antigravity-refresh-token', expires_in: 3600, token_type: 'Bearer', email: 'captain@example.com' });
+      }
+      if (urlStr.endsWith('/v1internal:loadCodeAssist')) {
+        expect((init as any).headers.Authorization).toBe('Bearer antigravity-access-token');
+        return Response.json({ cloudaicompanionProject: 'project-from-load', currentTier: { name: 'Free' } });
+      }
+      if (urlStr.endsWith('/v1internal:fetchAvailableModels')) {
+        expect((init as any).headers.Authorization).toBe('Bearer antigravity-access-token');
+        return Response.json({ models: { 'gemini-2.5-pro': { displayName: 'Gemini 2.5 Pro', contextWindow: 1048576 } } });
+      }
+      return origFetch(url, init);
+    });
+
+    const callback = await request(app, 'GET', `/api/oauth/callback/antigravity?state=${state}&code=antigravity-code`);
+    expect(callback.status).toBe(302);
+    expect(callback.headers.get('location')).toBe('/oauth?connected=1');
+
+    const accounts = await request(app, 'GET', '/api/oauth/accounts');
+    expect(accounts.status).toBe(200);
+    expect(accounts.body.accounts).toHaveLength(1);
+    expect(accounts.body.accounts[0].provider).toBe('antigravity');
+
+    const providerKeys = await request(app, 'GET', '/api/keys');
+    expect(providerKeys.status).toBe(200);
+    expect(providerKeys.body[0]).toMatchObject({ platform: 'google-oauth', source: 'oauth', oauthAccountId: accounts.body.accounts[0].id, status: 'healthy', enabled: true });
+
+    const modelList = await request(app, 'GET', '/api/models');
+    expect(modelList.status).toBe(200);
+    const antigravityModels = modelList.body.filter((m: any) => m.platform === 'google-oauth' && m.displayName.includes('browser account'));
+    expect(antigravityModels.map((m: any) => m.modelId)).toEqual(['gemini-2.5-pro']);
   });
 
   it('keeps local endpoint creation read-only while client API keys carry advanced access policy', async () => {

@@ -6,7 +6,7 @@ import { routeRequest, routeRequestAsync } from '../../services/router.js';
 describe('Router', () => {
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
+    delete process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET;
     initDb(':memory:');
   });
 
@@ -160,6 +160,7 @@ describe('Router', () => {
       expect(String(url)).toBe('https://oauth2.googleapis.com/token');
       const params = new URLSearchParams(String((init as any).body));
       expect(params.get('refresh_token')).toBe('refresh-token-value');
+      expect(params.get('client_secret')).toMatch(/^GOCSPX-/);
       return Response.json({ error: 'unauthorized_client', error_description: 'Unauthorized' }, { status: 401 });
     });
 

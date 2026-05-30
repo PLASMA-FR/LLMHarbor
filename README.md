@@ -330,7 +330,7 @@ Custom local endpoint creation is intentionally retired: `POST /api/settings/loc
 
 ### Browser OAuth accounts
 
-The OAuth page connects supported browser accounts through local loopback callbacks and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native client and requires `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` in the server environment before starting its login flow.
+The OAuth page connects supported browser accounts through local loopback callbacks and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native desktop client by default, so the Connect button is available on a fresh local install; set `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` only if Google rotates that public client credential and you need to override it.
 
 ```bash
 # Start browser-account login flows from the local dashboard/API

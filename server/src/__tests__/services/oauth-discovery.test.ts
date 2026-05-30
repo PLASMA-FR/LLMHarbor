@@ -11,7 +11,7 @@ function insertFallback(db: any, modelId: number) {
 describe('OAuth model discovery', () => {
   beforeEach(() => {
     process.env.ENCRYPTION_KEY = '2'.repeat(64);
-    process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET = 'fake';
+    delete process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET;
   });
 
   afterEach(() => vi.restoreAllMocks());

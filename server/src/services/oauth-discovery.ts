@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { decrypt, encrypt } from '../lib/crypto.js';
+import { oauthTokenClient } from './oauth-clients.js';
 
 export type OAuthLimitWindow = {
   label: string;
@@ -45,26 +46,6 @@ const CODE_ASSIST_HEADERS = {
 };
 export const DISCOVERY_BLACKLIST = new Set(['gpt-5-codex', 'gpt-5.1-codex']);
 
-function oauthRefreshClient(provider: string) {
-  if (provider === 'openai') {
-    return {
-      name: 'ChatGPT OAuth',
-      clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
-      tokenUrl: 'https://auth.openai.com/oauth/token',
-      clientSecret: '',
-    };
-  }
-  if (provider === 'antigravity') {
-    return {
-      name: 'Antigravity OAuth',
-      clientId: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com',
-      tokenUrl: 'https://oauth2.googleapis.com/token',
-      clientSecret: process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET || '',
-    };
-  }
-  return null;
-}
-
 function oauthRefreshDue(row: any) {
   const expiresAt = row.expires_at ? Date.parse(row.expires_at) : 0;
   return Boolean(expiresAt && expiresAt - Date.now() <= 5 * 60 * 1000);
@@ -77,7 +58,7 @@ function refreshTokenForProvider(provider: string, rawRefreshToken: string) {
 async function ensureFreshOAuthAccessToken(db: Database.Database, row: any) {
   if (!oauthRefreshDue(row)) return row;
   if (!row.encrypted_refresh_token || !row.refresh_iv || !row.refresh_auth_tag) return row;
-  const client = oauthRefreshClient(row.provider);
+  const client = oauthTokenClient(row.provider);
   if (!client) return row;
   if (row.provider !== 'openai' && !client.clientSecret) return row;
 

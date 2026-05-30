@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { refreshOAuthAccountInventory } from '../services/oauth-discovery.js';
+import { ANTIGRAVITY_OAUTH_CLIENT_ID, ANTIGRAVITY_OAUTH_TOKEN_URL, OPENAI_OAUTH_CLIENT_ID, OPENAI_OAUTH_TOKEN_URL, oauthTokenClient } from '../services/oauth-clients.js';
 
 export const oauthRouter = Router();
 
@@ -30,8 +31,8 @@ const BROWSER_OAUTH_PROVIDERS: BrowserOAuthProvider[] = [
     name: 'OpenAI / ChatGPT subscription',
     kind: 'openai',
     authorizationUrl: 'https://auth.openai.com/oauth/authorize',
-    tokenUrl: 'https://auth.openai.com/oauth/token',
-    clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+    tokenUrl: OPENAI_OAUTH_TOKEN_URL,
+    clientId: OPENAI_OAUTH_CLIENT_ID,
     modelsUrl: 'https://chatgpt.com/backend-api/codex/models?client_version=999.0.0',
     scopes: ['openid', 'profile', 'email', 'offline_access'],
     supportsDiscovery: true,
@@ -42,8 +43,8 @@ const BROWSER_OAUTH_PROVIDERS: BrowserOAuthProvider[] = [
     name: 'Google Antigravity',
     kind: 'google',
     authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
-    tokenUrl: 'https://oauth2.googleapis.com/token',
-    clientId: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com',
+    tokenUrl: ANTIGRAVITY_OAUTH_TOKEN_URL,
+    clientId: ANTIGRAVITY_OAUTH_CLIENT_ID,
     modelsUrl: 'https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist',
     scopes: ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile', 'https://www.googleapis.com/auth/cclog', 'https://www.googleapis.com/auth/experimentsandconfigs'],
     supportsDiscovery: true,
@@ -178,7 +179,7 @@ function ensureChatgptCallbackServer() {
       res.end('<!doctype html><title>LLMHarbor connected</title><body style="font-family:system-ui;background:#0f1115;color:#f4f1ea;display:grid;place-items:center;min-height:100vh"><main><h1>Account connected</h1><p>You can close this window and return to LLMHarbor.</p><script>setTimeout(()=>window.close(),1800)</script></main></body>');
     } catch (error: any) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
-      res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${String(error?.message ?? error)}</p></body>`);
+      res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${escapeHtml(error?.message ?? error)}</p></body>`);
     }
   });
   return new Promise<void>((resolve, reject) => {
@@ -189,7 +190,7 @@ function ensureChatgptCallbackServer() {
 
 
 function antigravityOAuthSecret(provider?: BrowserOAuthProvider) {
-  return process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET || provider?.clientSecret || '';
+  return oauthTokenClient(provider?.id ?? 'antigravity')?.clientSecret || provider?.clientSecret || '';
 }
 
 function antigravityCallbackPort() {
@@ -218,7 +219,7 @@ function ensureAntigravityCallbackServer(provider: BrowserOAuthProvider) {
       res.end('<!doctype html><title>LLMHarbor connected</title><body style="font-family:system-ui;background:#0f1115;color:#f4f1ea;display:grid;place-items:center;min-height:100vh"><main><h1>Antigravity account connected</h1><p>You can close this window and return to LLMHarbor.</p><script>setTimeout(()=>window.close(),1800)</script></main></body>');
     } catch (error: any) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
-      res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${String(error?.message ?? error)}</p></body>`);
+      res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${escapeHtml(error?.message ?? error)}</p></body>`);
     }
   });
   googleCallbackServers.set(provider.id, server);
@@ -238,6 +239,15 @@ function base64Url(buffer: Buffer) {
 
 function sha256(input: string) {
   return base64Url(crypto.createHash('sha256').update(input).digest());
+}
+
+function escapeHtml(value: unknown) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function publicProvider(provider: BrowserOAuthProvider) {

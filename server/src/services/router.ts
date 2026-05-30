@@ -3,6 +3,7 @@ import { getProvider } from '../providers/index.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
 import type { BaseProvider } from '../providers/base.js';
+import { ANTIGRAVITY_OAUTH_CLIENT_ID, oauthTokenClient } from './oauth-clients.js';
 
 interface ModelRow {
   id: number;
@@ -61,24 +62,6 @@ interface OAuthAccountRow {
   metadata_json: string | null;
 }
 
-function oauthClient(provider: string) {
-  if (provider === 'openai') {
-    return {
-      clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
-      tokenUrl: 'https://auth.openai.com/oauth/token',
-      clientSecret: '',
-    };
-  }
-  if (provider === 'antigravity') {
-    return {
-      clientId: '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com',
-      tokenUrl: 'https://oauth2.googleapis.com/token',
-      clientSecret: process.env.LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET || '',
-    };
-  }
-  return null;
-}
-
 async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   if (!key.oauth_account_id) return null;
   const db = getDb();
@@ -95,7 +78,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   }
   const rawRefreshToken = decrypt(account.encrypted_refresh_token, account.refresh_iv, account.refresh_auth_tag);
   const refreshToken = refreshTokenForProvider(account.provider, rawRefreshToken);
-  const client = oauthClient(account.provider);
+  const client = oauthTokenClient(account.provider);
   if (!client) return null;
   if (account.provider !== 'openai' && !client.clientSecret) return null;
   const params = new URLSearchParams({
@@ -110,7 +93,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
     body: params.toString(),
   });
   if (!upstream.ok) {
-    const message = `${client.clientId === '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com' ? 'Antigravity' : 'ChatGPT'} OAuth token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
+    const message = `${client.clientId === ANTIGRAVITY_OAUTH_CLIENT_ID ? 'Antigravity' : 'ChatGPT'} OAuth token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
     err.status = 401;
@@ -118,7 +101,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   }
   const tokenData = await upstream.json() as any;
   if (!tokenData.access_token) {
-    const message = `${client.clientId === '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com' ? 'Antigravity' : 'ChatGPT'} OAuth token refresh response did not contain an access token.`;
+    const message = `${client.clientId === ANTIGRAVITY_OAUTH_CLIENT_ID ? 'Antigravity' : 'ChatGPT'} OAuth token refresh response did not contain an access token.`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
     err.status = 401;
