@@ -3,7 +3,7 @@ import { getProvider } from '../providers/index.js';
 import { decrypt, encrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
 import type { BaseProvider } from '../providers/base.js';
-import { ANTIGRAVITY_OAUTH_CLIENT_ID, oauthTokenClient } from './oauth-clients.js';
+import { oauthTokenClient } from './oauth-clients.js';
 
 interface ModelRow {
   id: number;
@@ -32,6 +32,23 @@ function refreshTokenForProvider(provider: string, rawRefreshToken: string) {
   // refreshToken|duetProject|managedProject. Google only accepts the first
   // segment at oauth2.googleapis.com/token.
   return provider === 'antigravity' ? rawRefreshToken.split('|')[0] : rawRefreshToken;
+}
+
+function normalizeQwenResourceUrl(resourceUrl: unknown) {
+  if (typeof resourceUrl !== 'string' || resourceUrl.trim().length === 0) return null;
+  const withoutTrailing = resourceUrl.trim().replace(/\/+$/, '');
+  return withoutTrailing.endsWith('/v1') ? withoutTrailing : `${withoutTrailing}/v1`;
+}
+
+function metadataJsonWithQwenResource(account: any, tokenData: any) {
+  if (account.provider !== 'qwen') return account.metadata_json ?? '{}';
+  const resourceUrl = normalizeQwenResourceUrl(tokenData.resource_url ?? tokenData.resourceUrl);
+  if (!resourceUrl) return account.metadata_json ?? '{}';
+  let metadata: Record<string, unknown> = {};
+  try { metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {}; } catch {}
+  metadata.resourceUrl = resourceUrl;
+  metadata.qwenResourceUrl = resourceUrl;
+  return JSON.stringify(metadata);
 }
 
 function markOAuthAccountNeedsReconnect(db: ReturnType<typeof getDb>, account: any, message: string) {
@@ -70,7 +87,8 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   const expiresAt = account.expires_at ? Date.parse(account.expires_at) : 0;
   if (!expiresAt || expiresAt - Date.now() > 5 * 60 * 1000) return null;
   if (!account.encrypted_refresh_token || !account.refresh_iv || !account.refresh_auth_tag) {
-    const message = `${account.provider === 'antigravity' ? 'Antigravity' : 'ChatGPT'} OAuth access token expired and no refresh token is available.`;
+    const providerName = account.provider === 'antigravity' ? 'Antigravity' : account.provider === 'qwen' ? 'Qwen' : 'ChatGPT';
+    const message = `${providerName} OAuth access token expired and no refresh token is available.`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
     err.status = 401;
@@ -80,7 +98,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   const refreshToken = refreshTokenForProvider(account.provider, rawRefreshToken);
   const client = oauthTokenClient(account.provider);
   if (!client) return null;
-  if (account.provider !== 'openai' && !client.clientSecret) return null;
+  if (client.requiresClientSecret && !client.clientSecret) return null;
   const params = new URLSearchParams({
     grant_type: 'refresh_token',
     client_id: client.clientId,
@@ -93,7 +111,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
     body: params.toString(),
   });
   if (!upstream.ok) {
-    const message = `${client.clientId === ANTIGRAVITY_OAUTH_CLIENT_ID ? 'Antigravity' : 'ChatGPT'} OAuth token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
+    const message = `${client.name} token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
     err.status = 401;
@@ -101,7 +119,7 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   }
   const tokenData = await upstream.json() as any;
   if (!tokenData.access_token) {
-    const message = `${client.clientId === ANTIGRAVITY_OAUTH_CLIENT_ID ? 'Antigravity' : 'ChatGPT'} OAuth token refresh response did not contain an access token.`;
+    const message = `${client.name} token refresh response did not contain an access token.`;
     markOAuthAccountNeedsReconnect(db, account, message);
     const err = new Error(`${message} Reconnect the browser account.`) as any;
     err.status = 401;
@@ -110,15 +128,16 @@ async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
   const access = encrypt(String(tokenData.access_token));
   const nextRefresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
   const expires = typeof tokenData.expires_in === 'number' ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : account.expires_at;
+  const metadataJson = metadataJsonWithQwenResource(account, tokenData);
   db.prepare(`
     UPDATE oauth_accounts
     SET encrypted_access_token = ?, access_iv = ?, access_auth_tag = ?,
         encrypted_refresh_token = COALESCE(?, encrypted_refresh_token),
         refresh_iv = COALESCE(?, refresh_iv),
         refresh_auth_tag = COALESCE(?, refresh_auth_tag),
-        expires_at = ?, last_used_at = datetime('now')
+        expires_at = ?, metadata_json = ?, last_used_at = datetime('now')
     WHERE id = ?
-  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expires, account.id);
+  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expires, metadataJson, account.id);
   db.prepare(`
     UPDATE api_keys
     SET encrypted_key = ?, iv = ?, auth_tag = ?, status = 'healthy', last_checked_at = datetime('now')
@@ -417,7 +436,7 @@ export async function routeRequestAsync(
   const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
   if (key?.oauth_account_id) {
     const refreshed = await refreshOAuthKeyIfNeeded(key);
-    if (refreshed) return { ...route, apiKey: refreshed };
+    if (refreshed) return { ...route, apiKey: refreshed, oauth: oauthOptionsForKey(getDb(), key) };
   }
   return route;
 }

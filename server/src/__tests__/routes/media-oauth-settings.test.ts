@@ -99,7 +99,7 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
   it('starts browser OAuth directly, exchanges callback codes, and stores encrypted account tokens', async () => {
     const catalog = await request(app, 'GET', '/api/oauth/providers');
     expect(catalog.status).toBe(200);
-    expect(catalog.body.providers.map((p: any) => p.id)).toEqual(['openai', 'antigravity']);
+    expect(catalog.body.providers.map((p: any) => p.id)).toEqual(['openai', 'antigravity', 'qwen']);
     expect(JSON.stringify(catalog.body)).not.toContain('google-ai-studio');
     expect(JSON.stringify(catalog.body)).not.toContain('Gemini CLI');
     expect(JSON.stringify(catalog.body)).not.toContain('oauth.llmharbor.app');
@@ -108,6 +108,7 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
 
     const openai = catalog.body.providers.find((p: any) => p.id === 'openai');
     const antigravity = catalog.body.providers.find((p: any) => p.id === 'antigravity');
+    const qwen = catalog.body.providers.find((p: any) => p.id === 'qwen');
     expect(openai.canConnect).toBe(true);
     expect(openai.configured).toBe(true);
     expect(openai.loginMode).toBe('browser-oauth');
@@ -116,6 +117,10 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(antigravity.configured).toBe(true);
     expect(antigravity.loginMode).toBe('browser-oauth');
     expect(antigravity.authorizationUrl).toBe('https://accounts.google.com/o/oauth2/v2/auth');
+    expect(qwen.canConnect).toBe(true);
+    expect(qwen.configured).toBe(true);
+    expect(qwen.loginMode).toBe('device-oauth');
+    expect(qwen.authorizationUrl).toBe('https://chat.qwen.ai/authorize');
 
     const start = await request(app, 'POST', '/api/oauth/connect/openai/start');
     expect(start.status).toBe(200);
@@ -136,6 +141,11 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(antigravityStart.body.authUrl).toContain('client_id=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com');
     expect(antigravityStart.body.authUrl).toContain(encodeURIComponent('https://www.googleapis.com/auth/experimentsandconfigs'));
     expect(antigravityStart.body.authUrl).toContain('prompt=consent');
+
+    const callbackError = await request(app, 'GET', '/api/oauth/callback/openai?state=1234567890abcdef&error=access_denied&error_description=%3Cscript%3Ealert(1)%3C%2Fscript%3E');
+    expect(callbackError.status).toBe(400);
+    expect(callbackError.raw).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(callbackError.raw).not.toContain('<script>alert(1)</script>');
 
     const state = new URL(start.body.authUrl).searchParams.get('state');
     expect(state).toBeTruthy();
@@ -248,6 +258,84 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(modelList.status).toBe(200);
     const antigravityModels = modelList.body.filter((m: any) => m.platform === 'google-oauth' && m.displayName.includes('browser account'));
     expect(antigravityModels.map((m: any) => m.modelId)).toEqual(['gemini-2.5-pro']);
+  });
+
+  it('starts and completes Qwen OAuth device flow without exposing device secrets', async () => {
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr === 'https://chat.qwen.ai/api/v1/oauth2/device/code') {
+        const body = new URLSearchParams(String((init as any).body));
+        expect(body.get('client_id')).toBe('f0304373b74a44d2b584a3fb70ca9e56');
+        expect(body.get('scope')).toBe('openid profile email model.completion');
+        expect(body.get('code_challenge')).toBeTruthy();
+        expect(body.get('code_challenge_method')).toBe('S256');
+        return Response.json({
+          device_code: 'qwen-device-secret',
+          user_code: 'ABCD-EFGH',
+          verification_uri: 'https://chat.qwen.ai/authorize',
+          verification_uri_complete: 'https://chat.qwen.ai/authorize?user_code=ABCD-EFGH&client=qwen-code',
+          expires_in: 900,
+        });
+      }
+      if (urlStr === 'https://chat.qwen.ai/api/v1/oauth2/token') {
+        const body = new URLSearchParams(String((init as any).body));
+        expect(body.get('grant_type')).toBe('urn:ietf:params:oauth:grant-type:device_code');
+        expect(body.get('client_id')).toBe('f0304373b74a44d2b584a3fb70ca9e56');
+        expect(body.get('device_code')).toBe('qwen-device-secret');
+        expect(body.get('code_verifier')).toBeTruthy();
+        return Response.json({
+          access_token: 'qwen-access-token',
+          refresh_token: 'qwen-refresh-token',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          resource_url: 'https://portal.qwen.ai/custom-openai-compatible',
+        });
+      }
+      if (urlStr === 'https://portal.qwen.ai/custom-openai-compatible/v1/models') {
+        expect((init as any).headers.Authorization).toBe('Bearer qwen-access-token');
+        return Response.json({ data: [
+          { id: 'qwen3-coder-plus', object: 'model', owned_by: 'qwen' },
+          { id: 'text-embedding-v4', object: 'model', owned_by: 'qwen' },
+        ] });
+      }
+      return origFetch(url, init);
+    });
+
+    const start = await request(app, 'POST', '/api/oauth/connect/qwen/start');
+    expect(start.status).toBe(200);
+    expect(start.body).toMatchObject({
+      loginMode: 'device-oauth',
+      userCode: 'ABCD-EFGH',
+      verificationUri: 'https://chat.qwen.ai/authorize',
+      verificationUriComplete: 'https://chat.qwen.ai/authorize?user_code=ABCD-EFGH&client=qwen-code',
+      expiresInSeconds: 900,
+    });
+    expect(start.body.state).toBeTruthy();
+    expect(JSON.stringify(start.body)).not.toContain('qwen-device-secret');
+    const stateRow = getDb().prepare('SELECT redirect_uri, expires_at FROM oauth_login_states WHERE state = ?').get(start.body.state) as any;
+    expect(stateRow.redirect_uri).not.toContain('qwen-device-secret');
+    expect(stateRow.expires_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:/);
+
+    const complete = await request(app, 'POST', '/api/oauth/connect/qwen/complete', { state: start.body.state });
+    expect(complete.status).toBe(201);
+    expect(complete.body.account.provider).toBe('qwen');
+    expect(complete.body.account.metadata.resourceUrl).toBe('https://portal.qwen.ai/custom-openai-compatible/v1');
+
+    const accounts = await request(app, 'GET', '/api/oauth/accounts');
+    expect(accounts.status).toBe(200);
+    expect(accounts.body.accounts[0]).toMatchObject({ provider: 'qwen', accountHint: 'Qwen account' });
+    expect(accounts.body.accounts[0].metadata.resourceUrl).toBe('https://portal.qwen.ai/custom-openai-compatible/v1');
+
+    const providerKeys = await request(app, 'GET', '/api/keys');
+    expect(providerKeys.status).toBe(200);
+    expect(providerKeys.body[0]).toMatchObject({ platform: 'qwen-oauth', source: 'oauth', oauthAccountId: accounts.body.accounts[0].id, status: 'healthy', enabled: true });
+
+    const modelList = await request(app, 'GET', '/api/models');
+    expect(modelList.status).toBe(200);
+    const qwenModels = modelList.body.filter((m: any) => m.platform === 'qwen-oauth' && m.displayName.includes('browser account'));
+    expect(qwenModels.map((m: any) => m.modelId)).toEqual(['qwen3-coder-plus']);
+    expect(qwenModels[0].keyCount).toBe(1);
   });
 
   it('keeps local endpoint creation read-only while client API keys carry advanced access policy', async () => {

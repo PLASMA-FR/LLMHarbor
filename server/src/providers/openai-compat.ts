@@ -38,6 +38,18 @@ export class OpenAICompatProvider extends BaseProvider {
     this.timeoutMs = opts.timeoutMs ?? 15000;
   }
 
+  private runtimeBaseUrl(options?: CompletionOptions): string {
+    if (this.platform !== 'qwen-oauth') return this.baseUrl;
+    const metadataUrl = options?.oauth?.metadata?.resourceUrl ?? options?.oauth?.metadata?.qwenResourceUrl;
+    const raw = typeof metadataUrl === 'string' && metadataUrl.trim().length > 0 ? metadataUrl.trim() : this.baseUrl;
+    const withoutTrailing = raw.replace(/\/+$/, '');
+    return withoutTrailing.endsWith('/v1') ? withoutTrailing : `${withoutTrailing}/v1`;
+  }
+
+  private endpoint(path: string, options?: CompletionOptions): string {
+    return `${this.runtimeBaseUrl(options)}${path}`;
+  }
+
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -47,7 +59,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (this.platform === 'openai' && options?.oauth?.provider === 'openai') {
       return this.chatGptSubscriptionCompletion(apiKey, messages, modelId, options);
     }
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
+    const res = await this.fetchWithTimeout(this.endpoint('/chat/completions', options), {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -87,7 +99,7 @@ export class OpenAICompatProvider extends BaseProvider {
       yield* this.streamChatGptSubscriptionCompletion(apiKey, messages, modelId, options);
       return;
     }
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
+    const res = await this.fetchWithTimeout(this.endpoint('/chat/completions', options), {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,

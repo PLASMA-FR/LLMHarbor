@@ -78,7 +78,7 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 | Streaming | Server-Sent Events are supported for `stream: true`. |
 | Tool calls | OpenAI-style `tools`, `tool_choice`, assistant `tool_calls`, and tool follow-up messages round trip through the proxy. |
 | Client keys | Mint multiple OpenAI-compatible client keys, label them by app or device, and set per-key route/provider/model access policies. |
-| Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT and Antigravity through loopback OAuth with encrypted refresh storage and live model discovery. |
+| Browser OAuth | Connect supported browser accounts such as OpenAI/ChatGPT, Antigravity, and Qwen through loopback or device OAuth with encrypted refresh storage and live model discovery. |
 | Key storage | Provider keys and OAuth tokens are encrypted with AES-256-GCM before they are written to SQLite. |
 | Rate tracking | RPM, RPD, TPM, and TPD counters are tracked for upstream providers, models, and routing health. |
 | Sticky sessions | Multi-turn conversations can stay on the same model for a short window to avoid mid-thread model jumps. |
@@ -145,6 +145,7 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 | Google API keys | Gemini Flash and Pro family | Native adapter with OpenAI shape translation. |
 | OpenAI / ChatGPT OAuth | Account-discovered GPT and Codex routes | Browser OAuth account flow with loopback callback and live inventory. |
 | Antigravity OAuth | Google Code Assist / Gemini routes | Browser OAuth account flow with Code Assist inventory and reconnect handling. |
+| Qwen OAuth | Qwen Chat / Qwen Code-compatible completion routes | Device-code OAuth flow with encrypted refresh storage and OpenAI-compatible runtime discovery from the token `resource_url`. Availability depends on Qwen account policy. |
 | Groq | Llama, GPT-OSS, Qwen | Fast OpenAI-compatible route. |
 | Cerebras | Qwen and Llama routes | Fast inference, quota-dependent. |
 | SambaNova | DeepSeek, Llama, Gemma | OpenAI-compatible route. |
@@ -246,7 +247,7 @@ Then:
    - For one key, paste it into **Add a provider key**.
    - For many keys, use **Bulk import provider keys** with a `.txt` file: one key per line. The provider id follows the visible list, so Google is `1`, Groq is `2`, and custom providers continue after built-ins.
 2. Go to **Models** and probe the models you want to use.
-3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT or Antigravity.
+3. Optional: go to **OAuth** and connect a supported browser account such as OpenAI/ChatGPT, Antigravity, or Qwen.
 4. Go to **Fallback** and order the route list.
 5. Create or copy a client API key from **Keys**.
 6. Open **Settings** and restrict that key to specific local routes, provider endpoints, or model rows.
@@ -330,12 +331,14 @@ Custom local endpoint creation is intentionally retired: `POST /api/settings/loc
 
 ### Browser OAuth accounts
 
-The OAuth page connects supported browser accounts through local loopback callbacks and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native desktop client by default, so the Connect button is available on a fresh local install; set `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` only if Google rotates that public client credential and you need to override it.
+The OAuth page connects supported browser accounts through loopback callbacks or device-code approval and encrypted token storage. Discovery refreshes provider-reported model inventory and usage windows so `/v1/models` only exposes models that are actually routeable. Antigravity uses Google Code Assist's native desktop client by default, so the Connect button is available on a fresh local install; set `LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET` only if Google rotates that public client credential and you need to override it. Qwen uses the Qwen Code-compatible RFC 8628 device flow (`openid profile email model.completion`) and routes through the OpenAI-compatible `resource_url` returned by Qwen's token response. Qwen Code upstream notes that its old free OAuth tier was discontinued on 2026-04-15, so the device flow may only work for accounts Qwen still permits.
 
 ```bash
 # Start browser-account login flows from the local dashboard/API
 POST /api/oauth/connect/openai/start
 POST /api/oauth/connect/antigravity/start
+POST /api/oauth/connect/qwen/start
+POST /api/oauth/connect/qwen/complete  # body: {"state":"..."} after approving the device code
 
 # Refresh discovered account models and limits
 GET /api/oauth/accounts/:id/models

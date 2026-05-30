@@ -304,7 +304,11 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
   db.prepare(`
     INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
     SELECT
-      CASE WHEN oa.provider = 'openai' THEN 'openai' ELSE 'google-oauth' END AS platform,
+      CASE
+        WHEN oa.provider = 'openai' THEN 'openai'
+        WHEN oa.provider = 'qwen' THEN 'qwen-oauth'
+        ELSE 'google-oauth'
+      END AS platform,
       oa.label,
       oa.encrypted_access_token,
       oa.access_iv,
@@ -314,7 +318,7 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
       'oauth',
       oa.id
     FROM oauth_accounts oa
-    WHERE oa.provider IN ('openai', 'antigravity')
+    WHERE oa.provider IN ('openai', 'antigravity', 'qwen')
       AND NOT EXISTS (SELECT 1 FROM api_keys ak WHERE ak.oauth_account_id = oa.id)
   `).run();
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
-import { encrypt } from '../../lib/crypto.js';
+import { encrypt, decrypt } from '../../lib/crypto.js';
 import { routeRequest, routeRequestAsync } from '../../services/router.js';
 
 describe('Router', () => {
@@ -171,5 +171,48 @@ describe('Router', () => {
     const metadata = JSON.parse((db.prepare('SELECT metadata_json FROM oauth_accounts WHERE id = ?').get(Number(account.lastInsertRowid)) as any).metadata_json);
     expect(metadata.oauthNeedsReconnect).toBe(true);
     expect(metadata.oauthDiscoveryError).toContain('unauthorized_client');
+  });
+
+  it('routes Qwen OAuth browser-account models with refreshed bearer tokens and resource metadata', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('qwen-oauth', 'qwen3-coder-plus', 'Qwen3 Coder Plus (Qwen browser account)', 1, 2, 'Frontier', 1)
+    `).run();
+    const model = db.prepare("SELECT id FROM models WHERE platform = 'qwen-oauth' AND model_id = 'qwen3-coder-plus'").get() as { id: number };
+    db.prepare('INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1)').run(model.id);
+    db.prepare('UPDATE fallback_config SET priority = 1, enabled = 1 WHERE model_db_id = ?').run(model.id);
+
+    const staleAccess = encrypt('stale-qwen-access');
+    const refresh = encrypt('qwen-refresh-token');
+    const account = db.prepare(`
+      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, metadata_json, enabled)
+      VALUES ('qwen', 'Qwen browser', 'Qwen account', ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString(), JSON.stringify({ resourceUrl: 'https://portal.qwen.ai/custom-openai-compatible/v1' }));
+    const key = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('qwen-oauth', 'Qwen browser', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, Number(account.lastInsertRowid));
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      expect(String(url)).toBe('https://chat.qwen.ai/api/v1/oauth2/token');
+      const params = new URLSearchParams(String((init as any).body));
+      expect(params.get('grant_type')).toBe('refresh_token');
+      expect(params.get('client_id')).toBe('f0304373b74a44d2b584a3fb70ca9e56');
+      expect(params.get('refresh_token')).toBe('qwen-refresh-token');
+      expect(params.has('client_secret')).toBe(false);
+      return Response.json({ access_token: 'fresh-qwen-access', expires_in: 3600, token_type: 'Bearer', resource_url: 'https://portal.qwen.ai/refreshed-openai-compatible' });
+    });
+
+    const route = await routeRequestAsync(1000, undefined, model.id, true);
+
+    expect(route.platform).toBe('qwen-oauth');
+    expect(route.apiKey).toBe('fresh-qwen-access');
+    expect(route.oauth).toMatchObject({ accountId: Number(account.lastInsertRowid), provider: 'qwen', accountHint: 'Qwen account' });
+    expect(route.oauth?.metadata?.resourceUrl).toBe('https://portal.qwen.ai/refreshed-openai-compatible/v1');
+    const updatedKey = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(Number(key.lastInsertRowid)) as any;
+    expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh-qwen-access');
+    const updatedAccount = db.prepare('SELECT metadata_json FROM oauth_accounts WHERE id = ?').get(Number(account.lastInsertRowid)) as any;
+    expect(JSON.parse(updatedAccount.metadata_json).resourceUrl).toBe('https://portal.qwen.ai/refreshed-openai-compatible/v1');
   });
 });

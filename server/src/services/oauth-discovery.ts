@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { decrypt, encrypt } from '../lib/crypto.js';
-import { oauthTokenClient } from './oauth-clients.js';
+import { QWEN_DEFAULT_RESOURCE_URL, oauthTokenClient } from './oauth-clients.js';
 
 export type OAuthLimitWindow = {
   label: string;
@@ -12,7 +12,7 @@ export type OAuthLimitWindow = {
 export type OAuthDiscoveredModel = {
   id: string;
   displayName: string;
-  platform: 'openai' | 'google-oauth';
+  platform: 'openai' | 'google-oauth' | 'qwen-oauth';
   priority: number;
   speedRank: number;
   sizeLabel: string;
@@ -60,7 +60,7 @@ async function ensureFreshOAuthAccessToken(db: Database.Database, row: any) {
   if (!row.encrypted_refresh_token || !row.refresh_iv || !row.refresh_auth_tag) return row;
   const client = oauthTokenClient(row.provider);
   if (!client) return row;
-  if (row.provider !== 'openai' && !client.clientSecret) return row;
+  if (client.requiresClientSecret && !client.clientSecret) return row;
 
   const rawRefreshToken = decrypt(row.encrypted_refresh_token, row.refresh_iv, row.refresh_auth_tag);
   const refreshToken = refreshTokenForProvider(row.provider, rawRefreshToken);
@@ -87,6 +87,15 @@ async function ensureFreshOAuthAccessToken(db: Database.Database, row: any) {
   const expiresAt = typeof tokenData.expires_in === 'number'
     ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString()
     : row.expires_at;
+  let metadataJson = row.metadata_json ?? '{}';
+  if (row.provider === 'qwen' && (tokenData.resource_url || tokenData.resourceUrl)) {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {}; } catch {}
+    const resourceUrl = normalizeQwenResourceUrl(metadata, tokenData.resource_url ?? tokenData.resourceUrl);
+    metadata.resourceUrl = resourceUrl;
+    metadata.qwenResourceUrl = resourceUrl;
+    metadataJson = JSON.stringify(metadata);
+  }
 
   db.prepare(`
     UPDATE oauth_accounts
@@ -94,9 +103,9 @@ async function ensureFreshOAuthAccessToken(db: Database.Database, row: any) {
            encrypted_refresh_token = COALESCE(?, encrypted_refresh_token),
            refresh_iv = COALESCE(?, refresh_iv),
            refresh_auth_tag = COALESCE(?, refresh_auth_tag),
-           expires_at = ?, last_used_at = datetime('now')
+           expires_at = ?, metadata_json = ?, last_used_at = datetime('now')
      WHERE id = ?
-  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expiresAt, row.id);
+  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expiresAt, metadataJson, row.id);
   db.prepare(`
     UPDATE api_keys
        SET encrypted_key = ?, iv = ?, auth_tag = ?, status = 'healthy', last_checked_at = datetime('now')
@@ -112,6 +121,7 @@ async function ensureFreshOAuthAccessToken(db: Database.Database, row: any) {
     refresh_iv: nextRefresh?.iv ?? row.refresh_iv,
     refresh_auth_tag: nextRefresh?.authTag ?? row.refresh_auth_tag,
     expires_at: expiresAt,
+    metadata_json: metadataJson,
   };
 }
 
@@ -191,6 +201,54 @@ function parseGoogleLimits(load: any): OAuthLimitWindow[] {
     windows.push({ label: load?.paidTier?.name ?? load?.currentTier?.name ?? 'Account quota', usedPercent: null, resetAfterSeconds: null, resetAt: null });
   }
   return windows;
+}
+
+
+function normalizeQwenResourceUrl(metadata: Record<string, unknown> = {}, fallback?: unknown) {
+  let value = typeof metadata.resourceUrl === 'string' && metadata.resourceUrl.trim().length > 0
+    ? metadata.resourceUrl.trim()
+    : typeof metadata.qwenResourceUrl === 'string' && metadata.qwenResourceUrl.trim().length > 0
+      ? metadata.qwenResourceUrl.trim()
+      : typeof fallback === 'string' && fallback.trim().length > 0
+        ? fallback.trim()
+        : QWEN_DEFAULT_RESOURCE_URL;
+  value = value.replace(/\/+$/, '');
+  if (!value.endsWith('/v1')) value = `${value}/v1`;
+  return value;
+}
+
+function qwenModelRank(modelId: string, index: number) {
+  const lower = modelId.toLowerCase();
+  if (lower.includes('coder') && lower.includes('plus')) return 3;
+  if (lower.includes('coder')) return 4;
+  if (lower.includes('max')) return 5;
+  if (lower.includes('plus')) return 7;
+  return 20 + index;
+}
+
+function qwenSpeedRank(modelId: string) {
+  const lower = modelId.toLowerCase();
+  if (lower.includes('turbo') || lower.includes('flash')) return 2;
+  if (lower.includes('plus')) return 4;
+  if (lower.includes('max')) return 6;
+  return 4;
+}
+
+function qwenSizeLabel(modelId: string) {
+  const lower = modelId.toLowerCase();
+  if (lower.includes('turbo')) return 'Medium';
+  if (lower.includes('coder') || lower.includes('max') || lower.includes('plus')) return 'Frontier';
+  return 'Frontier';
+}
+
+function isQwenCompletionModel(modelId: string) {
+  const lower = modelId.toLowerCase();
+  return !lower.includes('embedding')
+    && !lower.includes('rerank')
+    && !lower.includes('audio')
+    && !lower.includes('image')
+    && !lower.includes('tts')
+    && !lower.includes('asr');
 }
 
 export function updateOAuthModels(db: Database.Database, models: OAuthDiscoveredModel[]) {
@@ -353,6 +411,44 @@ export async function discoverOAuthAccount(db: Database.Database, row: any): Pro
     };
   }
 
+  if (row.provider === 'qwen') {
+    let metadata: Record<string, unknown> = {};
+    try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {}; } catch {}
+    const resourceUrl = normalizeQwenResourceUrl(metadata);
+    const modelsRes = await fetch(`${resourceUrl}/models`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json', 'User-Agent': 'LLMHarbor/0.1.0' },
+    });
+    if (!modelsRes.ok) throw new Error(`Qwen model discovery failed with HTTP ${modelsRes.status}. ${(await modelsRes.text().catch(() => '')).slice(0, 300)}`);
+    const modelsJson = await modelsRes.json() as any;
+    const models = (Array.isArray(modelsJson.data) ? modelsJson.data : [])
+      .filter((model: any) => typeof model?.id === 'string' && model.id.length > 0)
+      .filter((model: any) => isQwenCompletionModel(String(model.id)))
+      .map((model: any, index: number): OAuthDiscoveredModel => {
+        const id = String(model.id);
+        return {
+          id,
+          displayName: `${model.display_name ?? id} (Qwen browser account)`,
+          platform: 'qwen-oauth',
+          priority: qwenModelRank(id, index),
+          speedRank: qwenSpeedRank(id),
+          sizeLabel: qwenSizeLabel(id),
+          contextWindow: typeof model.context_window === 'number' ? model.context_window : null,
+          supported: true,
+          visibility: model.visibility ?? 'list',
+        };
+      });
+    if (models.length === 0) throw new Error('Qwen returned no supported model.completion models.');
+    return {
+      models,
+      limits: [],
+      metadata: {
+        qwenResourceUrl: resourceUrl,
+        qwenModelsUpdatedAt: new Date().toISOString(),
+        qwenModelCount: models.length,
+      },
+    };
+  }
+
   return { models: [], limits: [], metadata: {} };
 }
 
@@ -370,9 +466,10 @@ export async function refreshOAuthAccountInventory(db: Database.Database, accoun
       .run(JSON.stringify(metadata), accountId);
     return { ...discovered, metadata };
   } catch (error: any) {
-    if (row.provider === 'antigravity') {
+    if (row.provider === 'antigravity' || row.provider === 'qwen') {
       const message = String(error?.message ?? error);
-      disableOAuthModelsForPlatform(db, 'google-oauth', message);
+      const platform = row.provider === 'qwen' ? 'qwen-oauth' : 'google-oauth';
+      disableOAuthModelsForPlatform(db, platform, message);
       let metadata = {} as Record<string, unknown>;
       try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {}; } catch {}
       metadata = {
@@ -381,7 +478,9 @@ export async function refreshOAuthAccountInventory(db: Database.Database, accoun
         oauthModelCount: 0,
         oauthDiscoveryError: message,
         oauthNeedsReconnect: /401|403|UNAUTHENTICATED|PERMISSION_DENIED|invalid_grant|invalid authentication|permission/i.test(message),
-        codeAssistUpdatedAt: new Date().toISOString(),
+        ...(row.provider === 'qwen'
+          ? { qwenModelsUpdatedAt: new Date().toISOString() }
+          : { codeAssistUpdatedAt: new Date().toISOString() }),
       };
       db.prepare("UPDATE oauth_accounts SET metadata_json = ?, last_discovered_at = datetime('now') WHERE id = ?")
         .run(JSON.stringify(metadata), accountId);

@@ -12,7 +12,7 @@ interface OAuthProvider {
   kind: string
   scopes: string[]
   supportsDiscovery: boolean
-  loginMode: 'browser-oauth'
+  loginMode: 'browser-oauth' | 'device-oauth'
   authorizationUrl: string
   callbackPath: string
   configured: boolean
@@ -20,10 +20,28 @@ interface OAuthProvider {
   notes: string
 }
 
-interface StartLoginResponse {
+interface BrowserStartLoginResponse {
   authUrl: string
   callbackUrl: string
   loginMode: 'browser-oauth'
+}
+
+interface DeviceStartLoginResponse {
+  authUrl: string
+  state: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete: string
+  expiresInSeconds: number
+  intervalSeconds: number
+  loginMode: 'device-oauth'
+}
+
+type StartLoginResponse = BrowserStartLoginResponse | DeviceStartLoginResponse
+type ActiveConnection = StartLoginResponse & { providerId: string }
+interface CompleteDeviceResponse {
+  pending?: boolean
+  account?: OAuthAccount
 }
 
 interface AccountLimit {
@@ -95,7 +113,7 @@ export default function OAuthPage() {
   const queryClient = useQueryClient()
   const [selectedAccount, setSelectedAccount] = useState<number | null>(null)
   const [renaming, setRenaming] = useState<Record<number, string>>({})
-  const [activeConnection, setActiveConnection] = useState<StartLoginResponse | null>(null)
+  const [activeConnection, setActiveConnection] = useState<ActiveConnection | null>(null)
 
   const { data: providerData } = useQuery<{ providers: OAuthProvider[] }>({ queryKey: ['oauth-providers'], queryFn: () => apiFetch('/api/oauth/providers') })
   const { data: accountData } = useQuery<{ accounts: OAuthAccount[] }>({ queryKey: ['oauth-accounts'], queryFn: () => apiFetch('/api/oauth/accounts') })
@@ -104,9 +122,26 @@ export default function OAuthPage() {
 
   const startLogin = useMutation({
     mutationFn: (provider: OAuthProvider) => apiFetch<StartLoginResponse>(`/api/oauth/connect/${provider.id}/start`, { method: 'POST' }),
+    onSuccess: (data, provider) => {
+      setActiveConnection({ ...data, providerId: provider.id })
+      if (data.loginMode === 'browser-oauth') {
+        window.location.href = data.authUrl
+      } else {
+        window.open(data.authUrl, '_blank', 'noopener,noreferrer')
+      }
+    },
+  })
+
+  const completeDeviceLogin = useMutation({
+    mutationFn: ({ providerId, state }: { providerId: string; state: string }) => apiFetch<CompleteDeviceResponse>(`/api/oauth/connect/${providerId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ state }),
+    }),
     onSuccess: (data) => {
-      setActiveConnection(data)
-      window.location.href = data.authUrl
+      if (data.account) {
+        setActiveConnection(null)
+        queryClient.invalidateQueries({ queryKey: ['oauth-accounts'] })
+      }
     },
   })
 
@@ -142,10 +177,27 @@ export default function OAuthPage() {
           {startLogin.error && <p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{startLogin.error.message}</p>}
           {activeConnection && (
             <div className="mt-4 rounded-2xl border border-border bg-muted/60 p-4 text-sm">
-              <p className="font-medium text-foreground">Browser OAuth started</p>
-              <p className="mt-2 text-muted-foreground">If the provider did not open, use this authorization link:</p>
-              <a className="mt-2 block break-all text-xs underline" href={activeConnection.authUrl}>{activeConnection.authUrl}</a>
-              <p className="mt-3 break-all text-xs text-muted-foreground">Callback: {activeConnection.callbackUrl}</p>
+              {activeConnection.loginMode === 'browser-oauth' ? (
+                <>
+                  <p className="font-medium text-foreground">Browser OAuth started</p>
+                  <p className="mt-2 text-muted-foreground">If the provider did not open, use this authorization link:</p>
+                  <a className="mt-2 block break-all text-xs underline" href={activeConnection.authUrl}>{activeConnection.authUrl}</a>
+                  <p className="mt-3 break-all text-xs text-muted-foreground">Callback: {activeConnection.callbackUrl}</p>
+                </>
+              ) : (
+                <>
+                  <p className="font-medium text-foreground">Device authorization started</p>
+                  <p className="mt-2 text-muted-foreground">Approve this code in Qwen, then return here to complete the connection.</p>
+                  <div className="mt-3 rounded-xl border border-border bg-background px-3 py-3 text-center font-mono text-lg tracking-[0.18em] text-foreground">{activeConnection.userCode}</div>
+                  <a className="mt-3 block break-all text-xs underline" href={activeConnection.authUrl} target="_blank" rel="noreferrer">{activeConnection.authUrl}</a>
+                  <p className="mt-2 text-xs text-muted-foreground">Expires in {Math.round(activeConnection.expiresInSeconds / 60)} minutes.</p>
+                  {completeDeviceLogin.data?.pending && <p className="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">Qwen has not confirmed the approval yet. Wait a moment, then try again.</p>}
+                  {completeDeviceLogin.error && <p className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">{completeDeviceLogin.error.message}</p>}
+                  <Button className="mt-4 w-full" disabled={completeDeviceLogin.isPending} onClick={() => completeDeviceLogin.mutate({ providerId: activeConnection.providerId, state: activeConnection.state })}>
+                    {completeDeviceLogin.isPending ? 'Checking approval...' : 'I approved it in Qwen'}
+                  </Button>
+                </>
+              )}
             </div>
           )}
           <div className="mt-5 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-2">
@@ -174,7 +226,7 @@ export default function OAuthPage() {
                 </div>
                 <p className="mt-4 truncate rounded-xl bg-muted px-3 py-2 text-xs text-muted-foreground">{provider.authorizationUrl}</p>
                 <Button className="mt-4 w-full" disabled={startLogin.isPending || !provider.canConnect} onClick={() => startLogin.mutate(provider)}>
-                  {provider.canConnect ? 'Connect account' : 'Waiting for verified public client'}
+                  {provider.canConnect ? (provider.loginMode === 'device-oauth' ? 'Connect with device code' : 'Connect account') : 'Waiting for verified public client'}
                 </Button>
               </article>
             ))}

@@ -9,6 +9,7 @@ export type BuiltInPlatform =
   | 'openai'
   | 'google'
   | 'google-oauth'
+  | 'qwen-oauth'
   | 'groq'
   | 'cerebras'
   | 'sambanova'

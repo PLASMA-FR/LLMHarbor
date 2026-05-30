@@ -107,6 +107,41 @@ describe('OAuth model discovery', () => {
     expect(apiRows.c).toBe(0);
   });
 
+  it('discovers Qwen OAuth OpenAI-compatible models from the token resource URL', async () => {
+    const db = initDb(':memory:');
+    initEncryptionKey(db);
+    const access = encrypt('qwen-access-token');
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      expect(urlStr).toBe('https://portal.qwen.ai/custom-openai-compatible/v1/models');
+      expect((init as any).headers.Authorization).toBe('Bearer qwen-access-token');
+      return Response.json({ data: [
+        { id: 'qwen3-coder-plus', object: 'model', owned_by: 'qwen' },
+        { id: 'qwen-plus', object: 'model', owned_by: 'qwen' },
+        { id: 'text-embedding-v4', object: 'model', owned_by: 'qwen' },
+      ] });
+    });
+
+    const discovered = await discoverOAuthAccount(db, {
+      provider: 'qwen',
+      encrypted_access_token: access.encrypted,
+      access_iv: access.iv,
+      access_auth_tag: access.authTag,
+      metadata_json: JSON.stringify({ resourceUrl: 'https://portal.qwen.ai/custom-openai-compatible/v1' }),
+    });
+
+    expect(discovered.models.map(model => model.id)).toEqual(['qwen3-coder-plus', 'qwen-plus']);
+    expect(discovered.models.every(model => model.platform === 'qwen-oauth')).toBe(true);
+    expect(discovered.metadata.qwenResourceUrl).toBe('https://portal.qwen.ai/custom-openai-compatible/v1');
+    updateOAuthModels(db, discovered.models);
+    const rows = db.prepare("SELECT platform, model_id, enabled FROM models WHERE platform = 'qwen-oauth' AND display_name LIKE '%browser account%' ORDER BY model_id").all() as any[];
+    expect(rows).toEqual([
+      { platform: 'qwen-oauth', model_id: 'qwen-plus', enabled: 1 },
+      { platform: 'qwen-oauth', model_id: 'qwen3-coder-plus', enabled: 1 },
+    ]);
+  });
+
   it('refreshes an expired Antigravity access token before live Code Assist model discovery', async () => {
     const db = initDb(':memory:');
     initEncryptionKey(db);
@@ -147,6 +182,47 @@ describe('OAuth model discovery', () => {
     expect(discovered.models.map(model => model.id)).toEqual(['gemini-2.5-pro']);
     const updatedKey = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(Number(key.lastInsertRowid)) as any;
     expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh');
+  });
+
+  it('refreshes an expired Qwen access token before OpenAI-compatible model discovery', async () => {
+    const db = initDb(':memory:');
+    initEncryptionKey(db);
+    const staleAccess = encrypt('stale-qwen-access-token');
+    const refresh = encrypt('qwen-refresh-token');
+    const account = db.prepare(`
+      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, metadata_json, enabled)
+      VALUES ('qwen', 'Qwen browser', 'Qwen account', ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString(), JSON.stringify({ resourceUrl: 'https://portal.qwen.ai/custom-openai-compatible/v1' }));
+    const key = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('qwen-oauth', 'Qwen browser', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, Number(account.lastInsertRowid));
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr === 'https://chat.qwen.ai/api/v1/oauth2/token') {
+        const params = new URLSearchParams(String((init as any).body));
+        expect(params.get('grant_type')).toBe('refresh_token');
+        expect(params.get('client_id')).toBe('f0304373b74a44d2b584a3fb70ca9e56');
+        expect(params.get('refresh_token')).toBe('qwen-refresh-token');
+        expect(params.has('client_secret')).toBe(false);
+        return Response.json({ access_token: 'fresh-qwen', refresh_token: 'fresh-qwen-refresh', expires_in: 3600, token_type: 'Bearer', resource_url: 'https://portal.qwen.ai/custom-openai-compatible' });
+      }
+      if (urlStr === 'https://portal.qwen.ai/custom-openai-compatible/v1/models') {
+        expect((init as any).headers.Authorization).toBe('Bearer fresh-qwen');
+        return Response.json({ data: [{ id: 'qwen3-coder-plus', object: 'model', owned_by: 'qwen' }] });
+      }
+      throw new Error(`unexpected URL ${urlStr}`);
+    });
+
+    const discovered = await refreshOAuthAccountInventory(db, Number(account.lastInsertRowid));
+
+    expect(discovered.models.map(model => model.id)).toEqual(['qwen3-coder-plus']);
+    expect(discovered.metadata.qwenResourceUrl).toBe('https://portal.qwen.ai/custom-openai-compatible/v1');
+    const updatedKey = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(Number(key.lastInsertRowid)) as any;
+    expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh-qwen');
+    const metadata = JSON.parse((db.prepare('SELECT metadata_json FROM oauth_accounts WHERE id = ?').get(Number(account.lastInsertRowid)) as any).metadata_json);
+    expect(metadata.resourceUrl).toBe('https://portal.qwen.ai/custom-openai-compatible/v1');
   });
 
   it('keeps OAuth keys healthy without validating browser tokens against API-key endpoints', async () => {
