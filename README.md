@@ -620,12 +620,6 @@ LLMHarbor is a self-hosted routing tool. It does not bypass provider terms, quot
 
 Use a free Google account for Antigravity OAuth instead of your primary, paid, work, school, or Google Workspace account. Do not connect an account you cannot afford to lose.
 
-### Safe defaults
-
-- Use one disposable or low-risk account per provider.
-- Do not resell access or expose a public shared endpoint.
-- Do not depend on trial-only APIs for production.
-- Do not use traffic volume that looks like a commercial relay.
 - Read the terms for every provider you connect.
 
 This is not legal advice. LLMHarbor contributors are not responsible for provider bans, quota changes, account suspensions, or service interruptions.
