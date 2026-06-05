@@ -8,6 +8,7 @@ import { recordRequest, recordTokens, setCooldown, getNextCooldownDuration } fro
 import { authenticateClientApiKey, checkClientApiKeyLimits, getDb, recordClientApiKeyUsage, type AuthenticatedClientApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { getClientModelAccessDenial, isClientRouteAllowed, localApiRouteDenied, type ClientAccessDenial } from '../services/accessPolicy.js';
+import { parseLocalModelId, toLocalModelId } from '../services/localModelIds.js';
 
 export const proxyRouter = Router();
 
@@ -153,7 +154,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         context_window: null,
       },
       ...allowedModels.map(m => ({
-        id: m.model_id,
+        id: toLocalModelId(m.platform, m.model_id),
         object: 'model',
         created: 0,
         owned_by: m.platform,
@@ -386,11 +387,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(messages);
   } else if (requestedModel) {
     const db = getDb();
-    const enabled = db.prepare(`
-      SELECT m.id, m.platform, m.model_id, m.display_name
-        FROM models m
-       WHERE m.model_id = ?
-         AND m.enabled = 1
+    const localModel = parseLocalModelId(requestedModel);
+    const routeablePredicate = `
+         m.enabled = 1
          AND EXISTS (
            SELECT 1 FROM api_keys ak
            LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
@@ -401,9 +400,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 ak.source != 'oauth'
                 OR (oa.enabled = 1 AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1)
               )
-         )
-       ORDER BY CASE WHEN m.display_name LIKE '%browser account%' THEN 0 ELSE 1 END, m.intelligence_rank ASC, m.id ASC
-       LIMIT 1
+         )`;
+    const routeableOrder = `ORDER BY CASE WHEN m.display_name LIKE '%browser account%' THEN 0 ELSE 1 END, m.intelligence_rank ASC, m.id ASC LIMIT 1`;
+    const enabledByLocalId = localModel ? db.prepare(`
+      SELECT m.id, m.platform, m.model_id, m.display_name
+        FROM models m
+       WHERE m.platform = ?
+         AND m.model_id = ?
+         AND ${routeablePredicate}
+       ${routeableOrder}
+    `).get(localModel.platform, localModel.modelId) as { id: number; platform: string; model_id: string; display_name: string } | undefined : undefined;
+    const enabled = enabledByLocalId ?? db.prepare(`
+      SELECT m.id, m.platform, m.model_id, m.display_name
+        FROM models m
+       WHERE m.model_id = ?
+         AND ${routeablePredicate}
+       ${routeableOrder}
     `).get(requestedModel) as { id: number; platform: string; model_id: string; display_name: string } | undefined;
     if (enabled) {
       const denial = getClientModelAccessDenial(clientKey.id, {
@@ -418,11 +430,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
       preferredModel = enabled.id;
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
-      const reason = disabled ? 'is disabled' : 'is not in the catalog';
+      const disabledByLocalId = localModel ? db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(localModel.platform, localModel.modelId) as { id: number } | undefined : undefined;
+      const disabled = disabledByLocalId ?? db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      const reason = disabled ? 'is disabled or has no routeable key' : 'is not in the catalog';
       res.status(400).json({
         error: {
-          message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+          message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available provider/model list.`,
           type: 'invalid_request_error',
           code: 'model_not_found',
         },
@@ -486,6 +499,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           );
 
           for await (const chunk of gen) {
+            const localRouteModelId = toLocalModelId(route.platform, route.modelId);
             if (!streamStarted) {
               res.setHeader('Content-Type', 'text/event-stream');
               res.setHeader('Cache-Control', 'no-cache');
@@ -496,7 +510,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
             const text = chunk.choices[0]?.delta?.content ?? '';
             totalOutputTokens += Math.ceil(text.length / 4);
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            res.write(`data: ${JSON.stringify({ ...chunk, model: localRouteModelId })}\n\n`);
           }
 
           if (!streamStarted) {
@@ -536,6 +550,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
 
         const totalTokens = result.usage?.total_tokens ?? estimatedTotal;
+        const localRouteModelId = toLocalModelId(route.platform, route.modelId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordClientApiKeyUsage(clientKey.id, totalTokens);
         recordSuccess(route.modelDbId);
@@ -543,7 +558,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
-        res.json(result);
+        res.json({
+          ...result,
+          model: localRouteModelId,
+          _routed_via: { platform: route.platform, model: route.modelId },
+        });
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',

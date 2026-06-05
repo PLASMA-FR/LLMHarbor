@@ -64,8 +64,9 @@ describe('Virtual "auto" model', () => {
       object: 'model',
       owned_by: 'llmharbor',
     });
-    // Real routeable catalog models still follow.
+    // Real routeable catalog models still follow and are exposed as provider/model.
     expect(body.data.length).toBeGreaterThan(1);
+    expect(body.data.some((m: any) => typeof m.id === 'string' && m.id.startsWith('groq/'))).toBe(true);
   });
 
   it('hides browser-account models from /v1/models when no live OAuth key can route them', async () => {
@@ -77,7 +78,7 @@ describe('Virtual "auto" model', () => {
     db.prepare("UPDATE models SET enabled = 1 WHERE platform = 'openai' AND model_id = 'gpt-browser-routeable-test'").run();
 
     const withoutKey = await request(app, 'GET', '/v1/models', undefined, authHeaders());
-    expect(withoutKey.body.data.map((m: any) => m.id)).not.toContain('gpt-browser-routeable-test');
+    expect(withoutKey.body.data.map((m: any) => m.id)).not.toContain('openai/gpt-browser-routeable-test');
 
     const token = encrypt('oauth-access-token');
     const account = db.prepare(`
@@ -90,11 +91,11 @@ describe('Virtual "auto" model', () => {
     `).run(token.encrypted, token.iv, token.authTag, Number(account.lastInsertRowid));
 
     const reconnecting = await request(app, 'GET', '/v1/models', undefined, authHeaders());
-    expect(reconnecting.body.data.map((m: any) => m.id)).not.toContain('gpt-browser-routeable-test');
+    expect(reconnecting.body.data.map((m: any) => m.id)).not.toContain('openai/gpt-browser-routeable-test');
 
     db.prepare("UPDATE oauth_accounts SET metadata_json = '{}' WHERE id = ?").run(Number(account.lastInsertRowid));
     const routeable = await request(app, 'GET', '/v1/models', undefined, authHeaders());
-    expect(routeable.body.data.map((m: any) => m.id)).toContain('gpt-browser-routeable-test');
+    expect(routeable.body.data.map((m: any) => m.id)).toContain('openai/gpt-browser-routeable-test');
   });
 
   it('treats model:"auto" as auto-route instead of a 400', async () => {
@@ -206,6 +207,79 @@ describe('Virtual "auto" model', () => {
 
     expect(status).toBe(400);
     expect(body.error.code).toBe('model_not_found');
+  });
+
+  it('accepts provider/model IDs on the local API and returns the routed provider/model id', async () => {
+    const origFetch = global.fetch;
+    let upstreamModel: string | undefined;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        upstreamModel = JSON.parse(String(init?.body ?? '{}')).model;
+        return Response.json({
+          id: 'chatcmpl-prefixed-model',
+          object: 'chat.completion',
+          created: 123,
+          model: upstreamModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'routed by provider/model id' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
+        });
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body, headers } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'groq/llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: 'hello' }],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(upstreamModel).toBe('llama-3.3-70b-versatile');
+    expect(headers.get('x-routed-via')).toBe('groq/llama-3.3-70b-versatile');
+    expect(body.model).toBe('groq/llama-3.3-70b-versatile');
+    expect(body._routed_via).toEqual({ platform: 'groq', model: 'llama-3.3-70b-versatile' });
+  });
+
+  it('does not confuse an unprefixed model id that itself contains slashes with provider/model parsing', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('openrouter', 'openai/gpt-oss-120b:free', 'GPT-OSS 120B (OpenRouter Free)', 1, 1, 'Large', 1)
+    `).run();
+    db.prepare("UPDATE models SET enabled = 1 WHERE platform = 'openrouter' AND model_id = 'openai/gpt-oss-120b:free'").run();
+    const token = encrypt('openrouter-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ('openrouter', 'openrouter slash model', ?, ?, ?, 'healthy', 1)
+    `).run(token.encrypted, token.iv, token.authTag);
+
+    const origFetch = global.fetch;
+    let upstreamModel: string | undefined;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('openrouter.ai/api/v1/chat/completions')) {
+        upstreamModel = JSON.parse(String(init?.body ?? '{}')).model;
+        return Response.json({
+          id: 'chatcmpl-slashy-legacy-model',
+          object: 'chat.completion',
+          created: 123,
+          model: upstreamModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'legacy slash id still works' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
+        });
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'openai/gpt-oss-120b:free',
+      messages: [{ role: 'user', content: 'hello' }],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(upstreamModel).toBe('openai/gpt-oss-120b:free');
+    expect(body.model).toBe('openrouter/openai/gpt-oss-120b:free');
   });
 
   it('does not fall back to a different model when an explicit catalog model fails upstream', async () => {

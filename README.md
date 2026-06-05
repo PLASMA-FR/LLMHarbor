@@ -73,7 +73,7 @@ It is not meant to sell free tiers as production infrastructure. It is meant to 
 
 | Area | What LLMHarbor does |
 |---|---|
-| OpenAI compatibility | `POST /v1/chat/completions` and `GET /v1/models` work with OpenAI-style SDKs and clients. |
+| OpenAI compatibility | `POST /v1/chat/completions` and `GET /v1/models` work with OpenAI-style SDKs and clients. Model IDs are exposed as `provider/model` so duplicate upstream IDs stay unambiguous. |
 | Auto routing | Use `model: "auto"` and let the router choose the highest-priority healthy model under quota. |
 | Fallbacks | On 429, 5xx, timeout, or provider failure, LLMHarbor cools that key down and tries the next enabled route. |
 | Streaming | Server-Sent Events are supported for `stream: true`. |
@@ -260,7 +260,54 @@ npm run build
 node server/dist/index.js
 ```
 
-The production server serves the API and built dashboard on port `3001`.
+The production server serves the API and built dashboard on port `3001` by default. If you want the bundled CLI as a hosted custom start command, run it in foreground mode instead of using the background daemon wrapper:
+
+```bash
+llmharbor start --foreground --host 0.0.0.0 --port "${PORT:-3001}"
+```
+
+For local machines, omit `--foreground` to keep using the managed PID/log flow:
+
+```bash
+llmharbor start --host 127.0.0.1 --port 3001
+llmharbor status
+llmharbor logs
+```
+
+### Tailscale dashboard + public API split
+
+Use split mode when you want the dashboard/control plane reachable only on your Tailscale IP while the OpenAI-compatible API is reachable on the machine's public IP. The public listener only serves `/v1/*` plus `/api/ping`; dashboard pages and key-management routes are not mounted there.
+
+```bash
+# Detect your Tailscale IPv4 and write the split listener settings to .env.
+# Defaults: dashboard http://<tailscale-ip>:3002, public API http://<public-ip>:3001/v1
+llmharbor tailscale
+llmharbor restart
+llmharbor url
+```
+
+You can also pass the listener settings directly to `start`/`restart` without editing `.env`. Use `--foreground` for hosted custom start commands; omit it for the local background daemon. Add `--save` if you want the flags written to `.env` for future starts.
+
+```bash
+llmharbor start --foreground \
+  --dashboard-host 100.x.y.z \
+  --dashboard-port 3002 \
+  --public-api-host 0.0.0.0 \
+  --public-api-port 3001 \
+  --trusted-network
+```
+
+Equivalent `.env` shape:
+
+```dotenv
+LLMHARBOR_DASHBOARD_HOST=100.x.y.z
+LLMHARBOR_DASHBOARD_PORT=3002
+LLMHARBOR_DASHBOARD_TRUSTED_NETWORK=1
+LLMHARBOR_PUBLIC_API_HOST=0.0.0.0
+LLMHARBOR_PUBLIC_API_PORT=3001
+```
+
+Keep a firewall in front of the public port and use scoped `llmharbor-*` client keys for apps that call the public `/v1` API.
 
 ## Using the API
 
@@ -278,7 +325,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="auto",
+    model="auto",  # or e.g. "groq/llama-3.3-70b-versatile" from GET /v1/models
     messages=[
         {"role": "user", "content": "Explain SQLite WAL mode in two sentences."}
     ],
@@ -299,6 +346,7 @@ curl http://localhost:3001/v1/chat/completions \
   }'
 ```
 
+`GET /v1/models` returns `auto` first, followed by routeable catalog entries such as `groq/llama-3.3-70b-versatile` or `openrouter/openai/gpt-oss-120b:free`. Send those exact provider-prefixed IDs when you want to pin a provider/model instead of auto-routing.
 
 ### Client key access policies
 

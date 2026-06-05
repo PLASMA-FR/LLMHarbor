@@ -37,6 +37,10 @@ function RoutePill({ label, value }: { label: string; value: string }) {
   )
 }
 
+function localModelId(model: Pick<FallbackEntry, 'platform' | 'modelId'>) {
+  return `${model.platform}/${model.modelId}`
+}
+
 export default function PlaygroundPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
@@ -145,7 +149,7 @@ export default function PlaygroundPage() {
 
   const activeModelLabel = selectedModel === 'auto'
     ? 'Auto routing'
-    : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
+    : availableModels.find(m => localModelId(m) === selectedModel)?.displayName ?? selectedModel
 
   const lastMeta = [...messages].reverse().find(m => m.meta)?.meta
 
@@ -163,9 +167,10 @@ export default function PlaygroundPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="auto">Auto routing</SelectItem>
-                {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>{m.displayName}, {m.platform}</SelectItem>
-                ))}
+                {availableModels.map(m => {
+                  const id = localModelId(m)
+                  return <SelectItem key={m.modelDbId} value={id}>{m.displayName}, {id}</SelectItem>
+                })}
               </SelectContent>
             </Select>
             {messages.length > 0 && <Button variant="outline" size="sm" onClick={handleClear}>Clear thread</Button>}

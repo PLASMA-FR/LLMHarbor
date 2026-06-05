@@ -3,6 +3,11 @@ set -Eeuo pipefail
 
 APP_NAME="LLMHarbor"
 DEFAULT_PORT="3001"
+DEFAULT_TAILSCALE_DASHBOARD_PORT="3002"
+DEFAULT_PUBLIC_API_PORT="3001"
+START_FOREGROUND=false
+START_SAVE=false
+declare -a START_OVERRIDES=()
 
 log() {
   printf '%s\n' "$*" >&2
@@ -44,21 +49,49 @@ Usage:
 Commands:
   install       Install npm dependencies, create .env, and build production assets
   dev           Run the API and dashboard in development mode
-  start         Start the production server in the background
+  start         Start the production server in the background, or foreground with --foreground
   stop          Stop the background production server
-  restart       Restart the background production server
+  restart       Restart the background production server; accepts the same options as start
   status        Show process and health-check status
   logs          Follow background server logs
   update        Pull latest git changes, rebuild, and restart if already running
+  tailscale     Configure split mode: dashboard on Tailscale, public /v1 API on all interfaces
   open          Open the dashboard in your browser
   url           Print dashboard and OpenAI-compatible API URLs
   doctor        Check local prerequisites
   help          Show this help
 
+Start options:
+  llmharbor start [--foreground] [--host HOST] [--port PORT]
+  llmharbor start --dashboard-host HOST --dashboard-port PORT \
+    --public-api-host HOST --public-api-port PORT [--trusted-network]
+
+  --foreground, --fg, --no-daemon       Run in the foreground for hosted custom start commands
+  --host HOST                           Dashboard/single-listener bind host alias
+  --port PORT                           Dashboard/single-listener port alias
+  --dashboard-host HOST                 Private dashboard/control-plane bind host
+  --dashboard-port PORT                 Private dashboard/control-plane port
+  --public-api-host HOST, --api-host HOST
+                                        Public OpenAI-compatible API bind host
+  --public-api-port PORT, --api-port PORT
+                                        Public API port; enables split mode
+  --split                               Enable split mode with default public API port 3001
+  --trusted-network                     Allow dashboard control-plane API on the private bind
+  --save                                Persist the supplied start options to .env
+
 Environment:
-  LLMHARBOR_HOME=/path/to/LLMHarbor   Override project directory
-  PORT=3001                           Override server port for this invocation
-  HOST=127.0.0.1                      Bind address; use 0.0.0.0 only behind network controls
+  LLMHARBOR_HOME=/path/to/LLMHarbor        Override project directory
+
+  # Single-listener/default mode
+  PORT=3001                                Dashboard/API port
+  HOST=127.0.0.1                           Bind address
+
+  # Split mode: dashboard private, OpenAI-compatible API public
+  LLMHARBOR_DASHBOARD_HOST=100.x.y.z       Tailscale/VPN IP for the dashboard listener
+  LLMHARBOR_DASHBOARD_PORT=3002            Dashboard port
+  LLMHARBOR_DASHBOARD_TRUSTED_NETWORK=1    Allow dashboard control-plane over that private bind
+  LLMHARBOR_PUBLIC_API_HOST=0.0.0.0        Public API bind address
+  LLMHARBOR_PUBLIC_API_PORT=3001           Public API port; enables split mode
 EOF
 }
 
@@ -78,16 +111,229 @@ read_env_value() {
   grep -E "^${key}=" "$file" | tail -n 1 | cut -d= -f2- || return 1
 }
 
-current_port() {
-  local port
-  if [[ -n "${PORT:-}" ]]; then
-    port="$PORT"
-  else
-    port="$(read_env_value PORT 2>/dev/null || printf '%s\n' "$DEFAULT_PORT")"
+lookup_value() {
+  local key="$1"
+  if [[ -n "${!key:-}" ]]; then
+    printf '%s\n' "${!key}"
+    return 0
   fi
-  [[ "$port" =~ ^[0-9]+$ ]] || fail "PORT must be numeric: $port"
-  (( port >= 1 && port <= 65535 )) || fail "PORT must be between 1 and 65535: $port"
+  read_env_value "$key"
+}
+
+value_or_default() {
+  local key="$1"
+  local fallback="$2"
+  lookup_value "$key" 2>/dev/null || printf '%s\n' "$fallback"
+}
+
+validate_port() {
+  local label="$1"
+  local port="$2"
+  [[ "$port" =~ ^[0-9]+$ ]] || fail "$label must be numeric: $port"
+  (( port >= 1 && port <= 65535 )) || fail "$label must be between 1 and 65535: $port"
+}
+
+require_option_value() {
+  local opt="$1"
+  local value="${2:-}"
+  [[ -n "$value" && "$value" != --* ]] || fail "$opt requires a value"
+  printf '%s\n' "$value"
+}
+
+set_start_override() {
+  local key="$1"
+  local value="$2"
+  export "$key=$value"
+  START_OVERRIDES+=("$key=$value")
+}
+
+set_start_port_override() {
+  local key="$1"
+  local value="$2"
+  validate_port "$key" "$value"
+  set_start_override "$key" "$value"
+}
+
+persist_start_overrides() {
+  local assignment key value
+  for assignment in "${START_OVERRIDES[@]}"; do
+    key="${assignment%%=*}"
+    value="${assignment#*=}"
+    upsert_env_value "$key" "$value"
+  done
+}
+
+parse_start_options() {
+  START_FOREGROUND=false
+  START_SAVE=false
+  START_OVERRIDES=()
+
+  local value
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --foreground|--fg|--no-daemon)
+        START_FOREGROUND=true
+        shift
+        ;;
+      --background|--daemon)
+        START_FOREGROUND=false
+        shift
+        ;;
+      --host|--dashboard-host)
+        value="$(require_option_value "$1" "${2:-}")"
+        set_start_override LLMHARBOR_DASHBOARD_HOST "$value"
+        shift 2
+        ;;
+      --host=*|--dashboard-host=*)
+        value="${1#*=}"
+        [[ -n "$value" ]] || fail "${1%%=*} requires a value"
+        set_start_override LLMHARBOR_DASHBOARD_HOST "$value"
+        shift
+        ;;
+      --port|--dashboard-port)
+        value="$(require_option_value "$1" "${2:-}")"
+        set_start_port_override LLMHARBOR_DASHBOARD_PORT "$value"
+        shift 2
+        ;;
+      --port=*|--dashboard-port=*)
+        value="${1#*=}"
+        set_start_port_override LLMHARBOR_DASHBOARD_PORT "$value"
+        shift
+        ;;
+      --public-api-host|--api-host)
+        value="$(require_option_value "$1" "${2:-}")"
+        set_start_override LLMHARBOR_PUBLIC_API_HOST "$value"
+        shift 2
+        ;;
+      --public-api-host=*|--api-host=*)
+        value="${1#*=}"
+        [[ -n "$value" ]] || fail "${1%%=*} requires a value"
+        set_start_override LLMHARBOR_PUBLIC_API_HOST "$value"
+        shift
+        ;;
+      --public-api-port|--api-port)
+        value="$(require_option_value "$1" "${2:-}")"
+        set_start_port_override LLMHARBOR_PUBLIC_API_PORT "$value"
+        shift 2
+        ;;
+      --public-api-port=*|--api-port=*)
+        value="${1#*=}"
+        set_start_port_override LLMHARBOR_PUBLIC_API_PORT "$value"
+        shift
+        ;;
+      --split)
+        if [[ -z "${LLMHARBOR_PUBLIC_API_PORT:-}" ]]; then
+          set_start_port_override LLMHARBOR_PUBLIC_API_PORT "$DEFAULT_PUBLIC_API_PORT"
+        fi
+        shift
+        ;;
+      --trusted-network|--dashboard-trusted-network)
+        set_start_override LLMHARBOR_DASHBOARD_TRUSTED_NETWORK "1"
+        shift
+        ;;
+      --local-control-plane)
+        set_start_override LLMHARBOR_DASHBOARD_TRUSTED_NETWORK "0"
+        set_start_override LLMHARBOR_ALLOW_REMOTE_CONTROL_PLANE "0"
+        shift
+        ;;
+      --save)
+        START_SAVE=true
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        [[ $# -eq 0 ]] || fail "Unexpected start argument after --: $*"
+        ;;
+      *)
+        fail "Unknown start option: $1"
+        ;;
+    esac
+  done
+
+  if [[ "$START_SAVE" == "true" ]]; then
+    persist_start_overrides
+  fi
+}
+
+first_value() {
+  local fallback="$1"
+  shift
+  local key value
+  for key in "$@"; do
+    if value="$(lookup_value "$key" 2>/dev/null)"; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  done
+  printf '%s\n' "$fallback"
+}
+
+current_dashboard_port() {
+  local legacy port
+  legacy="$(value_or_default PORT "$DEFAULT_PORT")"
+  port="$(first_value "$legacy" LLMHARBOR_DASHBOARD_PORT DASHBOARD_PORT)"
+  validate_port LLMHARBOR_DASHBOARD_PORT "$port"
   printf '%s\n' "$port"
+}
+
+current_dashboard_host() {
+  local legacy
+  legacy="$(value_or_default HOST "127.0.0.1")"
+  first_value "$legacy" LLMHARBOR_DASHBOARD_HOST DASHBOARD_HOST
+}
+
+current_public_api_port() {
+  local port=""
+  if port="$(lookup_value LLMHARBOR_PUBLIC_API_PORT 2>/dev/null)"; then
+    :
+  elif port="$(lookup_value PUBLIC_API_PORT 2>/dev/null)"; then
+    :
+  elif port="$(lookup_value API_PORT 2>/dev/null)"; then
+    :
+  else
+    return 1
+  fi
+  validate_port LLMHARBOR_PUBLIC_API_PORT "$port"
+  printf '%s\n' "$port"
+}
+
+current_public_api_host() {
+  first_value "0.0.0.0" LLMHARBOR_PUBLIC_API_HOST PUBLIC_API_HOST API_HOST
+}
+
+url_host() {
+  case "$1" in
+    0.0.0.0) printf 'localhost\n' ;;
+    ::) printf '[::1]\n' ;;
+    *:*)
+      if [[ "$1" == \[*\] ]]; then printf '%s\n' "$1"; else printf '[%s]\n' "$1"; fi
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+public_url_host() {
+  case "$1" in
+    0.0.0.0|::) printf '<public-ip>\n' ;;
+    *) url_host "$1" ;;
+  esac
+}
+
+dashboard_url() {
+  printf 'http://%s:%s\n' "$(url_host "$(current_dashboard_host)")" "$(current_dashboard_port)"
+}
+
+api_base_url() {
+  local api_port
+  if api_port="$(current_public_api_port 2>/dev/null)"; then
+    printf 'http://%s:%s/v1\n' "$(public_url_host "$(current_public_api_host)")" "$api_port"
+  else
+    printf '%s/v1\n' "$(dashboard_url)"
+  fi
 }
 
 make_encryption_key() {
@@ -117,6 +363,27 @@ ensure_env() {
   fi
 }
 
+upsert_env_value() {
+  local key="$1"
+  local value="$2"
+  local file="$PROJECT_ROOT/.env"
+  local tmp
+  ensure_env
+  tmp="$(mktemp)"
+  if grep -qE "^${key}=" "$file"; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        "$key"=*) printf '%s=%s\n' "$key" "$value" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$file" > "$tmp"
+  else
+    cat "$file" > "$tmp"
+    printf '\n%s=%s\n' "$key" "$value" >> "$tmp"
+  fi
+  mv "$tmp" "$file"
+}
+
 install_app() {
   cd_project
   require_cmd node
@@ -137,10 +404,26 @@ is_running() {
 
 start_app() {
   cd_project
+  parse_start_options "$@"
   require_cmd node
   require_cmd npm
   ensure_env
   mkdir -p "$STATE_DIR"
+
+  if [[ "$START_FOREGROUND" == "true" ]]; then
+    if is_running; then
+      fail "$APP_NAME is already running with PID $(<"$PID_FILE"). Stop it first or omit --foreground for managed background mode."
+    fi
+
+    if [[ ! -f server/dist/index.js || ! -f client/dist/index.html ]]; then
+      log "Production build not found. Building first..."
+      npm run build
+    fi
+
+    log "$APP_NAME starting in foreground"
+    print_urls >&2
+    exec env NODE_ENV=production node server/dist/index.js
+  fi
 
   if is_running; then
     log "$APP_NAME is already running with PID $(<"$PID_FILE")"
@@ -152,10 +435,8 @@ start_app() {
     npm run build
   fi
 
-  local port
-  port="$(current_port)"
   : > "$LOG_FILE"
-  PORT="$port" NODE_ENV=production nohup node server/dist/index.js >> "$LOG_FILE" 2>&1 &
+  NODE_ENV=production nohup node server/dist/index.js >> "$LOG_FILE" 2>&1 &
   local pid=$!
   printf '%s\n' "$pid" > "$PID_FILE"
 
@@ -167,7 +448,8 @@ start_app() {
     exit 1
   fi
 
-  log "$APP_NAME started on http://localhost:$port with PID $pid"
+  log "$APP_NAME started with PID $pid"
+  print_urls >&2
 }
 
 stop_app() {
@@ -197,9 +479,9 @@ stop_app() {
 
 status_app() {
   cd_project
-  local port url
-  port="$(current_port)"
-  url="http://localhost:$port/api/ping"
+  local dashboard health_url api_port api_health
+  dashboard="$(dashboard_url)"
+  health_url="$dashboard/api/ping"
 
   if is_running; then
     printf 'Process: running, PID %s\n' "$(<"$PID_FILE")"
@@ -207,14 +489,28 @@ status_app() {
     printf 'Process: stopped\n'
   fi
 
-  if command_exists curl && curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
-    printf 'Health:  ok (%s)\n' "$url"
+  if command_exists curl && curl -fsS --max-time 2 "$health_url" >/dev/null 2>&1; then
+    printf 'Dashboard: ok (%s)\n' "$dashboard"
   else
-    printf 'Health:  unavailable (%s)\n' "$url"
+    printf 'Dashboard: unavailable (%s)\n' "$dashboard"
   fi
 
-  printf 'Home:    %s\n' "$PROJECT_ROOT"
-  printf 'Logs:    %s\n' "$LOG_FILE"
+  if api_port="$(current_public_api_port 2>/dev/null)"; then
+    local api_host api_health api_display
+    api_host="$(current_public_api_host)"
+    api_health="http://$(url_host "$api_host"):$api_port/api/ping"
+    api_display="http://$(public_url_host "$api_host"):$api_port/v1"
+    if command_exists curl && curl -fsS --max-time 2 "$api_health" >/dev/null 2>&1; then
+      printf 'Public API: ok (%s)\n' "$api_display"
+    else
+      printf 'Public API: unavailable (%s)\n' "$api_display"
+    fi
+  else
+    printf 'Public API: same listener (%s)\n' "$(api_base_url)"
+  fi
+
+  printf 'Home:      %s\n' "$PROJECT_ROOT"
+  printf 'Logs:      %s\n' "$LOG_FILE"
 }
 
 show_logs() {
@@ -240,10 +536,33 @@ update_app() {
   fi
 }
 
+configure_tailscale() {
+  cd_project
+  require_cmd tailscale
+  local dashboard_port="${1:-$DEFAULT_TAILSCALE_DASHBOARD_PORT}"
+  local public_api_port="${2:-$DEFAULT_PUBLIC_API_PORT}"
+  validate_port LLMHARBOR_DASHBOARD_PORT "$dashboard_port"
+  validate_port LLMHARBOR_PUBLIC_API_PORT "$public_api_port"
+
+  local tail_ip
+  tail_ip="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  [[ -n "$tail_ip" ]] || fail "Could not detect a Tailscale IPv4 address. Is Tailscale running?"
+
+  upsert_env_value LLMHARBOR_DASHBOARD_HOST "$tail_ip"
+  upsert_env_value LLMHARBOR_DASHBOARD_PORT "$dashboard_port"
+  upsert_env_value LLMHARBOR_DASHBOARD_TRUSTED_NETWORK "1"
+  upsert_env_value LLMHARBOR_PUBLIC_API_HOST "0.0.0.0"
+  upsert_env_value LLMHARBOR_PUBLIC_API_PORT "$public_api_port"
+
+  log "Configured split mode in $PROJECT_ROOT/.env"
+  log "Dashboard: http://$tail_ip:$dashboard_port"
+  log "Public API: http://<public-ip>:$public_api_port/v1"
+  log "Run: llmharbor restart"
+}
+
 open_app() {
-  local port url
-  port="$(current_port)"
-  url="http://localhost:$port"
+  local url
+  url="$(dashboard_url)"
 
   if command_exists xdg-open; then
     xdg-open "$url" >/dev/null 2>&1 &
@@ -258,11 +577,14 @@ open_app() {
 }
 
 print_urls() {
-  local port
-  port="$(current_port)"
-  printf 'Dashboard: %s\n' "http://localhost:$port"
-  printf 'API base:  %s\n' "http://localhost:$port/v1"
-  printf 'Chat:      %s\n' "http://localhost:$port/v1/chat/completions"
+  printf 'Dashboard: %s\n' "$(dashboard_url)"
+  printf 'API base:  %s\n' "$(api_base_url)"
+  printf 'Chat:      %s/chat/completions\n' "$(api_base_url)"
+  if current_public_api_port >/dev/null 2>&1; then
+    printf 'Mode:      split (dashboard private, /v1 public)\n'
+  else
+    printf 'Mode:      single listener\n'
+  fi
 }
 
 doctor() {
@@ -277,6 +599,12 @@ doctor() {
     fi
   done
 
+  if command_exists tailscale; then
+    printf 'ok   tailscale: %s\n' "$(command -v tailscale)"
+  else
+    printf 'info tailscale: not found (only needed for llmharbor tailscale)\n'
+  fi
+
   if [[ -f .env ]]; then
     printf 'ok   .env\n'
   else
@@ -289,6 +617,7 @@ doctor() {
     printf 'miss production build (run: llmharbor install)\n'
   fi
 
+  print_urls
   [[ "$failed" == "false" ]] || exit 1
 }
 
@@ -304,6 +633,7 @@ case "$cmd" in
   status) status_app "$@" ;;
   logs) show_logs "$@" ;;
   update) update_app "$@" ;;
+  tailscale|configure-tailscale) configure_tailscale "$@" ;;
   open) open_app "$@" ;;
   url|urls) print_urls "$@" ;;
   doctor) doctor "$@" ;;
