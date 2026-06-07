@@ -388,7 +388,7 @@ export async function refreshOAuthAccountInventory(db: Database.Database, accoun
         oauthLimits: [],
         oauthModelCount: 0,
         oauthDiscoveryError: message,
-        oauthNeedsReconnect: /401|403|UNAUTHENTICATED|PERMISSION_DENIED|invalid_grant|invalid authentication|permission/i.test(message),
+        oauthNeedsReconnect: /401|403|UNAUTHENTICATED|PERMISSION_DENIED|invalid_grant|invalid authentication|permission|verification required|not eligible/i.test(message),
         codeAssistUpdatedAt: new Date().toISOString(),
       };
       db.prepare("UPDATE oauth_accounts SET metadata_json = ?, last_discovered_at = datetime('now') WHERE id = ?")
