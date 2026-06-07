@@ -39,10 +39,8 @@ const LOAD_CODE_ASSIST_ENDPOINTS = [
 ];
 const CODE_ASSIST_HEADERS = {
   'Content-Type': 'application/json',
-  'User-Agent': `antigravity/1.0.0 ${process.platform}/${process.arch}`,
-  'X-Client-Name': 'antigravity',
-  'X-Client-Version': '1.0.0',
-  'x-goog-api-client': 'gl-node/18.18.2 fire/0.8.6 grpc/1.10.x',
+  'User-Agent': 'antigravity/1.15.8',
+  'X-Goog-Api-Client': 'google-cloud-sdk vscode',
 };
 export const DISCOVERY_BLACKLIST = new Set(['gpt-5-codex', 'gpt-5.1-codex']);
 
@@ -301,6 +299,13 @@ export async function discoverOAuthAccount(db: Database.Database, row: any): Pro
       break;
     }
     if (!loadJson) throw new Error(`Google Code Assist discovery failed on all loadCodeAssist endpoints. Last error: ${loadLastError || 'unknown error'}`);
+    const validationRequired = Array.isArray(loadJson.ineligibleTiers)
+      ? loadJson.ineligibleTiers.find((tier: any) => tier?.reasonCode === 'VALIDATION_REQUIRED')
+      : undefined;
+    if (validationRequired) {
+      const message = String(validationRequired.reasonMessage ?? 'Verify your account to continue.');
+      throw new Error(`Google Code Assist account verification required: ${message}`);
+    }
     const discoveredProject = loadJson.cloudaicompanionProject?.id ?? loadJson.cloudaicompanionProject;
 
     let availableJson: any = null;
@@ -368,7 +373,7 @@ export async function refreshOAuthAccountInventory(db: Database.Database, accoun
     updateOAuthModels(db, discovered.models);
     let metadata = {} as Record<string, unknown>;
     try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {}; } catch {}
-    metadata = { ...metadata, ...discovered.metadata, oauthLimits: discovered.limits, oauthModelCount: discovered.models.length, oauthDiscoveryError: null };
+    metadata = { ...metadata, ...discovered.metadata, oauthLimits: discovered.limits, oauthModelCount: discovered.models.length, oauthDiscoveryError: null, oauthNeedsReconnect: false };
     db.prepare("UPDATE oauth_accounts SET metadata_json = ?, last_discovered_at = datetime('now'), last_used_at = datetime('now') WHERE id = ?")
       .run(JSON.stringify(metadata), accountId);
     return { ...discovered, metadata };

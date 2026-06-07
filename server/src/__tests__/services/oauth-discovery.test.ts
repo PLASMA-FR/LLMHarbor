@@ -114,9 +114,9 @@ describe('OAuth model discovery', () => {
     const staleAccess = encrypt('stale-antigravity-access-token');
     const refresh = encrypt('antigravity-refresh-token|duet-project|managed-project');
     const account = db.prepare(`
-      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, enabled)
-      VALUES ('antigravity', 'Antigravity browser', 'captain@example.com', ?, ?, ?, ?, ?, ?, ?, 1)
-    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString());
+      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, metadata_json, enabled)
+      VALUES ('antigravity', 'Antigravity browser', 'captain@example.com', ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(staleAccess.encrypted, staleAccess.iv, staleAccess.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString(), JSON.stringify({ oauthNeedsReconnect: true, oauthDiscoveryError: 'previous permission failure' }));
     const key = db.prepare(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
       VALUES ('google-oauth', 'Antigravity browser', ?, ?, ?, 'healthy', 1, 'oauth', ?)
@@ -148,6 +148,9 @@ describe('OAuth model discovery', () => {
     expect(discovered.models.map(model => model.id)).toEqual(['gemini-2.5-pro']);
     const updatedKey = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE id = ?').get(Number(key.lastInsertRowid)) as any;
     expect(decrypt(updatedKey.encrypted_key, updatedKey.iv, updatedKey.auth_tag)).toBe('fresh');
+    const metadata = JSON.parse((db.prepare('SELECT metadata_json FROM oauth_accounts WHERE id = ?').get(Number(account.lastInsertRowid)) as any).metadata_json);
+    expect(metadata.oauthNeedsReconnect).toBe(false);
+    expect(metadata.oauthDiscoveryError).toBeNull();
   });
 
 

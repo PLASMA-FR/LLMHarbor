@@ -23,10 +23,8 @@ const LOAD_CODE_ASSIST_ENDPOINTS = [
 ];
 const CODE_ASSIST_HEADERS = {
   'Content-Type': 'application/json',
-  'User-Agent': `antigravity/1.0.0 ${process.platform}/${process.arch}`,
-  'X-Client-Name': 'antigravity',
-  'X-Client-Version': '1.0.0',
-  'x-goog-api-client': 'gl-node/18.18.2 fire/0.8.6 grpc/1.10.x',
+  'User-Agent': 'antigravity/1.15.8',
+  'X-Goog-Api-Client': 'google-cloud-sdk vscode',
 };
 const ANTIGRAVITY_SYSTEM_INSTRUCTION = 'You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**';
 const codeAssistSessionIds = new Map<string, string>();
@@ -112,6 +110,13 @@ async function ensureCodeAssistProject(accessToken: string, options?: Completion
       continue;
     }
     const data = await res.json() as any;
+    const validationRequired = Array.isArray(data.ineligibleTiers)
+      ? data.ineligibleTiers.find((tier: any) => tier?.reasonCode === 'VALIDATION_REQUIRED')
+      : undefined;
+    if (validationRequired) {
+      const message = String(validationRequired.reasonMessage ?? 'Verify your account to continue.');
+      throw new Error(`Google Code Assist account verification required: ${message}`);
+    }
     const projectId = data.cloudaicompanionProject?.id ?? data.cloudaicompanionProject;
     const metadata = {
       ...(oauth.metadata ?? {}),

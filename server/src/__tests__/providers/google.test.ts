@@ -338,7 +338,8 @@ describe('GoogleProvider', () => {
 
     expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent');
     expect(capturedHeaders.Authorization).toBe('Bearer oauth-access-token');
-    expect(capturedHeaders['X-Client-Name']).toBe('antigravity');
+    expect(capturedHeaders['User-Agent']).toBe('antigravity/1.15.8');
+    expect(capturedHeaders['X-Goog-Api-Client']).toBe('google-cloud-sdk vscode');
     expect(capturedHeaders['X-Machine-Session-Id']).toBeTruthy();
     expect(capturedBody).toMatchObject({
       project: 'cloud-project-123',
