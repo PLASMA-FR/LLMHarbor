@@ -282,26 +282,34 @@ describe('Virtual "auto" model', () => {
     expect(body.model).toBe('openrouter/openai/gpt-oss-120b:free');
   });
 
-  it('does not fall back to a different model when an explicit catalog model fails upstream', async () => {
+  it('falls back when an explicit catalog model has a retryable upstream failure', async () => {
     const addGoogle = await request(app, 'POST', '/api/keys', {
       platform: 'google',
-      key: 'google-explicit-no-fallback-test',
-      label: 'google-explicit-no-fallback',
+      key: 'google-explicit-fallback-test',
+      label: 'google-explicit-fallback',
     });
     expect(addGoogle.status).toBe(201);
 
     const origFetch = global.fetch;
-    let googleCalled = false;
+    let googleCalls = 0;
     let groqCalled = false;
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
       if (urlStr.includes('generativelanguage.googleapis.com')) {
-        googleCalled = true;
-        return Response.json({ error: { message: 'model not found' } }, { status: 404 });
+        googleCalls++;
+        return Response.json({ error: { message: 'internal error encountered' } }, { status: 500 });
       }
       if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
         groqCalled = true;
-        return Response.json({ error: { message: 'should not be called for strict model' } }, { status: 500 });
+        const upstreamModel = JSON.parse(String(init?.body ?? '{}')).model;
+        return Response.json({
+          id: 'chatcmpl-explicit-fallback',
+          object: 'chat.completion',
+          created: 123,
+          model: upstreamModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'fallback succeeded' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 4, completion_tokens: 5, total_tokens: 9 },
+        });
       }
       return origFetch(url, init);
     });
@@ -311,12 +319,12 @@ describe('Virtual "auto" model', () => {
       messages: [{ role: 'user', content: 'hello' }],
     }, authHeaders());
 
-    expect(status).toBe(502);
-    expect(googleCalled).toBe(true);
-    expect(groqCalled).toBe(false);
-    expect(headers.get('x-routed-via')).toBeNull();
-    expect(body.error.code).toBe('model_no_fallback');
-    expect(body.error.message).toContain('no fallback was attempted');
-    expect(body.error.message).toContain('Google API error 404');
+    expect(status).toBe(200);
+    expect(googleCalls).toBeGreaterThan(0);
+    expect(groqCalled).toBe(true);
+    expect(headers.get('x-routed-via')).toBe('groq/llama-3.3-70b-versatile');
+    expect(Number(headers.get('x-fallback-attempts'))).toBeGreaterThan(0);
+    expect(body.choices[0].message.content).toBe('fallback succeeded');
+    expect(body.error?.code).not.toBe('model_no_fallback');
   });
 });

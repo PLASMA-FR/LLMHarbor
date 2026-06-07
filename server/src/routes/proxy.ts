@@ -376,12 +376,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  // Explicit `model` field pins routing. If the catalog has no enabled row
-  // matching the requested id, return 400 — silently auto-routing to a
-  // different model would be surprising to OpenAI-compatible clients.
+  // Explicit `model` field is honored first. If the catalog has no enabled row
+  // matching the requested id, return 400. Once the requested model's available
+  // keys are exhausted by retryable upstream failures, though, resume the normal
+  // fallback chain so transient provider/OAuth outages don't fail the whole
+  // request when other configured models can answer.
   // Sticky-session is the fallback when no `model` field was sent at all.
   let preferredModel: number | undefined;
-  const explicitModelStrict = Boolean(requestedModel && !isAutoModel(requestedModel));
+  const explicitModelRequested = Boolean(requestedModel && !isAutoModel(requestedModel));
+  let strictPreferredModel = explicitModelRequested;
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(messages);
@@ -456,19 +459,29 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = await routeRequestAsync(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, explicitModelStrict, accessFilter);
+      route = await routeRequestAsync(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, strictPreferredModel, accessFilter);
     } catch (err: any) {
+      if (strictPreferredModel && lastError && isRetryableError(lastError)) {
+        // The explicitly requested model/key pool has been exhausted by a
+        // transient provider failure. Switch to the normal fallback chain rather
+        // than returning "no fallback was attempted".
+        strictPreferredModel = false;
+        preferredModel = undefined;
+        console.log(`[Proxy] Requested model '${requestedModel}' exhausted; falling back to the next routeable model. Last error: ${String(lastError.message ?? lastError).slice(0, 120)}`);
+        continue;
+      }
+
       // No more models available
       if (lastError) {
         const lastMessage = String(lastError.message ?? lastError);
-        const strictRateLimited = explicitModelStrict && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
-        res.status(explicitModelStrict ? (strictRateLimited ? 429 : 502) : 429).json({
+        const strictRateLimited = strictPreferredModel && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
+        res.status(strictPreferredModel ? (strictRateLimited ? 429 : 502) : 429).json({
           error: {
-            message: explicitModelStrict
+            message: strictPreferredModel
               ? `Requested model '${requestedModel}' failed and no fallback was attempted. Last error: ${lastMessage}`
               : `All models rate-limited. Last error: ${lastMessage}`,
-            type: explicitModelStrict ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
-            ...(explicitModelStrict ? { code: 'model_no_fallback' } : {}),
+            type: strictPreferredModel ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
+            ...(strictPreferredModel ? { code: 'model_no_fallback' } : {}),
           },
         });
       } else {
@@ -588,7 +601,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, ${explicitModelStrict ? 'retrying same requested model/key pool' : 'falling back'} (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, ${strictPreferredModel ? 'retrying same requested model/key pool' : 'falling back'} (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
@@ -605,14 +618,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   // Exhausted all retries
   const lastMessage = String(lastError?.message ?? lastError ?? 'unknown error');
-  const strictRateLimited = explicitModelStrict && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
-  res.status(explicitModelStrict ? (strictRateLimited ? 429 : 502) : 429).json({
+  const strictRateLimited = strictPreferredModel && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
+  res.status(strictPreferredModel ? (strictRateLimited ? 429 : 502) : 429).json({
     error: {
-      message: explicitModelStrict
+      message: strictPreferredModel
         ? `Requested model '${requestedModel}' failed and no fallback was attempted. Last error: ${lastMessage}`
         : `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastMessage}`,
-      type: explicitModelStrict ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
-      ...(explicitModelStrict ? { code: 'model_no_fallback' } : {}),
+      type: strictPreferredModel ? (strictRateLimited ? 'rate_limit_error' : 'provider_error') : 'rate_limit_error',
+      ...(strictPreferredModel ? { code: 'model_no_fallback' } : {}),
     },
   });
 });
