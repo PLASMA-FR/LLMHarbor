@@ -110,6 +110,38 @@ describe('OpenAICompatProvider', () => {
     expect(await provider.validateKey('valid')).toBe(true);
   });
 
+  it('lists OpenAI-compatible /models catalog rows with provider headers', async () => {
+    const catalogProvider = new OpenAICompatProvider({
+      platform: 'openrouter',
+      name: 'OpenRouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      extraHeaders: { 'X-Title': 'LLMHarbor' },
+    });
+    let capturedUrl = '';
+    let capturedHeaders: Record<string, string> = {};
+
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url, init) => {
+      capturedUrl = String(url);
+      capturedHeaders = (init as any).headers;
+      return Response.json({
+        data: [
+          { id: 'deepseek/deepseek-chat-v3.1:free', name: 'DeepSeek Free', pricing: { prompt: '0', completion: '0' }, context_length: 131072 },
+        ],
+      });
+    });
+
+    const models = await catalogProvider.listModels('or-key');
+
+    expect(capturedUrl).toBe('https://openrouter.ai/api/v1/models');
+    expect(capturedHeaders.Authorization).toBe('Bearer or-key');
+    expect(capturedHeaders['X-Title']).toBe('LLMHarbor');
+    expect(models[0]).toMatchObject({
+      id: 'deepseek/deepseek-chat-v3.1:free',
+      displayName: 'DeepSeek Free',
+      contextWindow: 131072,
+    });
+  });
+
   it('validateKey returns false on confirmed 401', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: false, status: 401 } as any);
     expect(await provider.validateKey('bad')).toBe(false);

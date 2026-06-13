@@ -2,6 +2,7 @@ import './env.js';
 import { createApp, createPublicApiApp } from './app.js';
 import { initDb } from './db/index.js';
 import { startHealthChecker } from './services/health.js';
+import { startFreeModelUpdater } from './services/freeModelUpdater.js';
 
 function firstEnv(...names: string[]): string | undefined {
   for (const name of names) {
@@ -43,6 +44,7 @@ function listen(app: ReturnType<typeof createApp>, port: number, host: string, l
 
 async function main() {
   initDb();
+  startFreeModelUpdater();
 
   const dashboardHost = firstEnv('LLMHARBOR_DASHBOARD_HOST', 'DASHBOARD_HOST', 'HOST') ?? '127.0.0.1';
   const dashboardPort = parsePort(

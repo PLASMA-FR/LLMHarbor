@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@llmharbor/shared/types.js';
-import { BaseProvider, type CompletionOptions } from './base.js';
+import { BaseProvider, type CompletionOptions, type ProviderCatalogModel } from './base.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -40,6 +40,37 @@ export class OpenAICompatProvider extends BaseProvider {
 
   private endpoint(path: string): string {
     return `${this.baseUrl}${path}`;
+  }
+
+  async listModels(apiKey: string): Promise<ProviderCatalogModel[]> {
+    const res = await this.fetchWithTimeout(this.endpoint('/models'), {
+      method: 'GET',
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        ...this.extraHeaders,
+      },
+    }, 10000);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`${this.name} model catalog error ${res.status}: ${text.slice(0, 240) || res.statusText}`);
+    }
+
+    const body = await res.json() as any;
+    const rows = Array.isArray(body.data) ? body.data : Array.isArray(body.models) ? body.models : [];
+    return rows
+      .filter((row: any) => typeof row?.id === 'string' && row.id.length > 0)
+      .map((row: any) => ({
+        id: row.id,
+        displayName: row.name ?? row.display_name ?? row.id,
+        contextWindow: typeof row.context_length === 'number'
+          ? row.context_length
+          : typeof row.context_window === 'number'
+            ? row.context_window
+            : null,
+        pricing: row.pricing ?? row.cost ?? row.limits ?? null,
+        raw: row,
+      }));
   }
 
   async chatCompletion(

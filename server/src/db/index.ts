@@ -155,6 +155,33 @@ function createTables(db: Database.Database) {
       value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS free_model_updater_settings (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      enabled INTEGER NOT NULL DEFAULT 0,
+      last_run_at TEXT,
+      next_run_at TEXT,
+      refresh_interval_hours INTEGER NOT NULL DEFAULT 6,
+      status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'running', 'error')),
+      error_message TEXT,
+      detected_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS model_free_metadata (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      model_id INTEGER NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
+      detected_via_updater INTEGER NOT NULL DEFAULT 1,
+      created_by_updater INTEGER NOT NULL DEFAULT 1,
+      detection_method TEXT NOT NULL CHECK (detection_method IN ('pricing_tier', 'keyword', 'hardcoded_list', 'unclassified_provider')),
+      verification_status TEXT NOT NULL DEFAULT 'pending' CHECK (verification_status IN ('pending', 'verified', 'unavailable', 'expired', 'no_key')),
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_seen_at TEXT,
+      last_verified_at TEXT,
+      last_error TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS client_api_keys (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       label TEXT NOT NULL DEFAULT 'Default key',
@@ -254,7 +281,13 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
     CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+    CREATE INDEX IF NOT EXISTS idx_model_free_metadata_status ON model_free_metadata(verification_status);
   `);
+
+  db.prepare(`
+    INSERT OR IGNORE INTO free_model_updater_settings (id, enabled, refresh_interval_hours, status)
+    VALUES (1, 0, 6, 'idle')
+  `).run();
 
   ensureRequestKeyIdColumn(db);
   ensureClientApiKeyEndpointColumn(db);

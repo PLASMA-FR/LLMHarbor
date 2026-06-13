@@ -24,6 +24,14 @@ export interface CompletionOptions {
   };
 }
 
+export interface ProviderCatalogModel {
+  id: string;
+  displayName?: string;
+  contextWindow?: number | null;
+  pricing?: unknown;
+  raw?: unknown;
+}
+
 export abstract class BaseProvider {
   abstract readonly platform: Platform;
   abstract readonly name: string;
@@ -43,6 +51,10 @@ export abstract class BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk>;
 
   abstract validateKey(apiKey: string): Promise<boolean>;
+
+  async listModels(_apiKey: string): Promise<ProviderCatalogModel[]> {
+    return [];
+  }
 
   protected async fetchWithTimeout(
     url: string,

@@ -223,6 +223,45 @@ export interface RequestLog {
   createdAt: string;
 }
 
+// ---- Free Model Updater Types ----
+export type FreeModelDetectionMethod =
+  | 'pricing_tier'
+  | 'keyword'
+  | 'hardcoded_list'
+  | 'unclassified_provider';
+
+export type FreeModelVerificationStatus =
+  | 'pending'
+  | 'verified'
+  | 'unavailable'
+  | 'expired'
+  | 'no_key';
+
+export type FreeModelUpdaterRunStatus = 'idle' | 'running' | 'error';
+
+export interface FreeModelUpdaterStatus {
+  enabled: boolean;
+  lastRunAt: string | null;
+  nextRunAt: string | null;
+  refreshIntervalHours: number;
+  status: FreeModelUpdaterRunStatus;
+  detectedCount: number;
+  errorMessage: string | null;
+}
+
+export interface FreeModelUpdaterSettings extends FreeModelUpdaterStatus {}
+
+export interface DetectedFreeModel {
+  platform: Platform;
+  modelId: string;
+  displayName: string;
+  detectionMethod: FreeModelDetectionMethod;
+  verificationStatus: FreeModelVerificationStatus;
+  contextWindow: number | null;
+  lastVerifiedAt: string | null;
+  lastError: string | null;
+}
+
 // ---- Rate Limit Types ----
 
 export interface RateLimitStatus {

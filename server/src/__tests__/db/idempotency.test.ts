@@ -73,6 +73,23 @@ describe('Migration idempotency', () => {
     expect(dups).toEqual([]);
   });
 
+  it('creates free model updater settings and metadata tables idempotently', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const db = initDb(':memory:');
+
+    const settings = db.prepare('SELECT * FROM free_model_updater_settings WHERE id = 1').get() as any;
+    expect(settings).toBeTruthy();
+    expect(settings.enabled).toBe(0);
+    expect(settings.refresh_interval_hours).toBe(6);
+    expect(settings.status).toBe('idle');
+
+    const metadataColumns = db.prepare('PRAGMA table_info(model_free_metadata)').all() as { name: string }[];
+    const names = metadataColumns.map(col => col.name);
+    expect(names).toContain('verification_status');
+    expect(names).toContain('consecutive_failures');
+    expect(names).toContain('created_by_updater');
+  });
+
   it('migrates legacy Google AI Studio OAuth accounts into disabled cleanup state and renames browser rows to Antigravity', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     const tmpPath = `/tmp/llmharbor-antigravity-oauth-migration-${Date.now()}.db`;

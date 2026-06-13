@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -8,6 +8,7 @@ import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
+import type { DetectedFreeModel, FreeModelUpdaterStatus } from '../../../shared/types'
 
 interface ClientApiKey { id: number; label: string; key?: string; maskedKey: string; enabled: boolean; createdAt: string; lastUsedAt: string | null; localEndpointId?: number | null }
 interface LocalEndpointKey { id: number; label: string; maskedKey: string; enabled: boolean; localEndpointId: number; createdAt?: string; lastUsedAt?: string | null }
@@ -74,6 +75,7 @@ export default function SettingsPage() {
   const [modelSearch, setModelSearch] = useState('')
   const [platformFilter, setPlatformFilter] = useState('all')
   const [showBlockedOnly, setShowBlockedOnly] = useState(false)
+  const [freeUpdaterInterval, setFreeUpdaterInterval] = useState('6')
 
   const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
@@ -105,6 +107,43 @@ export default function SettingsPage() {
     },
   })
 
+  const { data: freeUpdaterStatus } = useQuery<FreeModelUpdaterStatus>({
+    queryKey: ['free-model-updater-status'],
+    queryFn: () => apiFetch('/api/settings/free-model-updater/status'),
+  })
+
+  const { data: detectedFreeModels = [], isFetching: detectingFreeModels } = useQuery<DetectedFreeModel[]>({
+    queryKey: ['free-model-updater-detected-models'],
+    queryFn: () => apiFetch('/api/settings/free-model-updater/detected-models'),
+    staleTime: 60_000,
+  })
+
+  const enableFreeUpdater = useMutation({
+    mutationFn: (refreshIntervalHours: number) => apiFetch<FreeModelUpdaterStatus>('/api/settings/free-model-updater/enable', {
+      method: 'POST',
+      body: JSON.stringify({ refreshIntervalHours }),
+    }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
+  })
+
+  const disableFreeUpdater = useMutation({
+    mutationFn: () => apiFetch<FreeModelUpdaterStatus>('/api/settings/free-model-updater/disable', { method: 'POST' }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
+  })
+
+  const refreshFreeModels = useMutation({
+    mutationFn: () => apiFetch('/api/settings/free-model-updater/refresh-now', { method: 'POST' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
+      queryClient.invalidateQueries({ queryKey: ['client-api-key-access-policy'] })
+    },
+  })
+
+  useEffect(() => {
+    if (freeUpdaterStatus) setFreeUpdaterInterval(String(freeUpdaterStatus.refreshIntervalHours))
+  }, [freeUpdaterStatus])
+
   const totalEndpoints = endpointData?.endpoints.length ?? 0
   const legacyDomains = endpointData?.endpoints.reduce((sum, endpoint) => sum + endpoint.domains.length, 0) ?? 0
   const blockedRoutes = policy?.routes.filter(route => !route.enabled).length ?? 0
@@ -123,6 +162,7 @@ export default function SettingsPage() {
       .filter(model => !query || `${model.modelId} ${model.displayName} ${model.platform}`.toLowerCase().includes(query))
       .slice(0, 160)
   }, [modelSearch, platformFilter, policy?.models, showBlockedOnly])
+  const freeUpdaterBusy = enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending
 
   function updatePolicy(patch: PolicyPatch) {
     if (!activeKeyId) return
@@ -144,6 +184,15 @@ export default function SettingsPage() {
     updatePolicy({ models: visibleModels.map(model => ({ modelDbId: model.modelDbId, enabled })) })
   }
 
+  function toggleFreeUpdater(enabled: boolean) {
+    if (enabled) {
+      const parsed = Number.parseInt(freeUpdaterInterval, 10)
+      enableFreeUpdater.mutate(Number.isFinite(parsed) ? Math.min(24, Math.max(1, parsed)) : 6)
+    } else {
+      disableFreeUpdater.mutate()
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -156,6 +205,77 @@ export default function SettingsPage() {
           </Button>
         }
       />
+
+      <section className="panel-card rounded-2xl p-5 sm:p-6">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Free model updater"
+            description="Disabled by default. Turn it on only if you want LLMHarbor to discover no-card/free-tier models, probe them, and keep the local catalog fresh."
+            action={<Badge variant="secondary">Still beta</Badge>}
+          />
+          <div className="flex flex-wrap items-center gap-3">
+            <Label className="text-xs text-muted-foreground">Interval (hours)</Label>
+            <Input
+              className="h-9 w-24"
+              type="number"
+              min={1}
+              max={24}
+              value={freeUpdaterInterval}
+              onChange={event => setFreeUpdaterInterval(event.target.value)}
+            />
+            <Switch
+              checked={freeUpdaterStatus?.enabled ?? false}
+              onCheckedChange={toggleFreeUpdater}
+              disabled={freeUpdaterBusy}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={refreshFreeModels.isPending}
+              onClick={() => refreshFreeModels.mutate()}
+            >
+              {refreshFreeModels.isPending ? 'Refreshing…' : 'Refresh now'}
+            </Button>
+          </div>
+        </div>
+
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <SummaryTile label="Status" value={freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
+          <SummaryTile label="Detected" value={freeUpdaterStatus?.detectedCount ?? detectedFreeModels.length} detail="Free candidates from live catalogs and fallback lists." />
+          <SummaryTile label="Last run" value={freeUpdaterStatus?.lastRunAt ? new Date(freeUpdaterStatus.lastRunAt).toLocaleString() : 'Never'} detail="Most recent updater cycle." />
+          <SummaryTile label="Next run" value={freeUpdaterStatus?.nextRunAt ? new Date(freeUpdaterStatus.nextRunAt).toLocaleString() : 'Off'} detail="Based on the configured interval." />
+        </div>
+
+        {freeUpdaterStatus?.errorMessage && (
+          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+            {freeUpdaterStatus.errorMessage}
+          </div>
+        )}
+
+        <div className="mt-5 rounded-2xl border border-border bg-background p-4">
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-medium">Detected free models preview</p>
+            <Badge variant="secondary">{detectingFreeModels ? 'Scanning…' : `${detectedFreeModels.length} candidates`}</Badge>
+          </div>
+          <div className="mt-3 max-h-64 space-y-2 overflow-y-auto pr-1">
+            {detectedFreeModels.length === 0 ? (
+              <EmptyState title="No candidates loaded" description="Add provider keys or run refresh to populate the preview." />
+            ) : detectedFreeModels.slice(0, 80).map(model => (
+              <div key={`${model.platform}:${model.modelId}`} className="rounded-xl border border-border bg-card px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{model.displayName}</span>
+                  <Badge variant="outline">{model.platform}</Badge>
+                  <Badge variant="secondary">{model.detectionMethod}</Badge>
+                  <Badge variant={model.verificationStatus === 'verified' ? 'default' : 'secondary'}>{model.verificationStatus}</Badge>
+                </div>
+                <code className="mt-1 block truncate text-muted-foreground">{model.modelId}</code>
+                {model.lastError && <p className="mt-1 text-rose-600 dark:text-rose-300">{model.lastError}</p>}
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
 
       <section className="grid min-w-0 max-w-full gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <SummaryTile label="Client keys" value={clientKeys.length} detail="Per app, agent, laptop, or experiment." />

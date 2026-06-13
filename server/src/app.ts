@@ -11,6 +11,7 @@ import { fallbackRouter } from './routes/fallback.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
+import { freeModelUpdaterRouter } from './routes/freeModelUpdater.js';
 import { endpointsRouter } from './routes/endpoints.js';
 import { oauthRouter } from './routes/oauth.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -141,6 +142,7 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
   app.use('/api/fallback', fallbackRouter);
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/health', healthRouter);
+  app.use('/api/settings/free-model-updater', freeModelUpdaterRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/endpoints', endpointsRouter);
   app.use('/api/oauth', oauthRouter);
