@@ -67,6 +67,7 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://openrouter.ai/api/v1',
   extraHeaders: {
     'HTTP-Referer': 'http://localhost:3001',
+    'X-OpenRouter-Title': 'LLMHarbor',
     'X-Title': 'LLMHarbor',
   },
 }));
@@ -78,6 +79,7 @@ register(new OpenAICompatProvider({
   platform: 'github',
   name: 'GitHub Models',
   baseUrl: 'https://models.github.ai/inference',
+  modelsUrl: 'https://models.github.ai/catalog/models',
 }));
 
 // Cohere - OpenAI-compatible via Cohere compatibility endpoint
@@ -124,24 +126,22 @@ register(new OpenAICompatProvider({
   timeoutMs: 120000,
 }));
 
-// Kilo AI Gateway — OpenAI-compatible aggregator. Anonymous access works
-// (200 req/hr per IP) for the few :free routes still active; a Kilo API key
-// raises the limit. Most named "free" routes in the docs have transitioned to
-// paid ("free period ended") — probe before adding catalog rows.
+// Kilo AI Gateway — OpenAI-compatible aggregator. The catalog endpoint exposes
+// explicit isFree flags at /models; anonymous free chat works at 200 req/hr/IP,
+// but the updater UI still shows built-ins only when the user has a key.
 register(new OpenAICompatProvider({
   platform: 'kilo',
   name: 'Kilo Gateway',
-  baseUrl: 'https://api.kilo.ai/api/gateway/v1',
+  baseUrl: 'https://api.kilo.ai/api/gateway',
 }));
 
-// Pollinations — OpenAI-compatible, anonymous tier. The chat completions
-// endpoint lives at `/openai/v1/chat/completions` (NOT `/v1/...` — the
-// `/openai` prefix is mandatory). Public model list returns one anonymous
-// model (`openai-fast` = GPT-OSS 20B on OVH, tools=true).
+// Pollinations — current OpenAI-compatible endpoint. The detailed text catalog
+// marks paid-only rows; the updater requires a key for built-in discovery.
 register(new OpenAICompatProvider({
   platform: 'pollinations',
   name: 'Pollinations',
-  baseUrl: 'https://text.pollinations.ai/openai/v1',
+  baseUrl: 'https://gen.pollinations.ai/v1',
+  modelsUrl: 'https://gen.pollinations.ai/text/models',
 }));
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access

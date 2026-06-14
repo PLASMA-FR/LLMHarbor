@@ -1,14 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
+import { encrypt } from '../../lib/crypto.js';
+import type { ProviderCatalogModel } from '../../providers/base.js';
 import { FreeModelUpdater, type DiscoveryProvider } from '../../services/freeModelUpdater.js';
 
-const provider = (models: Array<{ id: string; displayName?: string; contextWindow?: number | null }>): DiscoveryProvider => ({
+const provider = (models: ProviderCatalogModel[]): DiscoveryProvider => ({
   platform: 'openrouter',
   name: 'OpenRouter',
   listModels: async () => models,
 });
 
-const namedProvider = (platform: string, models: Array<{ id: string; displayName?: string; contextWindow?: number | null }>, spy = vi.fn()): DiscoveryProvider => ({
+const namedProvider = (platform: string, models: ProviderCatalogModel[], spy = vi.fn()): DiscoveryProvider => ({
   platform,
   name: platform,
   listModels: async (apiKey: string) => {
@@ -16,6 +18,14 @@ const namedProvider = (platform: string, models: Array<{ id: string; displayName
     return models;
   },
 });
+
+function insertApiKey(platform: string, status = 'healthy', enabled = 1): void {
+  const encrypted = encrypt(`${platform}-key`);
+  getDb().prepare(`
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(platform, `${platform} key`, encrypted.encrypted, encrypted.iv, encrypted.authTag, status, enabled);
+}
 
 describe('FreeModelUpdater', () => {
   beforeEach(() => {
@@ -37,7 +47,35 @@ describe('FreeModelUpdater', () => {
     });
   });
 
+  it('shows only built-in providers with enabled keys while preserving custom endpoints', () => {
+    insertApiKey('openrouter');
+    insertApiKey('groq', 'healthy', 0);
+    insertApiKey('cerebras', 'error', 1);
+    getDb().prepare(`
+      INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
+      VALUES ('custom-local-vllm', 'Local vLLM', 'http://127.0.0.1:18888/v1', 120000, 1)
+    `).run();
+
+    const options = new FreeModelUpdater().getProviderOptions();
+
+    expect(options.map(option => option.platform)).toEqual(['openrouter', 'custom-local-vllm']);
+    expect(options.find(option => option.platform === 'openrouter')).toMatchObject({ source: 'built-in', hasEnabledKey: true });
+    expect(options.find(option => option.platform === 'custom-local-vllm')).toMatchObject({ source: 'custom', detectionPolicy: 'custom_catalog', hasEnabledKey: false });
+  });
+
+  it('rejects keyless built-in selections but accepts enabled custom endpoints', () => {
+    getDb().prepare(`
+      INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
+      VALUES ('custom-local-vllm', 'Local vLLM', 'http://127.0.0.1:18888/v1', 120000, 1)
+    `).run();
+    const updater = new FreeModelUpdater();
+
+    expect(() => updater.setSelectedProviders(['openrouter'])).toThrow('Unknown or disabled free-model updater provider');
+    expect(updater.setSelectedProviders(['custom-local-vllm']).selectedProviders).toEqual(['custom-local-vllm']);
+  });
+
   it('persists selected providers and filters injected discovery to only those providers', async () => {
+    insertApiKey('groq');
     const openRouterSpy = vi.fn();
     const groqSpy = vi.fn();
     const updater = new FreeModelUpdater({
@@ -97,14 +135,16 @@ describe('FreeModelUpdater', () => {
   });
 
   it('discovers free models from injected providers without writing catalog rows', async () => {
+    insertApiKey('openrouter');
     const updater = new FreeModelUpdater({
       now: () => new Date('2026-06-01T00:00:00.000Z'),
       providers: [provider([
-        { id: 'deepseek/deepseek-chat-v3.1:free', displayName: 'DeepSeek free', contextWindow: 131072 },
+        { id: 'deepseek/deepseek-chat-v3.1:free', displayName: 'DeepSeek free', contextWindow: 131072, pricing: { prompt: '0', completion: '0' } },
         { id: 'paid/model', displayName: 'Paid model' },
       ])],
       keyResolver: () => 'test-key',
     });
+    updater.setSelectedProviders(['openrouter']);
 
     const detected = await updater.detectFreeModels();
     expect(detected.map(model => model.modelId)).toEqual(['deepseek/deepseek-chat-v3.1:free']);
@@ -114,12 +154,14 @@ describe('FreeModelUpdater', () => {
   });
 
   it('upserts detected models and creates fallback plus metadata rows', async () => {
+    insertApiKey('openrouter');
     const updater = new FreeModelUpdater({
       now: () => new Date('2026-06-01T00:00:00.000Z'),
-      providers: [provider([{ id: 'free/model:free', displayName: 'Free Model', contextWindow: 1234 }])],
+      providers: [provider([{ id: 'free/model:free', displayName: 'Free Model', contextWindow: 1234, pricing: { prompt: '0', completion: '0' } }])],
       keyResolver: () => 'test-key',
       probeModel: async () => ({ ok: true, latencyMs: 10, sample: 'harbor-ok' }),
     });
+    updater.setSelectedProviders(['openrouter']);
 
     const result = await updater.refreshNow();
     expect(result.detectedCount).toBe(1);
@@ -137,6 +179,7 @@ describe('FreeModelUpdater', () => {
   });
 
   it('does not expire unselected provider models during scoped refresh', async () => {
+    insertApiKey('openrouter');
     const db = getDb();
     const openrouter = db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled)
@@ -203,23 +246,27 @@ describe('FreeModelUpdater', () => {
   });
 
   it('marks discovered models no_key when no provider key is available', async () => {
+    insertApiKey('groq');
     const updater = new FreeModelUpdater({
-      providers: [provider([{ id: 'x/free:free' }])],
+      providers: [{ ...namedProvider('groq', [{ id: 'llama-3.3-70b-versatile' }]), detectionPolicy: 'account_free_tier_catalog' }],
       keyResolver: () => null,
     });
+    updater.setSelectedProviders(['groq']);
 
     await updater.refreshNow();
-    const modelRow = getDb().prepare("SELECT id FROM models WHERE platform = 'openrouter' AND model_id = 'x/free:free'").get() as any;
+    const modelRow = getDb().prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-versatile'").get() as any;
     const metadata = getDb().prepare('SELECT verification_status FROM model_free_metadata WHERE model_id = ?').get(modelRow.id) as any;
     expect(metadata.verification_status).toBe('no_key');
   });
 
   it('disables an updater-created model after three probe failures', async () => {
+    insertApiKey('openrouter');
     const updater = new FreeModelUpdater({
-      providers: [provider([{ id: 'x/free:free' }])],
+      providers: [provider([{ id: 'x/free:free', pricing: { prompt: '0', completion: '0' } }])],
       keyResolver: () => 'test-key',
       probeModel: async () => ({ ok: false, message: 'upstream 404' }),
     });
+    updater.setSelectedProviders(['openrouter']);
 
     await updater.refreshNow();
     await updater.refreshNow();
@@ -233,23 +280,27 @@ describe('FreeModelUpdater', () => {
   });
 
   it('records error status when refresh throws', async () => {
+    insertApiKey('openrouter');
     const updater = new FreeModelUpdater({
       providers: [{ platform: 'openrouter', name: 'OpenRouter', listModels: async () => { throw new Error('catalog down'); } }],
       keyResolver: () => 'test-key',
       failRefreshOnProviderError: true,
     });
+    updater.setSelectedProviders(['openrouter']);
 
     await expect(updater.refreshNow()).rejects.toThrow('catalog down');
     expect(updater.getStatus()).toMatchObject({ status: 'error', errorMessage: expect.stringContaining('catalog down') });
   });
 
   it('does not run overlapping refreshes', async () => {
+    insertApiKey('openrouter');
     let release!: () => void;
     const blocker = new Promise<void>(resolve => { release = resolve; });
     const updater = new FreeModelUpdater({
       providers: [{ platform: 'openrouter', name: 'OpenRouter', listModels: async () => { await blocker; return []; } }],
       keyResolver: () => 'test-key',
     });
+    updater.setSelectedProviders(['openrouter']);
 
     const first = updater.refreshNow();
     const second = updater.refreshNow();
@@ -259,14 +310,16 @@ describe('FreeModelUpdater', () => {
   });
 
   it('schedules refresh when enabled and stops cleanly', async () => {
+    insertApiKey('openrouter');
     vi.useFakeTimers();
     const refresh = vi.fn().mockResolvedValue({ ok: true });
     const updater = new FreeModelUpdater({
       now: () => new Date('2026-06-01T00:00:00.000Z'),
-      providers: [provider([{ id: 'x/free:free' }])],
+      providers: [provider([{ id: 'x/free:free', pricing: { prompt: '0', completion: '0' } }])],
       keyResolver: () => 'test-key',
       probeModel: refresh,
     });
+    updater.setSelectedProviders(['openrouter']);
 
     updater.enable(1);
     updater.start();

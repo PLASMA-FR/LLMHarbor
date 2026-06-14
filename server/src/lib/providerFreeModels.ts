@@ -11,22 +11,30 @@ export interface KnownFreeModel {
   monthlyTokenBudget: string;
 }
 
-export type ProviderFreePolicy = 'priced_catalog' | 'unclassified_all_catalog' | 'hardcoded_then_probe';
+export type ProviderFreePolicy =
+  | 'priced_catalog'
+  | 'openrouter_free_variant_catalog'
+  | 'account_free_tier_catalog'
+  | 'provider_declared_free_catalog'
+  | 'provider_tier_catalog'
+  | 'unclassified_all_catalog'
+  | 'hardcoded_then_probe'
+  | 'custom_catalog';
 
 export const FREE_MODEL_PROVIDER_POLICIES: Record<string, ProviderFreePolicy> = {
-  openrouter: 'priced_catalog',
-  cerebras: 'priced_catalog',
+  openrouter: 'openrouter_free_variant_catalog',
+  cerebras: 'account_free_tier_catalog',
   ollama: 'hardcoded_then_probe',
-  github: 'hardcoded_then_probe',
-  groq: 'unclassified_all_catalog',
-  pollinations: 'unclassified_all_catalog',
-  llm7: 'unclassified_all_catalog',
-  kilo: 'hardcoded_then_probe',
+  github: 'provider_tier_catalog',
+  groq: 'account_free_tier_catalog',
+  pollinations: 'provider_tier_catalog',
+  llm7: 'provider_tier_catalog',
+  kilo: 'provider_declared_free_catalog',
 };
 
-export const ANONYMOUS_MODEL_CATALOG_PLATFORMS = new Set(['pollinations', 'llm7']);
+export const ANONYMOUS_MODEL_CATALOG_PLATFORMS = new Set(['pollinations', 'llm7', 'openrouter', 'kilo']);
 
-export const FREE_MODEL_KEYWORDS = ['free', 'trial', 'open-source', 'opensource'];
+export const FREE_MODEL_KEYWORDS = ['free'];
 
 export const KNOWN_FREE_MODELS: KnownFreeModel[] = [
   {
@@ -58,46 +66,6 @@ export const KNOWN_FREE_MODELS: KnownFreeModel[] = [
     speedRank: 9,
     sizeLabel: 'Large',
     monthlyTokenBudget: '~10-20M',
-  },
-  {
-    platform: 'kilo',
-    modelId: 'nvidia/nemotron-3-super-120b-a12b:free',
-    displayName: 'Nemotron 3 Super 120B (Kilo)',
-    contextWindow: 262144,
-    intelligenceRank: 22,
-    speedRank: 9,
-    sizeLabel: 'Frontier',
-    monthlyTokenBudget: '~2-3M (200/hr)',
-  },
-  {
-    platform: 'pollinations',
-    modelId: 'openai-fast',
-    displayName: 'GPT-OSS 20B (Pollinations)',
-    contextWindow: 131072,
-    intelligenceRank: 18,
-    speedRank: 10,
-    sizeLabel: 'Medium',
-    monthlyTokenBudget: '~? (anon)',
-  },
-  {
-    platform: 'llm7',
-    modelId: 'gpt-oss-20b',
-    displayName: 'GPT-OSS 20B (LLM7)',
-    contextWindow: 131072,
-    intelligenceRank: 18,
-    speedRank: 10,
-    sizeLabel: 'Medium',
-    monthlyTokenBudget: '~2-3M (100/hr)',
-  },
-  {
-    platform: 'llm7',
-    modelId: 'codestral-latest',
-    displayName: 'Codestral (LLM7)',
-    contextWindow: 32000,
-    intelligenceRank: 16,
-    speedRank: 8,
-    sizeLabel: 'Medium',
-    monthlyTokenBudget: '~2-3M (100/hr)',
   },
 ];
 

@@ -69,7 +69,7 @@ function clampInterval(hours: number | undefined): number {
 }
 
 function rowToStatus(row: any): FreeModelUpdaterStatus {
-  const providers = selectedPlatforms();
+  const providers = selectedVisiblePlatforms();
   return {
     enabled: row.enabled === 1,
     lastRunAt: row.last_run_at,
@@ -124,6 +124,11 @@ function selectedSet(): Set<string> {
   return new Set(selectedPlatforms().map(String));
 }
 
+function selectedVisiblePlatforms(): Platform[] {
+  const visible = new Set(providerOptions().map(option => String(option.platform)));
+  return selectedPlatforms().filter(platform => visible.has(String(platform)));
+}
+
 function providerOptions(): FreeModelUpdaterProviderOption[] {
   const selected = selectedSet();
   const builtIns = getBuiltInProviderSummaries()
@@ -139,7 +144,8 @@ function providerOptions(): FreeModelUpdaterProviderOption[] {
       hasEnabledKey: hasEnabledKey(provider.platform),
       canListAnonymously: ANONYMOUS_MODEL_CATALOG_PLATFORMS.has(provider.platform),
       detectionPolicy: freeModelPolicyForPlatform(provider.platform) as FreeModelUpdaterDetectionPolicy,
-    }));
+    }))
+    .filter(provider => provider.hasEnabledKey);
 
   const custom = customEndpointRows().map(endpoint => ({
     platform: endpoint.platform,
@@ -166,7 +172,7 @@ function resolveDiscoveryProvider(platform: Platform): DiscoveryProvider | null 
     platform: provider.platform,
     name: provider.name,
     source: custom ? 'custom' : 'built-in',
-    detectionPolicy: custom ? 'unclassified_all_catalog' : freeModelPolicyForPlatform(String(provider.platform)),
+    detectionPolicy: custom ? 'custom_catalog' : freeModelPolicyForPlatform(String(provider.platform)),
     canListAnonymously: custom || ANONYMOUS_MODEL_CATALOG_PLATFORMS.has(String(provider.platform)),
     listModels: apiKey => provider.listModels(apiKey),
   };
@@ -191,7 +197,7 @@ function defaultKeyResolver(platform: Platform): string | null {
 }
 
 function defaultProviders(): DiscoveryProvider[] {
-  return selectedPlatforms()
+  return selectedVisiblePlatforms()
     .map(platform => resolveDiscoveryProvider(platform))
     .filter((provider): provider is DiscoveryProvider => provider !== null);
 }
@@ -286,7 +292,7 @@ export class FreeModelUpdater {
   }
 
   getDetectedModels(): DetectedFreeModel[] {
-    const providers = selectedPlatforms();
+    const providers = selectedVisiblePlatforms();
     if (providers.length === 0) return [];
     const placeholders = providers.map(() => '?').join(', ');
     return getDb().prepare(`
@@ -363,9 +369,9 @@ export class FreeModelUpdater {
   }
 
   private async discoverFreeModels(): Promise<DiscoveryRun> {
-    const selected = selectedPlatforms();
+    const selected = selectedVisiblePlatforms();
     const providers = this.providers
-      ? (selected.length > 0 ? this.providers.filter(provider => selected.includes(provider.platform)) : this.providers)
+      ? this.providers.filter(provider => selected.includes(provider.platform))
       : defaultProviders();
     const detected: DetectedFreeModel[] = [];
     const scannedProviders: Array<{ platform: Platform; source: 'built-in' | 'custom' }> = [];
@@ -466,7 +472,7 @@ export class FreeModelUpdater {
 
   private async defaultProbeModel(model: DetectedFreeModel): Promise<ProbeResult> {
     const apiKey = this.keyResolver(model.platform);
-    const canProbeAnonymously = isCustomEndpoint(model.platform) || ANONYMOUS_MODEL_CATALOG_PLATFORMS.has(String(model.platform));
+    const canProbeAnonymously = isCustomEndpoint(model.platform);
     if (!apiKey && !canProbeAnonymously) return { ok: false, noKey: true, message: 'No enabled key available for probe.' };
 
     const provider = getProvider(String(model.platform));

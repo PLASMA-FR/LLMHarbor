@@ -142,6 +142,28 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  it('supports provider-specific model catalog URLs separate from inference base URLs', async () => {
+    const catalogProvider = new OpenAICompatProvider({
+      platform: 'github',
+      name: 'GitHub Models',
+      baseUrl: 'https://models.github.ai/inference',
+      modelsUrl: 'https://models.github.ai/catalog/models',
+    });
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url) => {
+      capturedUrl = String(url);
+      return Response.json([
+        { id: 'openai/gpt-4.1', name: 'GPT-4.1', rate_limit_tier: 'high', limits: { max_input_tokens: 1048576 } },
+      ]);
+    });
+
+    const models = await catalogProvider.listModels('gh-token');
+
+    expect(capturedUrl).toBe('https://models.github.ai/catalog/models');
+    expect(models[0]).toMatchObject({ id: 'openai/gpt-4.1', displayName: 'GPT-4.1', contextWindow: 1048576 });
+    expect(models[0].raw).toMatchObject({ rate_limit_tier: 'high' });
+  });
+
   it('normalizes common custom /models response shapes', async () => {
     const catalogProvider = new OpenAICompatProvider({
       platform: 'custom-local-vllm',

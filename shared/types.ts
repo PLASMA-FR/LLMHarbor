@@ -243,6 +243,10 @@ export type FreeModelUpdaterProviderSource = 'built-in' | 'custom';
 
 export type FreeModelUpdaterDetectionPolicy =
   | 'priced_catalog'
+  | 'openrouter_free_variant_catalog'
+  | 'account_free_tier_catalog'
+  | 'provider_declared_free_catalog'
+  | 'provider_tier_catalog'
   | 'unclassified_all_catalog'
   | 'hardcoded_then_probe'
   | 'custom_catalog';

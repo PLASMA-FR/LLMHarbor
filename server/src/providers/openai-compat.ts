@@ -24,14 +24,21 @@ function numericValue(...values: unknown[]): number | null {
   for (const value of values) {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
     if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) return Number(value);
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      const nested = numericValue(record.tokens, record.token, record.max_input_tokens, record.chars);
+      if (nested !== null) return nested;
+    }
   }
   return null;
 }
 
 function pricingFields(row: Record<string, unknown>): unknown {
   if (row.pricing || row.cost || row.limits || row.price) return row.pricing ?? row.cost ?? row.limits ?? row.price;
-  const prompt = row.prompt ?? row.input ?? row.prompt_tokens ?? row.input_tokens ?? row.input_token ?? row.prompt_price;
-  const completion = row.completion ?? row.output ?? row.completion_tokens ?? row.output_tokens ?? row.output_token ?? row.completion_price;
+  const prompt = row.prompt ?? row.input ?? row.prompt_tokens ?? row.input_tokens ?? row.input_token ?? row.prompt_price
+    ?? row.input_price ?? row.prompt_cost ?? row.input_cost ?? row.prompt_token_cost ?? row.input_cost_per_token;
+  const completion = row.completion ?? row.output ?? row.completion_tokens ?? row.output_tokens ?? row.output_token ?? row.completion_price
+    ?? row.output_price ?? row.completion_cost ?? row.output_cost ?? row.completion_token_cost ?? row.output_cost_per_token;
   return prompt !== undefined || completion !== undefined ? { prompt, completion } : null;
 }
 
@@ -46,6 +53,7 @@ export class OpenAICompatProvider extends BaseProvider {
   readonly baseUrl: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
+  private readonly modelsUrl?: string;
   /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted
    * inference (llama.cpp / vLLM on CPU) can take 30-120s for long prompts. Default 15000. */
   readonly timeoutMs: number;
@@ -56,6 +64,7 @@ export class OpenAICompatProvider extends BaseProvider {
     baseUrl: string;
     extraHeaders?: Record<string, string>;
     validateUrl?: string;
+    modelsUrl?: string;
     timeoutMs?: number;
   }) {
     super();
@@ -64,6 +73,7 @@ export class OpenAICompatProvider extends BaseProvider {
     this.baseUrl = opts.baseUrl;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.validateUrl = opts.validateUrl;
+    this.modelsUrl = opts.modelsUrl;
     this.timeoutMs = opts.timeoutMs ?? 15000;
   }
 
@@ -72,7 +82,7 @@ export class OpenAICompatProvider extends BaseProvider {
   }
 
   async listModels(apiKey: string): Promise<ProviderCatalogModel[]> {
-    const res = await this.fetchWithTimeout(this.endpoint('/models'), {
+    const res = await this.fetchWithTimeout(this.modelsUrl ?? this.endpoint('/models'), {
       method: 'GET',
       headers: {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -99,7 +109,7 @@ export class OpenAICompatProvider extends BaseProvider {
         return {
           id,
           displayName,
-          contextWindow: numericValue(record.context_length, record.context_window, record.max_context_length, record.context, record.inputTokenLimit),
+          contextWindow: numericValue(record.context_length, record.context_window, record.max_context_length, record.context, record.inputTokenLimit, (record.limits as any)?.max_input_tokens, (record.top_provider as any)?.context_length),
           pricing: pricingFields(record),
           raw: row,
         };

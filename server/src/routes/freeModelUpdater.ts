@@ -50,6 +50,10 @@ freeModelUpdaterRouter.post('/enable', (req: Request, res: Response) => {
       return;
     }
   }
+  if (freeModelUpdater.getStatus().selectedProviderCount === 0) {
+    res.status(400).json({ error: { message: 'Select at least one ready provider before enabling the beta updater.' } });
+    return;
+  }
   res.json(freeModelUpdater.enable(parsed.data.refreshIntervalHours));
 });
 

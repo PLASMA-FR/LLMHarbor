@@ -10,16 +10,16 @@ const model = (id: string, extra: Partial<ProviderCatalogModel> = {}): ProviderC
 });
 
 describe('free model filters', () => {
-  it('identifies OpenRouter :free and zero-price catalog rows', () => {
+  it('identifies only OpenRouter :free zero-price catalog rows', () => {
     const result = filterFreeModels('openrouter', [
-      model('deepseek/deepseek-chat-v3.1:free'),
+      model('deepseek/deepseek-chat-v3.1:free', { pricing: { prompt: '0', completion: '0' } }),
       model('paid/model', { pricing: { prompt: '0.25', completion: '0.50' } }),
       model('zero/model', { pricing: { prompt: '0', completion: '0' } }),
+      model('sneaky/model:free', { pricing: { prompt: '0', completion: '0', image: '0.01' } }),
     ]);
 
-    expect(result.map(row => row.modelId)).toEqual(['deepseek/deepseek-chat-v3.1:free', 'zero/model']);
+    expect(result.map(row => row.modelId)).toEqual(['deepseek/deepseek-chat-v3.1:free']);
     expect(result[0].detectionMethod).toBe('keyword');
-    expect(result[1].detectionMethod).toBe('pricing_tier');
   });
 
   it('adds all Groq catalog rows as unclassified provider free-tier candidates', () => {
@@ -32,14 +32,41 @@ describe('free model filters', () => {
     expect(result.every(row => row.detectionMethod === 'unclassified_provider')).toBe(true);
   });
 
-  it('uses hardcoded fallback models when a hardcoded provider catalog is empty', () => {
-    const result = filterFreeModels('pollinations', []);
-    expect(result.map(row => row.modelId)).toContain('openai-fast');
-    expect(result.find(row => row.modelId === 'openai-fast')?.detectionMethod).toBe('hardcoded_list');
+  it('uses hardcoded fallback models only for hardcoded providers', () => {
+    expect(filterFreeModels('ollama', []).map(row => row.modelId)).toContain('qwen3-coder-next');
+    expect(filterFreeModels('pollinations', [])).toEqual([]);
+  });
+
+  it('uses provider-declared free flags for Kilo instead of zero pricing alone', () => {
+    const result = filterFreeModels('kilo', [
+      model('openrouter/owl-alpha', { pricing: { prompt: '0', completion: '0' }, raw: { isFree: true } }),
+      model('google/lyria-3-pro-preview', { pricing: { prompt: '0', completion: '0' }, raw: { isFree: false } }),
+    ]);
+
+    expect(result.map(row => row.modelId)).toEqual(['openrouter/owl-alpha']);
+    expect(result[0].detectionMethod).toBe('unclassified_provider');
+  });
+
+  it('excludes paid LLM7 tiers while accepting free-tier catalog rows', () => {
+    const result = filterFreeModels('llm7', [
+      model('codestral-latest', { raw: { id: 'codestral-latest' } }),
+      model('minimax-m2.7', { raw: { id: 'minimax-m2.7', tier: 'pro' } }),
+    ]);
+
+    expect(result.map(row => row.modelId)).toEqual(['codestral-latest']);
+  });
+
+  it('keeps custom catalog rows even when they are unpriced', () => {
+    const result = filterFreeModels('custom-local-vllm', [model('local/qwen-coder')], 'custom_catalog');
+    expect(result.map(row => row.modelId)).toEqual(['local/qwen-coder']);
+    expect(result[0].detectionMethod).toBe('unclassified_provider');
   });
 
   it('deduplicates by platform and model id', () => {
-    const result = filterFreeModels('openrouter', [model('x/free:free'), model('x/free:free')]);
+    const result = filterFreeModels('openrouter', [
+      model('x/free:free', { pricing: { prompt: '0', completion: '0' } }),
+      model('x/free:free', { pricing: { prompt: '0', completion: '0' } }),
+    ]);
     expect(result).toHaveLength(1);
   });
 });

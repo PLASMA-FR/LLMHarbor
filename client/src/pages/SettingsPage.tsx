@@ -128,19 +128,20 @@ export default function SettingsPage() {
       method: 'POST',
       body: JSON.stringify({ refreshIntervalHours }),
     }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
   })
 
   const disableFreeUpdater = useMutation({
     mutationFn: () => apiFetch<FreeModelUpdaterStatus>('/api/settings/free-model-updater/disable', { method: 'POST' }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
   })
 
   const refreshFreeModels = useMutation({
     mutationFn: () => apiFetch('/api/settings/free-model-updater/refresh-now', { method: 'POST' }),
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
       queryClient.invalidateQueries({ queryKey: ['client-api-key-access-policy'] })
     },
   })
@@ -150,7 +151,7 @@ export default function SettingsPage() {
       method: 'PUT',
       body: JSON.stringify({ selectedProviders }),
     }),
-    onSuccess: () => {
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
@@ -172,6 +173,7 @@ export default function SettingsPage() {
   const totalBlocked = blockedRoutes + blockedProviders + blockedModels
   const freeUpdaterProviders = freeUpdaterProviderData?.providers ?? []
   const selectedFreeUpdaterProviders = freeUpdaterProviders.filter(provider => provider.selected).map(provider => provider.platform)
+  const freeUpdaterActionError = enableFreeUpdater.error ?? disableFreeUpdater.error ?? refreshFreeModels.error ?? updateFreeUpdaterProviders.error
   const providerOptions = useMemo(() => Array.from(new Set(policy?.models.map(model => model.platform) ?? [])).sort((a, b) => a.localeCompare(b)), [policy?.models])
   const visibleModels = useMemo(() => {
     const query = modelSearch.trim().toLowerCase()
@@ -181,7 +183,9 @@ export default function SettingsPage() {
       .filter(model => !query || `${model.modelId} ${model.displayName} ${model.platform}`.toLowerCase().includes(query))
       .slice(0, 160)
   }, [modelSearch, platformFilter, policy?.models, showBlockedOnly])
-  const freeUpdaterBusy = enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending || updateFreeUpdaterProviders.isPending
+  const freeUpdaterBusy = (freeUpdaterStatus?.status === 'running') || enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending || updateFreeUpdaterProviders.isPending
+  const canRefreshFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
+  const canEnableFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
 
   function updatePolicy(patch: PolicyPatch) {
     if (!activeKeyId) return
@@ -240,8 +244,8 @@ export default function SettingsPage() {
         <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
           <SectionTitle
             title="Free model updater"
-            description="Disabled by default. Turn it on only if you want LLMHarbor to discover no-card/free-tier models, probe them, and keep the local catalog fresh."
-            action={<Badge variant="secondary">Still beta</Badge>}
+            description="Disabled by default. Select ready providers, then optionally let LLMHarbor discover free/free-tier models, probe them, and keep the local catalog fresh."
+            action={<Badge variant="secondary">Beta</Badge>}
           />
           <div className="flex flex-wrap items-center gap-3">
             <Label className="text-xs text-muted-foreground">Interval (hours)</Label>
@@ -256,16 +260,16 @@ export default function SettingsPage() {
             <Switch
               checked={freeUpdaterStatus?.enabled ?? false}
               onCheckedChange={toggleFreeUpdater}
-              disabled={freeUpdaterBusy}
+              disabled={freeUpdaterBusy || (!(freeUpdaterStatus?.enabled ?? false) && !canEnableFreeUpdater)}
             />
             <Button
               type="button"
               variant="outline"
               size="sm"
-              disabled={refreshFreeModels.isPending || selectedFreeUpdaterProviders.length === 0}
+              disabled={!canRefreshFreeUpdater}
               onClick={() => refreshFreeModels.mutate()}
             >
-              {refreshFreeModels.isPending ? 'Refreshing…' : 'Refresh now'}
+              {refreshFreeModels.isPending ? 'Refreshing…' : 'Refresh selected'}
             </Button>
           </div>
         </div>
@@ -277,12 +281,16 @@ export default function SettingsPage() {
           <SummaryTile label="Last run" value={freeUpdaterStatus?.lastRunAt ? new Date(freeUpdaterStatus.lastRunAt).toLocaleString() : 'Never'} detail="Most recent updater cycle." />
         </div>
 
+        <div className="mt-5 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
+          <strong>Beta safeguard:</strong> the updater stays off until you opt in. Built-in providers appear only when a usable upstream key is enabled. Custom endpoints are opt-in, user-declared free/local catalogs. Review provider quotas before enabling background refresh.
+        </div>
+
         <div className="mt-5 rounded-2xl border border-border bg-background p-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <p className="text-sm font-medium">Provider selection</p>
               <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                Refresh now fetches only the providers selected here. Custom endpoints are opt-in and treated as user-declared free/local catalogs; every listed model is probed before it is marked verified.
+                Refresh selected fetches only the providers selected here. Built-in providers appear only when they have a usable enabled key. Custom endpoints remain opt-in and are treated as user-declared free/local catalogs; every listed model is probed before it is marked verified.
               </p>
             </div>
             <div className="flex shrink-0 gap-2">
@@ -292,7 +300,7 @@ export default function SettingsPage() {
           </div>
           <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
             {freeUpdaterProviders.length === 0 ? (
-              <EmptyState title="No providers available" description="Add a supported provider or custom endpoint before enabling the updater." />
+              <EmptyState title="No ready providers" description="Add or enable an API key for a supported free-tier provider, or create/enable a custom OpenAI-compatible endpoint. The beta updater only shows providers it can actually refresh." />
             ) : freeUpdaterProviders.map(provider => (
               <div key={provider.platform} className={cn('rounded-2xl border p-3 transition-colors', provider.selected ? 'border-primary bg-primary/5' : 'border-border bg-card')}>
                 <div className="flex items-start justify-between gap-3">
@@ -305,7 +313,7 @@ export default function SettingsPage() {
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge variant="secondary">{provider.source}</Badge>
                   <Badge variant="outline">{provider.detectionPolicy}</Badge>
-                  {provider.hasEnabledKey ? <Badge variant="default">key ready</Badge> : <Badge variant="secondary">{provider.canListAnonymously ? 'no key ok' : 'needs key'}</Badge>}
+                  {provider.hasEnabledKey ? <Badge variant="default">key ready</Badge> : <Badge variant="secondary">custom/local</Badge>}
                 </div>
               </div>
             ))}
@@ -318,6 +326,12 @@ export default function SettingsPage() {
           </div>
         )}
 
+        {freeUpdaterActionError && (
+          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+            {freeUpdaterActionError.message}
+          </div>
+        )}
+
         <div className="mt-5 rounded-2xl border border-border bg-background p-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm font-medium">Detected free models preview</p>
@@ -325,7 +339,7 @@ export default function SettingsPage() {
           </div>
           <div className="mt-3 max-h-64 space-y-2 overflow-y-auto pr-1">
             {detectedFreeModels.length === 0 ? (
-              <EmptyState title="No candidates loaded" description={selectedFreeUpdaterProviders.length === 0 ? 'Select one or more providers before refreshing.' : 'Run refresh to populate the selected-provider preview.'} />
+              <EmptyState title="No preview yet" description={selectedFreeUpdaterProviders.length === 0 ? 'Select one or more ready providers before refreshing.' : 'Refresh selected providers to load free/free-tier candidates. Nothing is fetched from unselected providers.'} />
             ) : detectedFreeModels.slice(0, 80).map(model => (
               <div key={`${model.platform}:${model.modelId}`} className="rounded-xl border border-border bg-card px-3 py-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
