@@ -4,7 +4,7 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
+import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { cn } from '@/lib/utils'
 
 interface EndpointSummary {
@@ -66,14 +66,14 @@ export default function ModelsPage() {
   const [modelDisplayName, setModelDisplayName] = useState('')
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null)
 
-  const { data: endpoints = [], isLoading } = useQuery<EndpointSummary[]>({
+  const { data: endpoints = [], isLoading, isError, error, refetch } = useQuery<EndpointSummary[]>({
     queryKey: ['custom-endpoints'],
     queryFn: () => apiFetch('/api/endpoints'),
   })
 
   const activeEndpoint = selectedEndpoint || endpoints[0]?.platform || ''
 
-  const { data: endpointModels = [] } = useQuery<EndpointModel[]>({
+  const { data: endpointModels = [], isLoading: modelsLoading, isError: modelsError, error: modelsQueryError, refetch: refetchModels } = useQuery<EndpointModel[]>({
     queryKey: ['custom-endpoint-models', activeEndpoint],
     queryFn: () => apiFetch(`/api/endpoints/${encodeURIComponent(activeEndpoint)}/models`),
     enabled: Boolean(activeEndpoint),
@@ -146,9 +146,11 @@ export default function ModelsPage() {
         </div>
 
         <section className="panel-card rounded-2xl p-5 sm:p-6">
-          <SectionTitle title="Endpoint model registry" description="Choose any harbor, register the model IDs it serves, and run a probe before adding it to your routing chain." />
+          <SectionTitle title="Endpoint model registry" description="Choose any endpoint, register the model IDs it serves, and run a probe before adding it to your routing order." />
           {isLoading ? (
-            <div className="rounded-2xl border border-border bg-card p-8 text-sm text-muted-foreground">Loading endpoints...</div>
+            <LoadingState title="Loading endpoints" description="Checking built-in and custom provider endpoints…" />
+          ) : isError ? (
+            <ErrorState title="Could not load endpoints" description={error.message} action={<Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>} />
           ) : endpoints.length === 0 ? (
             <EmptyState title="No endpoints available" description="Add a provider key or create a custom endpoint from the Keys page." />
           ) : (
@@ -159,6 +161,7 @@ export default function ModelsPage() {
                     type="button"
                     key={endpoint.platform}
                     onClick={() => setSelectedEndpoint(endpoint.platform)}
+                    aria-pressed={activeEndpoint === endpoint.platform}
                     className={cn('w-full rounded-2xl border px-4 py-3 text-left transition-colors', activeEndpoint === endpoint.platform ? 'border-primary bg-primary/8' : 'border-border bg-card hover:bg-muted/45')}
                   >
                     <span className="flex items-center justify-between gap-3 text-sm font-semibold">
@@ -180,7 +183,7 @@ export default function ModelsPage() {
                   <div className="space-y-5">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-muted-foreground">{selectedEndpointInfo.custom ? 'Custom harbor' : platformDisplay(selectedEndpointInfo.platform).surface ?? 'Built-in harbor'}</p>
+                        <p className="text-sm font-medium text-muted-foreground">{selectedEndpointInfo.custom ? 'Custom endpoint' : platformDisplay(selectedEndpointInfo.platform).surface ?? 'Built-in endpoint'}</p>
                         <h3 className="mt-1 text-lg font-semibold tracking-[-0.03em]">{selectedEndpointInfo.platform === 'google-oauth' ? 'Antigravity Browser Account' : selectedEndpointInfo.name}</h3>
                         <code className="mt-1 block truncate text-xs text-muted-foreground">{selectedEndpointInfo.baseUrl || selectedEndpointInfo.platform}</code>
                       </div>
@@ -190,18 +193,18 @@ export default function ModelsPage() {
                     <div className="rounded-[var(--radius-panel)] border border-border bg-background p-4">
                       <div className="grid gap-3 md:grid-cols-[1fr_1fr]">
                         <div className="space-y-1.5">
-                          <Label className="text-xs">Model ID</Label>
-                          <Input value={modelId} onChange={e => setModelId(e.target.value)} placeholder="llama-3.3-70b-versatile" className="h-10 rounded-[var(--radius-input)] bg-background font-mono text-xs" />
+                          <Label htmlFor="model-registry-id" className="text-xs">Model ID</Label>
+                          <Input id="model-registry-id" value={modelId} onChange={e => setModelId(e.target.value)} placeholder="llama-3.3-70b-versatile" className="h-10 rounded-[var(--radius-input)] bg-background font-mono text-xs" />
                         </div>
                         <div className="space-y-1.5">
-                          <Label className="text-xs">Display name</Label>
-                          <Input value={modelDisplayName} onChange={e => setModelDisplayName(e.target.value)} placeholder="Llama 3.3 70B" className="h-10 rounded-[var(--radius-input)] bg-background" />
+                          <Label htmlFor="model-registry-display-name" className="text-xs">Display name</Label>
+                          <Input id="model-registry-display-name" value={modelDisplayName} onChange={e => setModelDisplayName(e.target.value)} placeholder="Llama 3.3 70B" className="h-10 rounded-[var(--radius-input)] bg-background" />
                         </div>
                       </div>
                       <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                         <p className="text-xs text-muted-foreground">No context field needed. LLMHarbor lets the provider enforce the model default.</p>
                         <div className="flex gap-2">
-                          <Button type="button" variant="outline" size="sm" className="rounded-[var(--radius-button)]" disabled={!modelId || probeModel.isPending} onClick={() => probeModel.mutate({ platform: selectedEndpointInfo.platform, modelId })}>
+                          <Button type="button" variant="outline" size="sm" className="rounded-[var(--radius-button)]" disabled={!modelId || probeModel.isPending || selectedEndpointInfo.keyCount === 0} onClick={() => probeModel.mutate({ platform: selectedEndpointInfo.platform, modelId })} aria-describedby="model-probe-help">
                             {probeModel.isPending ? 'Testing...' : 'Test model'}
                           </Button>
                           <Button type="button" size="sm" className="rounded-[var(--radius-button)]" disabled={!modelId || !modelDisplayName || addModel.isPending} onClick={() => addModel.mutate({ platform: selectedEndpointInfo.platform, modelId, displayName: modelDisplayName })}>
@@ -212,16 +215,21 @@ export default function ModelsPage() {
                     </div>
 
                     {probeResult && probeResult.platform === selectedEndpointInfo.platform && (
-                      <div className={cn('rounded-[var(--radius-panel)] border px-4 py-3 text-sm', probeResult.ok ? 'border-emerald-500/30 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300' : 'border-rose-500/30 bg-rose-500/8 text-rose-700 dark:text-rose-300')}>
+                      <div className={cn('rounded-[var(--radius-panel)] border px-4 py-3 text-sm', probeResult.ok ? 'border-emerald-500/30 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300' : 'border-rose-500/30 bg-rose-500/8 text-rose-700 dark:text-rose-300')} role={probeResult.ok ? 'status' : 'alert'}>
                         <span className="font-semibold">{probeResult.ok ? 'Probe passed' : 'Probe failed'}</span>
                         <span className="ml-2 text-xs opacity-80">{probeResult.modelId}{probeResult.latencyMs !== undefined ? ` · ${probeResult.latencyMs}ms` : ''}</span>
                         <p className="mt-1 text-xs opacity-85">{probeResult.sample || probeResult.message}</p>
                       </div>
                     )}
-                    {addModel.isError && <p className="text-xs text-destructive">{(addModel.error as Error).message}</p>}
+                    <p id="model-probe-help" className="text-xs text-muted-foreground">{selectedEndpointInfo.keyCount === 0 ? 'Add a key before probing this endpoint.' : 'Probe uses the endpoint credentials before you rely on the model.'}</p>
+                    {addModel.isError && <p className="text-xs text-destructive" role="alert">{(addModel.error as Error).message}</p>}
 
                     <div className="divide-y divide-border overflow-hidden rounded-[var(--radius-panel)] border border-border bg-background">
-                      {endpointModels.length === 0 ? (
+                      {modelsLoading ? (
+                        <div className="p-4"><LoadingState title="Loading models" description="Fetching registered model IDs…" /></div>
+                      ) : modelsError ? (
+                        <div className="p-4"><ErrorState title="Could not load models" description={modelsQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchModels()}>Retry</Button>} /></div>
+                      ) : endpointModels.length === 0 ? (
                         <p className="px-4 py-5 text-sm text-muted-foreground">No models registered for this endpoint yet.</p>
                       ) : endpointModels.map(model => (
                         <div key={model.id} className="grid gap-2 px-4 py-3 sm:grid-cols-[1fr_110px_auto_auto] sm:items-center">
@@ -230,8 +238,8 @@ export default function ModelsPage() {
                             <code className="block truncate text-[11px] text-muted-foreground">{model.modelId}</code>
                           </div>
                           <span className="text-xs text-muted-foreground">{model.fallbackEnabled ? `route ${model.priority ?? 'set'}` : 'not routed'}</span>
-                          <Button variant="ghost" size="xs" onClick={() => probeModel.mutate({ platform: selectedEndpointInfo.platform, modelId: model.modelId })} disabled={probeModel.isPending}>Test</Button>
-                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteModel.mutate({ endpointPlatform: selectedEndpointInfo.platform, modelDbId: model.id })} disabled={deleteModel.isPending}>Remove</Button>
+                          <Button variant="ghost" size="xs" onClick={() => probeModel.mutate({ platform: selectedEndpointInfo.platform, modelId: model.modelId })} disabled={probeModel.isPending || selectedEndpointInfo.keyCount === 0} aria-label={`Test ${model.displayName}`}>Test</Button>
+                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => { if (window.confirm(`Remove model "${model.displayName}"?`)) deleteModel.mutate({ endpointPlatform: selectedEndpointInfo.platform, modelDbId: model.id }) }} disabled={deleteModel.isPending} aria-label={`Remove ${model.displayName}`}>Remove</Button>
                         </div>
                       ))}
                     </div>

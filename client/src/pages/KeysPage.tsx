@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -6,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
+import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { cn } from '@/lib/utils'
 import type { ApiKey, Platform } from '../../../shared/types'
 
@@ -91,12 +92,13 @@ interface BulkImportResult {
 
 function ClientKeysSection() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [visibleKeyId, setVisibleKeyId] = useState<number | null>(null)
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
   const [createdKey, setCreatedKey] = useState<ClientApiKey | null>(null)
   const [newKeyLabel, setNewKeyLabel] = useState('')
 
-  const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
+  const { data: clientKeys = [], isLoading, isError, error, refetch } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
     queryFn: () => apiFetch('/api/settings/api-keys'),
   })
@@ -104,7 +106,7 @@ function ClientKeysSection() {
   const createKey = useMutation({
     mutationFn: (label: string) => apiFetch<ClientApiKey>('/api/settings/api-keys', {
       method: 'POST',
-      body: JSON.stringify({ label: label || 'Personal key' }),
+      body: JSON.stringify({ label: label || 'Client key' }),
     }),
     onSuccess: (key) => {
       setCreatedKey(key)
@@ -150,11 +152,13 @@ function ClientKeysSection() {
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
             Create one OpenAI-compatible key per app, agent, laptop, or experiment. Then tune routes, provider endpoints, and models per key.
           </p>
-        </div>
-        <div className="grid min-w-0 gap-3 sm:min-w-[360px]">
+          </div>
+          <div className="grid min-w-0 gap-3 sm:min-w-[360px]">
           <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-            <Input
-              placeholder="Label, e.g. Cursor on MacBook"
+          <Label htmlFor="client-key-label" className="sr-only">Client key label</Label>
+          <Input
+          id="client-key-label"
+          placeholder="Label, e.g. Cursor on MacBook"
               value={newKeyLabel}
               onChange={(event) => setNewKeyLabel(event.target.value)}
             />
@@ -163,7 +167,7 @@ function ClientKeysSection() {
             </Button>
           </div>
           <div className="rounded-2xl border border-border/70 bg-background px-3 py-2 text-xs leading-5 text-muted-foreground">
-            Use Access policy to block Antigravity, allow one provider endpoint, or hide a single model from a specific llmharbor key.
+            Use Access policy to block Antigravity, allow one provider endpoint, or hide a single model from a specific client key.
           </div>
         </div>
       </div>
@@ -186,13 +190,18 @@ function ClientKeysSection() {
               <p className="font-semibold text-amber-900 dark:text-amber-100">Copy this new key now. It will only be shown once.</p>
               <code className="mt-2 block truncate rounded-xl bg-background/80 px-3 py-2 font-mono select-all">{createdKey.key}</code>
             </div>
-            <Button size="sm" onClick={() => copy(createdKey)}>{copiedKeyId === createdKey.id ? 'Copied' : 'Copy key'}</Button>
+            <Button size="sm" onClick={() => copy(createdKey)} aria-label="Copy newly created client key">{copiedKeyId === createdKey.id ? 'Copied' : 'Copy key'}</Button>
           </div>
         </div>
       )}
+      <div className="sr-only" role="status" aria-live="polite">{copiedKeyId ? 'Client key copied to clipboard.' : ''}</div>
 
       <div className="relative mt-5 space-y-3">
-        {clientKeys.length === 0 ? (
+        {isLoading ? (
+          <LoadingState title="Loading client keys" description="Checking local API credentials…" />
+        ) : isError ? (
+          <ErrorState title="Could not load client keys" description={error.message} action={<Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>} />
+        ) : clientKeys.length === 0 ? (
           <EmptyState title="No client keys yet" description="Create a key to call the local OpenAI-compatible API." />
         ) : clientKeys.map((key) => (
           <div key={key.id} className="rounded-2xl border border-border bg-background p-3">
@@ -210,11 +219,11 @@ function ClientKeysSection() {
                 </code>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)} disabled={!key.key}>{visibleKeyId === key.id && key.key ? 'Hide' : 'Show'}</Button>
-                <Button variant="default" size="sm" onClick={() => copy(key)} disabled={!key.key}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
-                <Button variant="outline" size="sm" onClick={() => { window.location.href = `/settings?key=${key.id}` }}>Access policy</Button>
-                <Switch checked={key.enabled} onCheckedChange={(enabled) => toggleKey.mutate({ id: key.id, enabled })} />
-                <Button variant="ghost" size="sm" onClick={() => deleteClientKey.mutate(key.id)}>Delete</Button>
+                <Button variant="outline" size="sm" onClick={() => setVisibleKeyId(visibleKeyId === key.id ? null : key.id)} disabled={!key.key} aria-label={`${visibleKeyId === key.id && key.key ? 'Hide' : 'Show'} key ${key.label}`}>{visibleKeyId === key.id && key.key ? 'Hide' : 'Show'}</Button>
+                <Button variant="default" size="sm" onClick={() => copy(key)} disabled={!key.key} aria-label={`Copy key ${key.label}`}>{copiedKeyId === key.id ? 'Copied' : 'Copy'}</Button>
+                <Button variant="outline" size="sm" onClick={() => navigate(`/settings?key=${key.id}`)}>Access policy</Button>
+                <Switch checked={key.enabled} onCheckedChange={(enabled) => toggleKey.mutate({ id: key.id, enabled })} aria-label={`${key.enabled ? 'Disable' : 'Enable'} client key ${key.label}`} />
+                <Button variant="ghost" size="sm" onClick={() => { if (window.confirm(`Delete client key "${key.label}"?`)) deleteClientKey.mutate(key.id) }} disabled={deleteClientKey.isPending} aria-label={`Delete client key ${key.label}`}>Delete</Button>
               </div>
             </div>
             <div className="mt-3 rounded-2xl border border-border/70 bg-card/60 px-3 py-2 text-xs leading-5 text-muted-foreground">
@@ -252,7 +261,7 @@ export default function KeysPage() {
   const [lastImport, setLastImport] = useState<BulkImportResult | null>(null)
   const importFileRef = useRef<HTMLInputElement | null>(null)
 
-  const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
+  const { data: keys = [], isLoading, isError, error, refetch } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
     queryFn: () => apiFetch('/api/keys'),
   })
@@ -427,15 +436,15 @@ export default function KeysPage() {
         </div>
 
         <section className="panel-card rounded-2xl p-5 sm:p-6">
-          <SectionTitle title="Custom providers" description="Add OpenAI-compatible harbors here. Register the models served by each endpoint from the Models page." />
+          <SectionTitle title="Custom providers" description="Add OpenAI-compatible endpoints here. Register the models served by each endpoint from the Models page." />
           <div className="grid gap-3 lg:grid-cols-[220px_1fr_auto]">
             <div className="space-y-1.5">
-              <Label className="text-xs">Endpoint name</Label>
-              <Input value={endpointName} onChange={e => setEndpointName(e.target.value)} placeholder="Local vLLM" className="h-10 rounded-2xl bg-background" />
+              <Label htmlFor="custom-endpoint-name" className="text-xs">Endpoint name</Label>
+              <Input id="custom-endpoint-name" value={endpointName} onChange={e => setEndpointName(e.target.value)} placeholder="Local vLLM" className="h-10 rounded-2xl bg-background" />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Base URL</Label>
-              <Input value={endpointBaseUrl} onChange={e => setEndpointBaseUrl(e.target.value)} placeholder="http://127.0.0.1:8000/v1" className="h-10 rounded-2xl bg-background font-mono text-xs" />
+              <Label htmlFor="custom-endpoint-base-url" className="text-xs">Base URL</Label>
+              <Input id="custom-endpoint-base-url" value={endpointBaseUrl} onChange={e => setEndpointBaseUrl(e.target.value)} placeholder="http://127.0.0.1:8000/v1" className="h-10 rounded-2xl bg-background font-mono text-xs" />
             </div>
             <Button type="button" size="lg" className="self-end rounded-2xl" disabled={!endpointName || !endpointBaseUrl || addEndpoint.isPending} onClick={() => addEndpoint.mutate({ name: endpointName, baseUrl: endpointBaseUrl })}>
               {addEndpoint.isPending ? 'Adding...' : 'Add endpoint'}
@@ -452,7 +461,7 @@ export default function KeysPage() {
                     <code className="mt-1 block truncate text-[11px] text-muted-foreground">{endpoint.baseUrl}</code>
                   </div>
                   <span className="text-xs text-muted-foreground">{endpoint.modelCount} model{endpoint.modelCount === 1 ? '' : 's'} · {endpoint.keyCount} key{endpoint.keyCount === 1 ? '' : 's'}</span>
-                  <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteEndpoint.mutate(endpoint.platform)} disabled={deleteEndpoint.isPending}>Remove</Button>
+                  <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => { if (window.confirm(`Remove custom endpoint "${endpoint.name}"?`)) deleteEndpoint.mutate(endpoint.platform) }} disabled={deleteEndpoint.isPending} aria-label={`Remove custom endpoint ${endpoint.name}`}>Remove</Button>
                 </div>
               ))}
             </div>
@@ -463,9 +472,9 @@ export default function KeysPage() {
           <SectionTitle title="Add a provider key" description="Cloudflare needs an account ID and token. For other providers, paste the key." />
           <form onSubmit={handleSubmit} className="grid gap-3 lg:grid-cols-[240px_1fr_180px_auto] lg:items-end">
             <div className="space-y-1.5">
-              <Label className="text-xs">Platform</Label>
+              <Label className="text-xs" id="provider-platform-label">Platform</Label>
               <Select value={platform} onValueChange={(v) => setPlatform(v as Platform)}>
-                <SelectTrigger className="h-10 rounded-2xl bg-background">
+                <SelectTrigger className="h-10 w-full rounded-2xl bg-background" aria-labelledby="provider-platform-label">
                   <SelectValue placeholder="Select provider" />
                 </SelectTrigger>
                 <SelectContent>
@@ -475,17 +484,17 @@ export default function KeysPage() {
             </div>
             {needsAccountId && (
               <div className="space-y-1.5 lg:col-span-1">
-                <Label className="text-xs">Account ID</Label>
-                <Input value={accountId} onChange={e => setAccountId(e.target.value)} placeholder="a1b2c3d4..." className="h-10 rounded-2xl bg-background font-mono text-xs" />
+                <Label htmlFor="provider-account-id" className="text-xs">Account ID</Label>
+                <Input id="provider-account-id" value={accountId} onChange={e => setAccountId(e.target.value)} placeholder="a1b2c3d4..." className="h-10 rounded-2xl bg-background font-mono text-xs" />
               </div>
             )}
             <div className={cn('space-y-1.5', needsAccountId ? 'lg:col-span-1' : 'lg:col-span-1')}>
-              <Label className="text-xs">{needsAccountId ? 'API token' : 'API key'}</Label>
-              <Input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={needsAccountId ? 'Bearer token' : 'Paste key'} className="h-10 rounded-2xl bg-background font-mono text-xs" />
+              <Label htmlFor="provider-api-key" className="text-xs">{needsAccountId ? 'API token' : 'API key'}</Label>
+              <Input id="provider-api-key" type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} placeholder={needsAccountId ? 'Bearer token' : 'Paste key'} className="h-10 rounded-2xl bg-background font-mono text-xs" />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Label</Label>
-              <Input value={label} onChange={e => setLabel(e.target.value)} placeholder="optional" className="h-10 rounded-2xl bg-background" />
+              <Label htmlFor="provider-key-label" className="text-xs">Label</Label>
+              <Input id="provider-key-label" value={label} onChange={e => setLabel(e.target.value)} placeholder="optional" className="h-10 rounded-2xl bg-background" />
             </div>
             <Button type="submit" size="lg" className="rounded-2xl" disabled={!platform || !apiKey || (needsAccountId && !accountId) || addKey.isPending}>
               {addKey.isPending ? 'Adding...' : 'Add key'}
@@ -497,14 +506,14 @@ export default function KeysPage() {
         <section className="panel-card rounded-2xl p-5 sm:p-6">
           <SectionTitle
             title="Bulk import provider keys"
-            description="Upload a .txt file with one key per line. Select the numbered provider target first: Google is 1, Groq is 2, and custom providers continue after the built-ins. Blank lines and # comments are ignored."
+            description="Upload a .txt file with one key per line. Choose a provider from the live target list; blank lines and # comments are ignored."
           />
           <div className="grid gap-3 lg:grid-cols-[240px_1fr_180px_auto] lg:items-end">
             <div className="space-y-1.5">
-              <Label className="text-xs">Provider ID</Label>
+              <Label className="text-xs" id="provider-import-target-label">Provider target</Label>
               <Select value={importProviderId} onValueChange={(value) => setImportProviderId(value ?? '')}>
-                <SelectTrigger className="h-10 rounded-2xl bg-background">
-                  <SelectValue placeholder="Choose ID" />
+                <SelectTrigger className="h-10 w-full rounded-2xl bg-background" aria-labelledby="provider-import-target-label">
+                  <SelectValue placeholder="Choose provider" />
                 </SelectTrigger>
                 <SelectContent>
                   {providerTargets.map(target => (
@@ -516,12 +525,12 @@ export default function KeysPage() {
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">TXT file</Label>
-              <Input ref={importFileRef} type="file" accept=".txt,text/plain" onChange={handleImportFile} className="h-10 rounded-2xl bg-background text-xs file:mr-3 file:rounded-xl file:border-0 file:bg-muted file:px-3 file:py-1 file:text-xs" />
+              <Label htmlFor="provider-import-file" className="text-xs">TXT file</Label>
+              <Input id="provider-import-file" ref={importFileRef} type="file" accept=".txt,text/plain" onChange={handleImportFile} className="h-10 rounded-2xl bg-background text-xs file:mr-3 file:rounded-xl file:border-0 file:bg-muted file:px-3 file:py-1 file:text-xs" />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Label prefix</Label>
-              <Input value={importLabelPrefix} onChange={e => setImportLabelPrefix(e.target.value)} placeholder="optional" className="h-10 rounded-2xl bg-background" />
+              <Label htmlFor="provider-import-label-prefix" className="text-xs">Label prefix</Label>
+              <Input id="provider-import-label-prefix" value={importLabelPrefix} onChange={e => setImportLabelPrefix(e.target.value)} placeholder="optional" className="h-10 rounded-2xl bg-background" />
             </div>
             <Button
               type="button"
@@ -547,8 +556,9 @@ export default function KeysPage() {
               <span className="mt-0.5 block font-medium tabular-nums">{importContents.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#')).length}</span>
             </div>
           </div>
+          {providerTargets.length === 0 && <p className="mt-3 text-xs text-muted-foreground">No provider import targets are available yet. Add or enable a provider endpoint first.</p>}
           {lastImport && (
-            <p className="mt-3 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-100">
+            <p className="mt-3 rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-100" role="status">
               Imported {lastImport.imported} key{lastImport.imported === 1 ? '' : 's'} for {lastImport.providerName}; skipped {lastImport.skipped} duplicate{lastImport.skipped === 1 ? '' : 's'}.
             </p>
           )}
@@ -561,16 +571,18 @@ export default function KeysPage() {
             description={enabledPlatforms > 0 ? `${enabledPlatforms} provider${enabledPlatforms === 1 ? '' : 's'} enabled for routing.` : 'Enable at least one provider to route requests.'}
           />
           {isLoading ? (
-            <div className="panel-card rounded-[var(--radius-panel)] p-8 text-sm text-muted-foreground">Loading provider keys...</div>
+            <LoadingState title="Loading provider keys" description="Checking configured provider credentials…" />
+          ) : isError ? (
+            <ErrorState title="Could not load provider keys" description={error.message} action={<Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>} />
           ) : keys.length === 0 ? (
-            <EmptyState title="No provider keys yet" description="Add a key above, then enable it for routing." />
+            <EmptyState title="No provider keys yet" description="Add a key above, then enable it for routing." action={<Button type="button" variant="outline" size="sm" onClick={() => document.getElementById('provider-platform-label')?.scrollIntoView({ behavior: 'smooth', block: 'center' })}>Go to add key</Button>} />
           ) : (
             <div className="space-y-4">
               {grouped.map(group => (
                 <div key={group.value} className="panel-card overflow-hidden rounded-[var(--radius-panel)]">
                   <div className="flex flex-col gap-3 border-b border-border bg-card px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
                     <div className="flex items-center gap-3">
-                      <Switch checked={group.keys.some(k => k.enabled)} onCheckedChange={(checked) => togglePlatform.mutate({ platform: group.value, enabled: checked })} disabled={togglePlatform.isPending} />
+                      <Switch checked={group.keys.some(k => k.enabled)} onCheckedChange={(checked) => togglePlatform.mutate({ platform: group.value, enabled: checked })} disabled={togglePlatform.isPending} aria-label={`${group.keys.some(k => k.enabled) ? 'Disable' : 'Enable'} provider ${group.label}`} />
                       <div>
                         <h3 className="text-sm font-semibold">{group.label}</h3>
                         <p className="text-xs text-muted-foreground tabular-nums">{group.keys.length} key{group.keys.length === 1 ? '' : 's'}</p>
@@ -593,8 +605,8 @@ export default function KeysPage() {
                             <span className="ml-2">{statusLabel[status] ?? status}</span>
                           </div>
                           <span className="text-[11px] text-muted-foreground tabular-nums">{lastChecked ? new Date(lastChecked).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'not checked'}</span>
-                          <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending}>Check</Button>
-                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteKey.mutate(k.id)} disabled={deleteKey.isPending}>Remove</Button>
+                          <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending} aria-label={`Check key ${k.label || k.maskedKey}`}>Check</Button>
+                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => { if (window.confirm(`Remove provider key "${k.label || k.maskedKey}"?`)) deleteKey.mutate(k.id) }} disabled={deleteKey.isPending} aria-label={`Remove key ${k.label || k.maskedKey}`}>Remove</Button>
                         </div>
                       )
                     })}

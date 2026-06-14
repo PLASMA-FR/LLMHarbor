@@ -165,6 +165,10 @@
   ::selection {
     background: #2A9D8F4D;
   }
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--ring) 70%, transparent);
+    outline-offset: 2px;
+  }
 }
 
 @layer utilities {
@@ -176,11 +180,17 @@
   .harbor-grid {
     background: transparent;
   }
-  .no-scrollbar {
-    scrollbar-width: none;
-    -ms-overflow-style: none;
+  .skip-link {
+    @apply fixed left-4 top-3 z-50 -translate-y-20 rounded-[var(--radius-button)] bg-primary px-3 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-transform focus:translate-y-0;
   }
-  .no-scrollbar::-webkit-scrollbar {
-    display: none;
+  .nav-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in srgb, var(--muted-foreground) 35%, transparent) transparent;
+  }
+  .nav-scroll::-webkit-scrollbar { height: 6px; }
+  .nav-scroll::-webkit-scrollbar-track { background: transparent; }
+  .nav-scroll::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted-foreground) 35%, transparent);
+    border-radius: 999px;
   }
 }

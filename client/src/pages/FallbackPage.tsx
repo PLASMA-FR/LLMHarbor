@@ -20,7 +20,7 @@ import { CSS } from '@dnd-kit/utilities'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { PageHeader, EmptyState } from '@/components/page-header'
+import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { cn } from '@/lib/utils'
 
 interface FallbackEntry {
@@ -106,7 +106,7 @@ function SortableModelRow({ entry, index, onToggle }: { entry: FallbackEntry; in
 
   return (
     <div ref={setNodeRef} style={style} className={cn('group grid gap-3 bg-card px-4 py-4 transition-colors hover:bg-muted/35 sm:grid-cols-[auto_auto_minmax(0,1fr)_auto] sm:items-center', isDragging && 'opacity-50', !entry.enabled && 'opacity-55')}>
-      <button {...attributes} {...listeners} className="cursor-grab rounded-xl p-1 text-muted-foreground/50 transition-colors hover:bg-muted hover:text-foreground active:cursor-grabbing" aria-label="Drag to reorder">
+      <button {...attributes} {...listeners} className="cursor-grab rounded-xl p-1 text-muted-foreground/50 transition-colors hover:bg-muted hover:text-foreground active:cursor-grabbing" aria-label={`Reorder ${entry.displayName}, currently position ${index + 1}`}>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" /><circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" /><circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" /></svg>
       </button>
       <div className="flex size-9 items-center justify-center rounded-2xl border border-border bg-background font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</div>
@@ -125,7 +125,7 @@ function SortableModelRow({ entry, index, onToggle }: { entry: FallbackEntry; in
           <span>{entry.monthlyTokenBudget} tok/mo</span>
         </div>
       </div>
-      <Switch checked={entry.enabled} onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)} />
+      <Switch checked={entry.enabled} onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)} aria-label={`${entry.enabled ? 'Disable' : 'Enable'} ${entry.displayName} in routing`} />
     </div>
   )
 }
@@ -134,7 +134,7 @@ export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
 
-  const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({ queryKey: ['fallback'], queryFn: () => apiFetch('/api/fallback') })
+  const { data: entries = [], isLoading, isError, error, refetch } = useQuery<FallbackEntry[]>({ queryKey: ['fallback'], queryFn: () => apiFetch('/api/fallback') })
   const { data: tokenUsage } = useQuery<TokenUsageData>({ queryKey: ['fallback', 'token-usage'], queryFn: () => apiFetch('/api/fallback/token-usage') })
 
   const saveMutation = useMutation({
@@ -178,7 +178,7 @@ export default function FallbackPage() {
     <div>
       <PageHeader
         eyebrow="Routing order"
-        title="Fallback chain"
+        title="Routing order"
         description="Put the models in the order LLMHarbor should try them. Disabled or exhausted models are skipped."
         actions={<>
           <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('intelligence')} disabled={sortMutation.isPending}>Best answers</Button>
@@ -196,14 +196,22 @@ export default function FallbackPage() {
 
         {tokenUsage && tokenUsage.totalBudget > 0 && <TokenUsageBar data={tokenUsage} />}
 
+        {(saveMutation.isError || sortMutation.isError) && (
+          <div className="rounded-[var(--radius-panel)] border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive" role="alert">
+            {(saveMutation.error ?? sortMutation.error)?.message ?? 'Could not update routing order.'}
+          </div>
+        )}
+
         {isLoading ? (
-          <div className="panel-card rounded-[var(--radius-panel)] p-8 text-sm text-muted-foreground">Loading fallback chain...</div>
+          <LoadingState title="Loading routing order" description="Fetching enabled models and token budgets…" />
+        ) : isError ? (
+          <ErrorState title="Could not load routing order" description={error.message} action={<Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>} />
         ) : displayEntries.length === 0 ? (
           <EmptyState title="No models available" description="Add provider keys first, then return here to set the routing order." />
         ) : (
           <>
             <div className="panel-card overflow-hidden rounded-[var(--radius-panel)]">
-              <div className="border-b border-border bg-card px-4 py-3 text-xs font-medium text-muted-foreground">Drag rows to change order</div>
+              <div className="border-b border-border bg-card px-4 py-3 text-xs font-medium text-muted-foreground">Drag rows, or focus a handle and use Space plus arrow keys to reorder.</div>
               <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
                 <SortableContext items={displayEntries.map(e => e.modelDbId)} strategy={verticalListSortingStrategy}>
                   <div className="divide-y divide-border">

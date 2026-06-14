@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { PageHeader, EmptyState } from '@/components/page-header'
+import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { cn } from '@/lib/utils'
 
 interface FallbackEntry {
@@ -20,6 +20,7 @@ interface FallbackEntry {
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  kind?: 'normal' | 'error'
   meta?: {
     platform?: string
     model?: string
@@ -49,12 +50,12 @@ export default function PlaygroundPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  const { data: keyData } = useQuery<{ apiKey: string }>({
+  const { data: keyData, isLoading: keyLoading, isError: keyError, error: keyQueryError } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
     queryFn: () => apiFetch('/api/settings/api-key'),
   })
 
-  const { data: fallbackEntries = [] } = useQuery<FallbackEntry[]>({
+  const { data: fallbackEntries = [], isLoading: routesLoading, isError: routesError, error: routesQueryError } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
     queryFn: () => apiFetch('/api/fallback'),
   })
@@ -101,6 +102,7 @@ export default function PlaygroundPage() {
         const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
         setMessages([...newMessages, {
           role: 'assistant',
+          kind: 'error',
           content: `Error: ${err.error?.message ?? 'Unknown error'}`,
         }])
         return
@@ -127,6 +129,7 @@ export default function PlaygroundPage() {
       const message = err instanceof Error ? err.message : 'Unknown error'
       setMessages([...newMessages, {
         role: 'assistant',
+        kind: 'error',
         content: `Error: ${message}`,
       }])
     } finally {
@@ -152,6 +155,21 @@ export default function PlaygroundPage() {
     : availableModels.find(m => localModelId(m) === selectedModel)?.displayName ?? selectedModel
 
   const lastMeta = [...messages].reverse().find(m => m.meta)?.meta
+  const selectedModelReady = selectedModel === 'auto' || availableModels.some(m => localModelId(m) === selectedModel)
+  const canSend = Boolean(input.trim()) && !loading && Boolean(keyData?.apiKey) && availableModels.length > 0 && selectedModelReady
+  const setupMessage = keyLoading || routesLoading
+    ? 'Checking keys and enabled routes…'
+    : keyError
+      ? `Could not load the client key: ${keyQueryError.message}`
+      : routesError
+        ? `Could not load routing order: ${routesQueryError.message}`
+        : !keyData?.apiKey
+          ? 'Create a client key on the Keys page before sending requests.'
+          : availableModels.length === 0
+            ? 'Add a provider key and enable at least one routed model before sending requests.'
+            : !selectedModelReady
+              ? 'The selected model is no longer available. Choose Auto routing or another ready model.'
+              : `Using ${activeModelLabel}. Enter a prompt below to test routing.`
 
   return (
     <div className="flex min-h-[calc(100vh-9.5rem)] flex-col">
@@ -162,7 +180,7 @@ export default function PlaygroundPage() {
         actions={
           <>
             <Select value={selectedModel} onValueChange={(v) => setSelectedModel(v ?? 'auto')}>
-              <SelectTrigger className="h-9 w-[270px] rounded-2xl bg-card">
+              <SelectTrigger className="h-9 w-full max-w-full rounded-2xl bg-card sm:w-[270px]" aria-label="Choose model route">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -179,7 +197,7 @@ export default function PlaygroundPage() {
       />
 
       <div className="grid flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
-        <section className="panel-card flex min-h-[620px] flex-col overflow-hidden rounded-2xl">
+        <section className="panel-card flex min-h-[min(620px,calc(100dvh-14rem))] flex-col overflow-hidden rounded-2xl">
           <div className="flex items-center justify-between border-b border-border bg-card px-5 py-3">
             <div>
               <p className="text-sm font-semibold">Thread</p>
@@ -188,14 +206,22 @@ export default function PlaygroundPage() {
             <div className="rounded-lg bg-primary/10 px-3 py-1 text-xs font-medium text-primary">{activeModelLabel}</div>
           </div>
 
-          <div className="relative flex-1 overflow-y-auto p-5">
+          <div className="relative flex-1 overflow-y-auto p-5" role="log" aria-live="polite" aria-label="Conversation">
             <div className="harbor-grid pointer-events-none absolute inset-0 opacity-70" />
             <div className="relative space-y-4">
-              {messages.length === 0 ? (
+              {keyLoading || routesLoading ? (
+                <div className="flex min-h-[360px] items-center justify-center">
+                  <LoadingState title="Preparing Playground" description={setupMessage} />
+                </div>
+              ) : keyError || routesError ? (
+                <div className="flex min-h-[360px] items-center justify-center">
+                  <ErrorState title="Playground setup failed" description={setupMessage} />
+                </div>
+              ) : messages.length === 0 ? (
                 <div className="flex min-h-[430px] items-center justify-center">
                   <EmptyState
                     title="Send a test request."
-                    description={`Using ${activeModelLabel}. Add provider keys to start routing requests.`}
+                    description={setupMessage}
                   />
                 </div>
               ) : (
@@ -206,7 +232,9 @@ export default function PlaygroundPage() {
                         'max-w-[86%] rounded-xl px-4 py-3 text-sm leading-7  sm:max-w-[76%]',
                         msg.role === 'user'
                           ? 'bg-primary text-primary-foreground '
-                          : 'border border-border bg-background ',
+                          : msg.kind === 'error'
+                            ? 'border border-destructive/30 bg-destructive/10 text-destructive'
+                            : 'border border-border bg-background ',
                       )}>
                         <div className="whitespace-pre-wrap">{msg.content}</div>
                         {msg.meta && (
@@ -224,11 +252,12 @@ export default function PlaygroundPage() {
                   ))}
                   {loading && (
                     <div className="flex justify-start">
-                      <div className="rounded-xl border border-border bg-background px-4 py-3 ">
-                        <div className="flex gap-1.5">
-                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '0ms' }} />
-                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '150ms' }} />
-                          <span className="size-1.5 rounded-lg bg-primary/70 animate-bounce" style={{ animationDelay: '300ms' }} />
+                      <div className="rounded-xl border border-border bg-background px-4 py-3" role="status" aria-live="polite">
+                        <span className="sr-only">Routing response…</span>
+                        <div className="flex gap-1.5" aria-hidden="true">
+                          <span className="size-1.5 animate-bounce rounded-lg bg-primary/70" style={{ animationDelay: '0ms' }} />
+                          <span className="size-1.5 animate-bounce rounded-lg bg-primary/70" style={{ animationDelay: '150ms' }} />
+                          <span className="size-1.5 animate-bounce rounded-lg bg-primary/70" style={{ animationDelay: '300ms' }} />
                         </div>
                       </div>
                     </div>
@@ -241,7 +270,9 @@ export default function PlaygroundPage() {
 
           <div className="border-t border-border bg-background p-3 ">
             <div className="flex items-end gap-2 rounded-[var(--radius-panel)] border border-border bg-card p-2 ">
+              <label htmlFor="playground-prompt" className="sr-only">Prompt</label>
               <textarea
+                id="playground-prompt"
                 ref={inputRef}
                 value={input}
                 onChange={e => setInput(e.target.value)}
@@ -256,10 +287,11 @@ export default function PlaygroundPage() {
                   el.style.height = Math.min(el.scrollHeight, 180) + 'px'
                 }}
               />
-              <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg" className="rounded-[var(--radius-button)] px-4">
+              <Button onClick={handleSend} disabled={!canSend} size="lg" className="rounded-[var(--radius-button)] px-4" aria-describedby="playground-send-help">
                 {loading ? 'Routing...' : 'Send'}
               </Button>
             </div>
+            <p id="playground-send-help" className="mt-2 text-xs text-muted-foreground">{canSend ? 'Press Enter to send; Shift Enter adds a line.' : setupMessage}</p>
           </div>
         </section>
 
@@ -270,7 +302,7 @@ export default function PlaygroundPage() {
           <RoutePill label="Latency" value={lastMeta?.latency != null ? `${lastMeta.latency} ms` : 'Waiting'} />
           <div className="rounded-[var(--radius-panel)] border border-border bg-card p-4 text-xs leading-5 text-muted-foreground ">
             <p className="font-medium text-foreground">Practical check</p>
-            <p className="mt-1">If a provider fails, LLMHarbor tries the next enabled model. Change the order on the Fallback page.</p>
+            <p className="mt-1">If a provider fails, LLMHarbor tries the next enabled model. Change the order on the Routing page.</p>
           </div>
         </aside>
       </div>

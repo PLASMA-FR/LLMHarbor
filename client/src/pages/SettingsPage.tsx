@@ -4,7 +4,7 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
+import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
@@ -107,12 +107,12 @@ export default function SettingsPage() {
     },
   })
 
-  const { data: freeUpdaterStatus } = useQuery<FreeModelUpdaterStatus>({
+  const { data: freeUpdaterStatus, isLoading: freeUpdaterStatusLoading, isError: freeUpdaterStatusError, error: freeUpdaterStatusQueryError, refetch: refetchFreeUpdaterStatus } = useQuery<FreeModelUpdaterStatus>({
     queryKey: ['free-model-updater-status'],
     queryFn: () => apiFetch('/api/settings/free-model-updater/status'),
   })
 
-  const { data: freeUpdaterProviderData } = useQuery<{ providers: FreeModelUpdaterProviderOption[] }>({
+  const { data: freeUpdaterProviderData, isLoading: freeUpdaterProvidersLoading, isError: freeUpdaterProvidersError, error: freeUpdaterProvidersQueryError, refetch: refetchFreeUpdaterProviders } = useQuery<{ providers: FreeModelUpdaterProviderOption[] }>({
     queryKey: ['free-model-updater-providers'],
     queryFn: () => apiFetch('/api/settings/free-model-updater/providers'),
   })
@@ -261,6 +261,7 @@ export default function SettingsPage() {
               checked={freeUpdaterStatus?.enabled ?? false}
               onCheckedChange={toggleFreeUpdater}
               disabled={freeUpdaterBusy || (!(freeUpdaterStatus?.enabled ?? false) && !canEnableFreeUpdater)}
+              aria-label={(freeUpdaterStatus?.enabled ?? false) ? 'Disable free model updater' : 'Enable free model updater'}
             />
             <Button
               type="button"
@@ -275,7 +276,7 @@ export default function SettingsPage() {
         </div>
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <SummaryTile label="Status" value={freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
+          <SummaryTile label="Status" value={freeUpdaterStatusLoading ? 'loading' : freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
           <SummaryTile label="Selected" value={freeUpdaterStatus?.selectedProviderCount ?? selectedFreeUpdaterProviders.length} detail="Only these providers are fetched." tone={selectedFreeUpdaterProviders.length ? 'good' : 'warn'} />
           <SummaryTile label="Detected" value={freeUpdaterStatus?.detectedCount ?? detectedFreeModels.length} detail="Candidates from the latest selected-provider refresh." />
           <SummaryTile label="Last run" value={freeUpdaterStatus?.lastRunAt ? new Date(freeUpdaterStatus.lastRunAt).toLocaleString() : 'Never'} detail="Most recent updater cycle." />
@@ -299,7 +300,11 @@ export default function SettingsPage() {
             </div>
           </div>
           <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-            {freeUpdaterProviders.length === 0 ? (
+            {freeUpdaterProvidersLoading ? (
+              <div className="md:col-span-2 xl:col-span-3"><LoadingState title="Loading ready providers" description="Checking enabled keys and custom endpoints…" /></div>
+            ) : freeUpdaterProvidersError ? (
+              <div className="md:col-span-2 xl:col-span-3"><ErrorState title="Could not load updater providers" description={freeUpdaterProvidersQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchFreeUpdaterProviders()}>Retry</Button>} /></div>
+            ) : freeUpdaterProviders.length === 0 ? (
               <EmptyState title="No ready providers" description="Add or enable an API key for a supported free-tier provider, or create/enable a custom OpenAI-compatible endpoint. The beta updater only shows providers it can actually refresh." />
             ) : freeUpdaterProviders.map(provider => (
               <div key={provider.platform} className={cn('rounded-2xl border p-3 transition-colors', provider.selected ? 'border-primary bg-primary/5' : 'border-border bg-card')}>
@@ -308,7 +313,7 @@ export default function SettingsPage() {
                     <p className="truncate text-sm font-medium">{provider.name}</p>
                     <code className="mt-1 block truncate text-[11px] text-muted-foreground">{provider.platform}</code>
                   </div>
-                  <Switch checked={provider.selected} disabled={freeUpdaterBusy} onCheckedChange={checked => setFreeUpdaterProvider(provider.platform, checked)} />
+                  <Switch checked={provider.selected} disabled={freeUpdaterBusy} onCheckedChange={checked => setFreeUpdaterProvider(provider.platform, checked)} aria-label={`${provider.selected ? 'Deselect' : 'Select'} ${provider.name} for free model refresh`} />
                 </div>
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge variant="secondary">{provider.source}</Badge>
@@ -323,6 +328,12 @@ export default function SettingsPage() {
         {freeUpdaterStatus?.errorMessage && (
           <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
             {freeUpdaterStatus.errorMessage}
+          </div>
+        )}
+
+        {freeUpdaterStatusError && (
+          <div className="mt-4">
+            <ErrorState title="Could not load updater status" description={freeUpdaterStatusQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchFreeUpdaterStatus()}>Retry</Button>} />
           </div>
         )}
 
@@ -468,7 +479,7 @@ export default function SettingsPage() {
                             <code className="mt-2 block font-mono text-xs text-muted-foreground">{route.path}</code>
                             <p className="mt-2 text-xs leading-5 text-muted-foreground">{route.description}</p>
                           </div>
-                          <Switch checked={route.enabled} onCheckedChange={(enabled) => updatePolicy({ routes: [{ route: route.id, enabled }] })} disabled={patchPolicy.isPending} />
+                          <Switch checked={route.enabled} onCheckedChange={(enabled) => updatePolicy({ routes: [{ route: route.id, enabled }] })} disabled={patchPolicy.isPending} aria-label={`${route.enabled ? 'Block' : 'Allow'} route ${route.name}`} />
                         </div>
                       </div>
                     ))}
@@ -495,7 +506,7 @@ export default function SettingsPage() {
                           </div>
                           <div className="flex shrink-0 items-center gap-3">
                             <PolicyStateBadge enabled={provider.enabled} />
-                            <Switch checked={provider.enabled} onCheckedChange={(enabled) => updatePolicy({ platforms: [{ platform: provider.platform, enabled }] })} disabled={patchPolicy.isPending} />
+                            <Switch checked={provider.enabled} onCheckedChange={(enabled) => updatePolicy({ platforms: [{ platform: provider.platform, enabled }] })} disabled={patchPolicy.isPending} aria-label={`${provider.enabled ? 'Block' : 'Allow'} provider ${provider.name}`} />
                           </div>
                         </div>
                       </div>
@@ -554,7 +565,7 @@ export default function SettingsPage() {
                           </div>
                           <div className="flex shrink-0 items-center justify-between gap-3 md:justify-end">
                             <PolicyStateBadge enabled={model.enabled} />
-                            <Switch checked={model.enabled} onCheckedChange={(enabled) => updatePolicy({ models: [{ modelDbId: model.modelDbId, enabled }] })} disabled={patchPolicy.isPending} />
+                            <Switch checked={model.enabled} onCheckedChange={(enabled) => updatePolicy({ models: [{ modelDbId: model.modelDbId, enabled }] })} disabled={patchPolicy.isPending} aria-label={`${model.enabled ? 'Block' : 'Allow'} model ${model.displayName}`} />
                           </div>
                         </div>
                       </div>

@@ -7,7 +7,7 @@ import {
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { PageHeader } from '@/components/page-header'
+import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 
 type TimeRange = '24h' | '7d' | '30d'
 
@@ -95,35 +95,37 @@ const primaryFill = 'var(--foreground)'
 export default function AnalyticsPage() {
   const [range, setRange] = useState<TimeRange>('7d')
 
-  const { data: summary } = useQuery({
+  const { data: summary, isLoading: summaryLoading, isError: summaryError, error: summaryQueryError, refetch: refetchSummary } = useQuery({
     queryKey: ['analytics', 'summary', range],
     queryFn: () => apiFetch<AnalyticsSummary>(`/api/analytics/summary?range=${range}`),
   })
 
-  const { data: byPlatform = [] } = useQuery({
+  const { data: byPlatform = [], isLoading: platformLoading, isError: platformError, error: platformQueryError } = useQuery({
     queryKey: ['analytics', 'by-platform', range],
     queryFn: () => apiFetch<PlatformStats[]>(`/api/analytics/by-platform?range=${range}`),
   })
 
-  const { data: timeline = [] } = useQuery({
+  const { data: timeline = [], isLoading: timelineLoading, isError: timelineError, error: timelineQueryError } = useQuery({
     queryKey: ['analytics', 'timeline', range],
     queryFn: () => apiFetch<TimelinePoint[]>(`/api/analytics/timeline?range=${range}`),
   })
 
-  const { data: byModel = [] } = useQuery({
+  const { data: byModel = [], isLoading: modelLoading, isError: modelError, error: modelQueryError } = useQuery({
     queryKey: ['analytics', 'by-model', range],
     queryFn: () => apiFetch<ModelStats[]>(`/api/analytics/by-model?range=${range}`),
   })
 
-  const { data: errors = [] } = useQuery({
+  const { data: errors = [], isLoading: errorsLoading, isError: errorsError, error: errorsQueryError } = useQuery({
     queryKey: ['analytics', 'errors', range],
     queryFn: () => apiFetch<ErrorEntry[]>(`/api/analytics/errors?range=${range}`),
   })
 
-  const { data: errorDist } = useQuery({
+  const { data: errorDist, isLoading: errorDistLoading, isError: errorDistError, error: errorDistQueryError } = useQuery({
     queryKey: ['analytics', 'error-distribution', range],
     queryFn: () => apiFetch<ErrorDistribution>(`/api/analytics/error-distribution?range=${range}`),
   })
+
+  const analyticsError = summaryError ? summaryQueryError : platformError ? platformQueryError : timelineError ? timelineQueryError : modelError ? modelQueryError : errorsError ? errorsQueryError : errorDistError ? errorDistQueryError : null
 
   return (
     <div>
@@ -138,6 +140,7 @@ export default function AnalyticsPage() {
                 key={r}
                 variant={range === r ? 'secondary' : 'ghost'}
                 size="xs"
+                aria-pressed={range === r}
                 onClick={() => setRange(r)}
               >
                 {r}
@@ -148,20 +151,26 @@ export default function AnalyticsPage() {
       />
 
       <div className="space-y-6">
+        {analyticsError && (
+          <ErrorState title="Some analytics could not load" description={analyticsError.message} action={<Button variant="outline" size="sm" onClick={() => refetchSummary()}>Retry summary</Button>} />
+        )}
+
         {/* Summary stats */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-          <Stat label="Requests" value={summary?.totalRequests ?? 0} />
-          <Stat label="Success rate" value={`${summary?.successRate ?? 0}%`} />
-          <Stat label="Input tokens" value={formatTokens(summary?.totalInputTokens)} />
-          <Stat label="Output tokens" value={formatTokens(summary?.totalOutputTokens)} />
-          <Stat label="Avg latency" value={`${summary?.avgLatencyMs ?? 0} ms`} />
-          <Stat label="Est. savings" value={`$${summary?.estimatedCostSavings ?? '0.00'}`} />
+          <Stat label="Requests" value={summaryLoading ? '…' : summary?.totalRequests ?? 0} />
+          <Stat label="Success rate" value={summaryLoading ? '…' : `${summary?.successRate ?? 0}%`} />
+          <Stat label="Input tokens" value={summaryLoading ? '…' : formatTokens(summary?.totalInputTokens)} />
+          <Stat label="Output tokens" value={summaryLoading ? '…' : formatTokens(summary?.totalOutputTokens)} />
+          <Stat label="Avg latency" value={summaryLoading ? '…' : `${summary?.avgLatencyMs ?? 0} ms`} />
+          <Stat label="Est. savings" value={summaryLoading ? '…' : `$${summary?.estimatedCostSavings ?? '0.00'}`} />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <Panel title="Requests by provider">
-            {byPlatform.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
+            {platformLoading ? (
+              <LoadingState title="Loading provider requests" />
+            ) : byPlatform.length === 0 ? (
+              <EmptyState title="No requests in this range" description="Send traffic through Playground or the public API to populate provider analytics." />
             ) : (
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
@@ -176,8 +185,10 @@ export default function AnalyticsPage() {
           </Panel>
 
           <Panel title="Avg latency by provider">
-            {byPlatform.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
+            {platformLoading ? (
+              <LoadingState title="Loading latency" />
+            ) : byPlatform.length === 0 ? (
+              <EmptyState title="No latency data yet" description="Latency appears after routed requests complete." />
             ) : (
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
@@ -193,8 +204,10 @@ export default function AnalyticsPage() {
 
           <div className="lg:col-span-2">
             <Panel title="Requests over time">
-              {timeline.length === 0 ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
+              {timelineLoading ? (
+                <LoadingState title="Loading timeline" />
+              ) : timeline.length === 0 ? (
+                <EmptyState title="No timeline data" description="Requests will appear here grouped by success and failure." />
               ) : (
                 <ResponsiveContainer width="100%" height={240}>
                   <LineChart data={timeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
@@ -213,8 +226,10 @@ export default function AnalyticsPage() {
 
           <div className="lg:col-span-2">
             <Panel title="Model breakdown">
-              {byModel.length === 0 ? (
-                <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
+              {modelLoading ? (
+                <LoadingState title="Loading model breakdown" />
+              ) : byModel.length === 0 ? (
+                <EmptyState title="No model breakdown yet" description="Per-model usage appears after traffic has been routed." />
               ) : (
                 <div className="max-h-[360px] overflow-y-auto -mx-4">
                   <Table>
@@ -249,8 +264,10 @@ export default function AnalyticsPage() {
           </div>
 
           <Panel title="Errors by provider">
-            {!errorDist?.byPlatform?.length ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No errors</p>
+            {errorDistLoading ? (
+              <LoadingState title="Loading error distribution" />
+            ) : !errorDist?.byPlatform?.length ? (
+              <EmptyState title="No provider errors" description="Provider errors will appear here when upstream calls fail." />
             ) : (
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={errorDist.byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
@@ -265,8 +282,10 @@ export default function AnalyticsPage() {
           </Panel>
 
           <Panel title="Recent errors">
-            {errors.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No errors</p>
+            {errorsLoading ? (
+              <LoadingState title="Loading recent errors" />
+            ) : errors.length === 0 ? (
+              <EmptyState title="No recent errors" description="Failed upstream calls will appear here with their full message." />
             ) : (
               <div className="max-h-[240px] overflow-y-auto -mx-4">
                 <Table>
@@ -281,7 +300,7 @@ export default function AnalyticsPage() {
                     {errors.slice(0, 20).map((e) => (
                       <TableRow key={e.id}>
                         <TableCell className="pl-4 text-xs">{e.platform}</TableCell>
-                        <TableCell className="text-xs max-w-[200px] truncate">{e.error}</TableCell>
+                        <TableCell className="text-xs max-w-[200px] truncate" title={e.error}>{e.error}</TableCell>
                         <TableCell className="text-right text-xs text-muted-foreground tabular-nums pr-4">
                           {new Date(e.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </TableCell>

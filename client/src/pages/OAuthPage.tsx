@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
+import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 
 interface OAuthProvider {
@@ -115,8 +115,8 @@ export default function OAuthPage() {
   const [renaming, setRenaming] = useState<Record<number, string>>({})
   const [activeConnection, setActiveConnection] = useState<ActiveConnection | null>(null)
 
-  const { data: providerData } = useQuery<{ providers: OAuthProvider[] }>({ queryKey: ['oauth-providers'], queryFn: () => apiFetch('/api/oauth/providers') })
-  const { data: accountData } = useQuery<{ accounts: OAuthAccount[] }>({ queryKey: ['oauth-accounts'], queryFn: () => apiFetch('/api/oauth/accounts') })
+  const { data: providerData, isLoading: providersLoading, isError: providersError, error: providersQueryError, refetch: refetchProviders } = useQuery<{ providers: OAuthProvider[] }>({ queryKey: ['oauth-providers'], queryFn: () => apiFetch('/api/oauth/providers') })
+  const { data: accountData, isLoading: accountsLoading, isError: accountsError, error: accountsQueryError, refetch: refetchAccounts } = useQuery<{ accounts: OAuthAccount[] }>({ queryKey: ['oauth-accounts'], queryFn: () => apiFetch('/api/oauth/accounts') })
   const providers = providerData?.providers ?? []
   const accounts = accountData?.accounts ?? []
 
@@ -174,7 +174,7 @@ export default function OAuthPage() {
       <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
         <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
           <SectionTitle title="Connect a provider" description="LLMHarbor handles PKCE, loopback callbacks, encrypted credential storage, model discovery, and account-limit telemetry. No CLI handoff or raw token paste boxes." />
-          {startLogin.error && <p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{startLogin.error.message}</p>}
+          {startLogin.error && <p className="mt-4 rounded-2xl border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive" role="alert">{startLogin.error.message}</p>}
           {activeConnection && (
             <div className="mt-4 rounded-2xl border border-border bg-muted/60 p-4 text-sm">
               {activeConnection.loginMode === 'browser-oauth' ? (
@@ -201,7 +201,11 @@ export default function OAuthPage() {
             </div>
           )}
           <div className="mt-5 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-2">
-            {providers.map(provider => (
+            {providersLoading ? (
+              <div className="md:col-span-2"><LoadingState title="Loading OAuth providers" description="Checking available browser-account integrations…" /></div>
+            ) : providersError ? (
+              <div className="md:col-span-2"><ErrorState title="Could not load OAuth providers" description={providersQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchProviders()}>Retry</Button>} /></div>
+            ) : providers.map(provider => (
               <article key={provider.id} className="min-w-0 rounded-2xl border border-border bg-background p-4">
                 <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
                   <div className="min-w-0">
@@ -225,7 +229,7 @@ export default function OAuthPage() {
                   ))}
                 </div>
                 <p className="mt-4 truncate rounded-xl bg-muted px-3 py-2 text-xs text-muted-foreground">{provider.authorizationUrl}</p>
-                <Button className="mt-4 w-full" disabled={startLogin.isPending || !provider.canConnect} onClick={() => startLogin.mutate(provider)}>
+                <Button className="mt-4 w-full" disabled={startLogin.isPending || !provider.canConnect} onClick={() => startLogin.mutate(provider)} aria-label={`Connect ${provider.name}`}>
                   {provider.canConnect ? (provider.loginMode === 'device-oauth' ? 'Connect with device code' : 'Connect account') : 'Waiting for verified public client'}
                 </Button>
               </article>
@@ -237,9 +241,9 @@ export default function OAuthPage() {
           <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
             <SectionTitle title="Connected accounts" description="Each account shows provider-reported model inventory and limit windows. Select an account to refresh its models." />
             <div className="mt-5 space-y-3">
-              {accounts.length === 0 ? <EmptyState title="No connected accounts" description="Connect a provider account to make its OAuth-backed models available." /> : accounts.map(account => (
+              {accountsLoading ? <LoadingState title="Loading connected accounts" /> : accountsError ? <ErrorState title="Could not load accounts" description={accountsQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchAccounts()}>Retry</Button>} /> : accounts.length === 0 ? <EmptyState title="No connected accounts" description="Connect a provider account to make its OAuth-backed models available." /> : accounts.map(account => (
                 <div key={account.id} className="min-w-0 rounded-2xl border border-border bg-background p-4">
-                  <button onClick={() => setSelectedAccount(account.id)} className="w-full text-left">
+                  <button onClick={() => setSelectedAccount(account.id)} className="w-full rounded-2xl text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/40" aria-pressed={selectedAccount === account.id}>
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="font-medium">{account.label}</span>
                       <Badge variant="secondary">{account.providerName}</Badge>
@@ -250,10 +254,10 @@ export default function OAuthPage() {
                     <LimitBars limits={account.limits} />
                   </button>
                   <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto_auto_auto]">
-                    <Input value={renaming[account.id] ?? account.label} onChange={event => setRenaming(prev => ({ ...prev, [account.id]: event.target.value }))} />
+                    <Input aria-label={`Rename ${account.label}`} value={renaming[account.id] ?? account.label} onChange={event => setRenaming(prev => ({ ...prev, [account.id]: event.target.value }))} />
                     <Button variant="outline" size="sm" onClick={() => updateAccount.mutate({ id: account.id, body: { label: renaming[account.id] ?? account.label } })}>Rename</Button>
                     <Button variant="outline" size="sm" onClick={() => updateAccount.mutate({ id: account.id, body: { enabled: !account.enabled } })}>{account.enabled ? 'Disable' : 'Enable'}</Button>
-                    <Button variant="ghost" size="sm" onClick={() => deleteAccount.mutate(account.id)}>Remove</Button>
+                    <Button variant="ghost" size="sm" onClick={() => { if (window.confirm(`Remove OAuth account "${account.label}"?`)) deleteAccount.mutate(account.id) }}>Remove</Button>
                   </div>
                 </div>
               ))}
@@ -262,7 +266,7 @@ export default function OAuthPage() {
 
           {selectedAccount !== null && <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
             <SectionTitle title="Automatic model inventory" description="This list is refreshed from the selected account. Unsupported stale model IDs are removed from routing." />
-            {models.isLoading ? <p className="mt-4 text-sm text-muted-foreground">Refreshing provider inventory...</p> : models.error ? <p className="mt-4 text-sm text-destructive">{models.error.message}</p> : models.data?.message ? <p className="mt-4 text-sm text-muted-foreground">{models.data.message}</p> : (
+            {models.isLoading ? <LoadingState title="Refreshing provider inventory" /> : models.error ? <ErrorState title="Inventory refresh failed" description={models.error.message} /> : models.data?.message ? <EmptyState title="No inventory available" description={models.data.message} /> : (
               <div className="mt-4 space-y-4">
                 <LimitBars limits={models.data?.limits} />
                 <div className="flex flex-wrap gap-2">{(models.data?.models ?? []).map(model => <Badge key={model.id} variant="outline">{model.displayName ?? model.id}</Badge>)}</div>
