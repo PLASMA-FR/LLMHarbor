@@ -221,6 +221,7 @@ endpointsRouter.delete('/:platform', (req: Request, res: Response) => {
   const db = getDb();
   const remove = db.transaction(() => {
     db.prepare('DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = ?)').run(platform.data);
+    db.prepare('DELETE FROM free_model_updater_provider_preferences WHERE platform = ?').run(platform.data);
     db.prepare('DELETE FROM models WHERE platform = ?').run(platform.data);
     db.prepare('DELETE FROM api_keys WHERE platform = ?').run(platform.data);
     db.prepare('DELETE FROM custom_endpoints WHERE platform = ?').run(platform.data);

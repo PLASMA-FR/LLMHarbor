@@ -142,6 +142,29 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  it('normalizes common custom /models response shapes', async () => {
+    const catalogProvider = new OpenAICompatProvider({
+      platform: 'custom-local-vllm',
+      name: 'Local vLLM',
+      baseUrl: 'http://127.0.0.1:18888/v1',
+    });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
+      models: [
+        'string-model',
+        { name: 'name-only-model', context_window: '8192' },
+        { model_id: 'model-id-field', display_name: 'Model ID Field', input_token: '0', output_token: '0' },
+      ],
+    }) as any);
+
+    const models = await catalogProvider.listModels('');
+
+    expect(models).toEqual([
+      expect.objectContaining({ id: 'string-model', displayName: 'string-model' }),
+      expect.objectContaining({ id: 'name-only-model', contextWindow: 8192 }),
+      expect.objectContaining({ id: 'model-id-field', displayName: 'Model ID Field', pricing: { prompt: '0', completion: '0' } }),
+    ]);
+  });
+
   it('validateKey returns false on confirmed 401', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: false, status: 401 } as any);
     expect(await provider.validateKey('bad')).toBe(false);

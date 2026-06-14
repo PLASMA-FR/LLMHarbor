@@ -6,6 +6,35 @@ import type {
 } from '@llmharbor/shared/types.js';
 import { BaseProvider, type CompletionOptions, type ProviderCatalogModel } from './base.js';
 
+function catalogRows(body: any): any[] {
+  if (Array.isArray(body)) return body;
+  if (Array.isArray(body?.data)) return body.data;
+  if (Array.isArray(body?.models)) return body.models;
+  return [];
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function numericValue(...values: unknown[]): number | null {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  }
+  return null;
+}
+
+function pricingFields(row: Record<string, unknown>): unknown {
+  if (row.pricing || row.cost || row.limits || row.price) return row.pricing ?? row.cost ?? row.limits ?? row.price;
+  const prompt = row.prompt ?? row.input ?? row.prompt_tokens ?? row.input_tokens ?? row.input_token ?? row.prompt_price;
+  const completion = row.completion ?? row.output ?? row.completion_tokens ?? row.output_tokens ?? row.output_token ?? row.completion_price;
+  return prompt !== undefined || completion !== undefined ? { prompt, completion } : null;
+}
+
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, SambaNova, NVIDIA NIM, Mistral, OpenRouter,
@@ -57,20 +86,25 @@ export class OpenAICompatProvider extends BaseProvider {
     }
 
     const body = await res.json() as any;
-    const rows = Array.isArray(body.data) ? body.data : Array.isArray(body.models) ? body.models : [];
-    return rows
-      .filter((row: any) => typeof row?.id === 'string' && row.id.length > 0)
-      .map((row: any) => ({
-        id: row.id,
-        displayName: row.name ?? row.display_name ?? row.id,
-        contextWindow: typeof row.context_length === 'number'
-          ? row.context_length
-          : typeof row.context_window === 'number'
-            ? row.context_window
-            : null,
-        pricing: row.pricing ?? row.cost ?? row.limits ?? null,
-        raw: row,
-      }));
+    const normalized: Array<ProviderCatalogModel | null> = catalogRows(body)
+      .map((row: any) => {
+        if (typeof row === 'string') {
+          return { id: row, displayName: row, contextWindow: null, pricing: null, raw: row };
+        }
+        if (!row || typeof row !== 'object') return null;
+        const record = row as Record<string, unknown>;
+        const id = firstString(record.id, record.model, record.model_id, record.name);
+        if (!id) return null;
+        const displayName = firstString(record.display_name, record.displayName, record.name, record.label, id) ?? id;
+        return {
+          id,
+          displayName,
+          contextWindow: numericValue(record.context_length, record.context_window, record.max_context_length, record.context, record.inputTokenLimit),
+          pricing: pricingFields(record),
+          raw: row,
+        };
+      });
+    return normalized.filter((row): row is ProviderCatalogModel => row !== null);
   }
 
   async chatCompletion(
@@ -85,7 +119,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(this.endpoint('/chat/completions'), {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
@@ -125,7 +159,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(this.endpoint('/chat/completions'), {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
@@ -183,7 +217,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         ...this.extraHeaders,
       },
     }, 10000);

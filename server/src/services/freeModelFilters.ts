@@ -4,6 +4,7 @@ import {
   FREE_MODEL_KEYWORDS,
   freeModelPolicyForPlatform,
   knownFreeModelsForPlatform,
+  type ProviderFreePolicy,
 } from '../lib/providerFreeModels.js';
 
 export interface FilteredFreeModel {
@@ -17,15 +18,19 @@ export interface FilteredFreeModel {
 
 function numericZero(value: unknown): boolean {
   if (value === 0) return true;
-  if (typeof value === 'string' && value.trim() !== '') return Number(value) === 0;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const normalized = value.trim().toLowerCase().replace(/^\$/, '');
+    if (normalized === 'free') return true;
+    return Number(normalized) === 0;
+  }
   return false;
 }
 
 function hasZeroPricing(pricing: unknown): boolean {
   if (!pricing || typeof pricing !== 'object') return false;
   const obj = pricing as Record<string, unknown>;
-  const prompt = obj.prompt ?? obj.input ?? obj.prompt_tokens;
-  const completion = obj.completion ?? obj.output ?? obj.completion_tokens;
+  const prompt = obj.prompt ?? obj.input ?? obj.prompt_tokens ?? obj.input_tokens ?? obj.input_token ?? obj.prompt_price;
+  const completion = obj.completion ?? obj.output ?? obj.completion_tokens ?? obj.output_tokens ?? obj.output_token ?? obj.completion_price;
   if (prompt === undefined && completion === undefined) return false;
   return numericZero(prompt ?? 0) && numericZero(completion ?? 0);
 }
@@ -49,8 +54,8 @@ function fromKnown(platform: string): FilteredFreeModel[] {
   }));
 }
 
-export function filterFreeModels(platform: Platform, catalog: ProviderCatalogModel[]): FilteredFreeModel[] {
-  const policy = freeModelPolicyForPlatform(String(platform));
+export function filterFreeModels(platform: Platform, catalog: ProviderCatalogModel[], policyOverride?: ProviderFreePolicy): FilteredFreeModel[] {
+  const policy = policyOverride ?? freeModelPolicyForPlatform(String(platform));
   const candidates: FilteredFreeModel[] = [];
 
   for (const row of catalog) {

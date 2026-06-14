@@ -168,6 +168,13 @@ function createTables(db: Database.Database) {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS free_model_updater_provider_preferences (
+      platform TEXT PRIMARY KEY,
+      selected INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS model_free_metadata (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       model_id INTEGER NOT NULL UNIQUE REFERENCES models(id) ON DELETE CASCADE,
@@ -282,6 +289,7 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
     CREATE INDEX IF NOT EXISTS idx_model_free_metadata_status ON model_free_metadata(verification_status);
+    CREATE INDEX IF NOT EXISTS idx_free_model_updater_provider_preferences_selected ON free_model_updater_provider_preferences(selected);
   `);
 
   db.prepare(`

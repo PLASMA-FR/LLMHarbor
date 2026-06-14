@@ -88,6 +88,9 @@ describe('Migration idempotency', () => {
     expect(names).toContain('verification_status');
     expect(names).toContain('consecutive_failures');
     expect(names).toContain('created_by_updater');
+
+    const preferenceColumns = db.prepare('PRAGMA table_info(free_model_updater_provider_preferences)').all() as { name: string }[];
+    expect(preferenceColumns.map(col => col.name)).toEqual(expect.arrayContaining(['platform', 'selected', 'updated_at']));
   });
 
   it('migrates legacy Google AI Studio OAuth accounts into disabled cleanup state and renames browser rows to Antigravity', () => {

@@ -5,12 +5,35 @@ import { freeModelUpdater } from '../services/freeModelUpdater.js';
 
 export const freeModelUpdaterRouter = Router();
 
+const providerSelectionSchema = z.object({
+  selectedProviders: z.array(z.string().min(1).max(120)).max(50),
+}).strict();
+
 const intervalSchema = z.object({
   refreshIntervalHours: z.number().int().min(1).max(24).optional(),
+  selectedProviders: z.array(z.string().min(1).max(120)).max(50).optional(),
 }).strict();
 
 freeModelUpdaterRouter.get('/status', (_req: Request, res: Response) => {
   res.json(freeModelUpdater.getStatus());
+});
+
+freeModelUpdaterRouter.get('/providers', (_req: Request, res: Response) => {
+  res.json({ providers: freeModelUpdater.getProviderOptions() });
+});
+
+freeModelUpdaterRouter.put('/providers', (req: Request, res: Response) => {
+  const parsed = providerSelectionSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+  try {
+    const status = freeModelUpdater.setSelectedProviders(parsed.data.selectedProviders);
+    res.json({ status, providers: freeModelUpdater.getProviderOptions() });
+  } catch (error) {
+    res.status(400).json({ error: { message: error instanceof Error ? error.message : String(error) } });
+  }
 });
 
 freeModelUpdaterRouter.post('/enable', (req: Request, res: Response) => {
@@ -18,6 +41,14 @@ freeModelUpdaterRouter.post('/enable', (req: Request, res: Response) => {
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
+  }
+  if (parsed.data.selectedProviders) {
+    try {
+      freeModelUpdater.setSelectedProviders(parsed.data.selectedProviders);
+    } catch (error) {
+      res.status(400).json({ error: { message: error instanceof Error ? error.message : String(error) } });
+      return;
+    }
   }
   res.json(freeModelUpdater.enable(parsed.data.refreshIntervalHours));
 });
@@ -32,5 +63,5 @@ freeModelUpdaterRouter.post('/refresh-now', async (_req: Request, res: Response)
 });
 
 freeModelUpdaterRouter.get('/detected-models', async (_req: Request, res: Response) => {
-  res.json(await freeModelUpdater.detectFreeModels());
+  res.json(freeModelUpdater.getDetectedModels());
 });

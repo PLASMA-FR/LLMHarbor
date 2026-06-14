@@ -8,7 +8,7 @@ import { PageHeader, SectionTitle, EmptyState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import type { DetectedFreeModel, FreeModelUpdaterStatus } from '../../../shared/types'
+import type { DetectedFreeModel, FreeModelUpdaterProviderOption, FreeModelUpdaterStatus } from '../../../shared/types'
 
 interface ClientApiKey { id: number; label: string; key?: string; maskedKey: string; enabled: boolean; createdAt: string; lastUsedAt: string | null; localEndpointId?: number | null }
 interface LocalEndpointKey { id: number; label: string; maskedKey: string; enabled: boolean; localEndpointId: number; createdAt?: string; lastUsedAt?: string | null }
@@ -112,8 +112,13 @@ export default function SettingsPage() {
     queryFn: () => apiFetch('/api/settings/free-model-updater/status'),
   })
 
+  const { data: freeUpdaterProviderData } = useQuery<{ providers: FreeModelUpdaterProviderOption[] }>({
+    queryKey: ['free-model-updater-providers'],
+    queryFn: () => apiFetch('/api/settings/free-model-updater/providers'),
+  })
+
   const { data: detectedFreeModels = [], isFetching: detectingFreeModels } = useQuery<DetectedFreeModel[]>({
-    queryKey: ['free-model-updater-detected-models'],
+    queryKey: ['free-model-updater-detected-models', freeUpdaterStatus?.selectedProviders ?? []],
     queryFn: () => apiFetch('/api/settings/free-model-updater/detected-models'),
     staleTime: 60_000,
   })
@@ -140,6 +145,18 @@ export default function SettingsPage() {
     },
   })
 
+  const updateFreeUpdaterProviders = useMutation({
+    mutationFn: (selectedProviders: string[]) => apiFetch('/api/settings/free-model-updater/providers', {
+      method: 'PUT',
+      body: JSON.stringify({ selectedProviders }),
+    }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
+    },
+  })
+
   useEffect(() => {
     if (freeUpdaterStatus) setFreeUpdaterInterval(String(freeUpdaterStatus.refreshIntervalHours))
   }, [freeUpdaterStatus])
@@ -153,6 +170,8 @@ export default function SettingsPage() {
   const blockedModels = policy?.models.filter(model => !model.enabled).length ?? 0
   const allowedModels = policy ? policy.models.length - blockedModels : 0
   const totalBlocked = blockedRoutes + blockedProviders + blockedModels
+  const freeUpdaterProviders = freeUpdaterProviderData?.providers ?? []
+  const selectedFreeUpdaterProviders = freeUpdaterProviders.filter(provider => provider.selected).map(provider => provider.platform)
   const providerOptions = useMemo(() => Array.from(new Set(policy?.models.map(model => model.platform) ?? [])).sort((a, b) => a.localeCompare(b)), [policy?.models])
   const visibleModels = useMemo(() => {
     const query = modelSearch.trim().toLowerCase()
@@ -162,7 +181,7 @@ export default function SettingsPage() {
       .filter(model => !query || `${model.modelId} ${model.displayName} ${model.platform}`.toLowerCase().includes(query))
       .slice(0, 160)
   }, [modelSearch, platformFilter, policy?.models, showBlockedOnly])
-  const freeUpdaterBusy = enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending
+  const freeUpdaterBusy = enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending || updateFreeUpdaterProviders.isPending
 
   function updatePolicy(patch: PolicyPatch) {
     if (!activeKeyId) return
@@ -182,6 +201,17 @@ export default function SettingsPage() {
   function setVisibleModels(enabled: boolean) {
     if (!visibleModels.length) return
     updatePolicy({ models: visibleModels.map(model => ({ modelDbId: model.modelDbId, enabled })) })
+  }
+
+  function setFreeUpdaterProvider(platform: string, selected: boolean) {
+    const next = new Set(selectedFreeUpdaterProviders.map(String))
+    if (selected) next.add(platform)
+    else next.delete(platform)
+    updateFreeUpdaterProviders.mutate(Array.from(next).sort((a, b) => a.localeCompare(b)))
+  }
+
+  function setAllFreeUpdaterProviders(selected: boolean) {
+    updateFreeUpdaterProviders.mutate(selected ? freeUpdaterProviders.map(provider => provider.platform) : [])
   }
 
   function toggleFreeUpdater(enabled: boolean) {
@@ -232,7 +262,7 @@ export default function SettingsPage() {
               type="button"
               variant="outline"
               size="sm"
-              disabled={refreshFreeModels.isPending}
+              disabled={refreshFreeModels.isPending || selectedFreeUpdaterProviders.length === 0}
               onClick={() => refreshFreeModels.mutate()}
             >
               {refreshFreeModels.isPending ? 'Refreshing…' : 'Refresh now'}
@@ -242,9 +272,44 @@ export default function SettingsPage() {
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <SummaryTile label="Status" value={freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
-          <SummaryTile label="Detected" value={freeUpdaterStatus?.detectedCount ?? detectedFreeModels.length} detail="Free candidates from live catalogs and fallback lists." />
+          <SummaryTile label="Selected" value={freeUpdaterStatus?.selectedProviderCount ?? selectedFreeUpdaterProviders.length} detail="Only these providers are fetched." tone={selectedFreeUpdaterProviders.length ? 'good' : 'warn'} />
+          <SummaryTile label="Detected" value={freeUpdaterStatus?.detectedCount ?? detectedFreeModels.length} detail="Candidates from the latest selected-provider refresh." />
           <SummaryTile label="Last run" value={freeUpdaterStatus?.lastRunAt ? new Date(freeUpdaterStatus.lastRunAt).toLocaleString() : 'Never'} detail="Most recent updater cycle." />
-          <SummaryTile label="Next run" value={freeUpdaterStatus?.nextRunAt ? new Date(freeUpdaterStatus.nextRunAt).toLocaleString() : 'Off'} detail="Based on the configured interval." />
+        </div>
+
+        <div className="mt-5 rounded-2xl border border-border bg-background p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-sm font-medium">Provider selection</p>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                Refresh now fetches only the providers selected here. Custom endpoints are opt-in and treated as user-declared free/local catalogs; every listed model is probed before it is marked verified.
+              </p>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <Button type="button" size="sm" variant="outline" disabled={freeUpdaterBusy || freeUpdaterProviders.length === 0} onClick={() => setAllFreeUpdaterProviders(true)}>Select all</Button>
+              <Button type="button" size="sm" variant="outline" disabled={freeUpdaterBusy || selectedFreeUpdaterProviders.length === 0} onClick={() => setAllFreeUpdaterProviders(false)}>Clear</Button>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+            {freeUpdaterProviders.length === 0 ? (
+              <EmptyState title="No providers available" description="Add a supported provider or custom endpoint before enabling the updater." />
+            ) : freeUpdaterProviders.map(provider => (
+              <div key={provider.platform} className={cn('rounded-2xl border p-3 transition-colors', provider.selected ? 'border-primary bg-primary/5' : 'border-border bg-card')}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{provider.name}</p>
+                    <code className="mt-1 block truncate text-[11px] text-muted-foreground">{provider.platform}</code>
+                  </div>
+                  <Switch checked={provider.selected} disabled={freeUpdaterBusy} onCheckedChange={checked => setFreeUpdaterProvider(provider.platform, checked)} />
+                </div>
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  <Badge variant="secondary">{provider.source}</Badge>
+                  <Badge variant="outline">{provider.detectionPolicy}</Badge>
+                  {provider.hasEnabledKey ? <Badge variant="default">key ready</Badge> : <Badge variant="secondary">{provider.canListAnonymously ? 'no key ok' : 'needs key'}</Badge>}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
 
         {freeUpdaterStatus?.errorMessage && (
@@ -256,11 +321,11 @@ export default function SettingsPage() {
         <div className="mt-5 rounded-2xl border border-border bg-background p-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm font-medium">Detected free models preview</p>
-            <Badge variant="secondary">{detectingFreeModels ? 'Scanning…' : `${detectedFreeModels.length} candidates`}</Badge>
+            <Badge variant="secondary">{detectingFreeModels ? 'Loading…' : `${detectedFreeModels.length} candidates`}</Badge>
           </div>
           <div className="mt-3 max-h-64 space-y-2 overflow-y-auto pr-1">
             {detectedFreeModels.length === 0 ? (
-              <EmptyState title="No candidates loaded" description="Add provider keys or run refresh to populate the preview." />
+              <EmptyState title="No candidates loaded" description={selectedFreeUpdaterProviders.length === 0 ? 'Select one or more providers before refreshing.' : 'Run refresh to populate the selected-provider preview.'} />
             ) : detectedFreeModels.slice(0, 80).map(model => (
               <div key={`${model.platform}:${model.modelId}`} className="rounded-xl border border-border bg-card px-3 py-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">

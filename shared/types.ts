@@ -239,6 +239,27 @@ export type FreeModelVerificationStatus =
 
 export type FreeModelUpdaterRunStatus = 'idle' | 'running' | 'error';
 
+export type FreeModelUpdaterProviderSource = 'built-in' | 'custom';
+
+export type FreeModelUpdaterDetectionPolicy =
+  | 'priced_catalog'
+  | 'unclassified_all_catalog'
+  | 'hardcoded_then_probe'
+  | 'custom_catalog';
+
+export interface FreeModelUpdaterProviderOption {
+  platform: Platform;
+  name: string;
+  source: FreeModelUpdaterProviderSource;
+  baseUrl: string | null;
+  timeoutMs: number | null;
+  enabled: boolean;
+  selected: boolean;
+  hasEnabledKey: boolean;
+  canListAnonymously: boolean;
+  detectionPolicy: FreeModelUpdaterDetectionPolicy;
+}
+
 export interface FreeModelUpdaterStatus {
   enabled: boolean;
   lastRunAt: string | null;
@@ -247,6 +268,8 @@ export interface FreeModelUpdaterStatus {
   status: FreeModelUpdaterRunStatus;
   detectedCount: number;
   errorMessage: string | null;
+  selectedProviders: Platform[];
+  selectedProviderCount: number;
 }
 
 export interface FreeModelUpdaterSettings extends FreeModelUpdaterStatus {}
