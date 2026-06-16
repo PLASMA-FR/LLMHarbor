@@ -61,6 +61,7 @@ export interface FreeModelUpdaterOptions {
 interface DiscoveryRun {
   detected: DetectedFreeModel[];
   scannedProviders: Array<{ platform: Platform; source: 'built-in' | 'custom' }>;
+  probeResults: Map<string, ProbeResult>;
 }
 
 function clampInterval(hours: number | undefined): number {
@@ -235,6 +236,36 @@ async function runWithConcurrency<T>(items: T[], concurrency: number, worker: (i
   await Promise.all(workers);
 }
 
+function detectedKey(model: Pick<DetectedFreeModel, 'platform' | 'modelId'>): string {
+  return `${model.platform}:${model.modelId}`;
+}
+
+function toDetectedModel(
+  platform: Platform,
+  model: Pick<DetectedFreeModel, 'modelId' | 'displayName' | 'detectionMethod'> & { contextWindow?: number | null },
+): DetectedFreeModel {
+  return {
+    platform,
+    modelId: model.modelId,
+    displayName: model.displayName,
+    detectionMethod: model.detectionMethod,
+    verificationStatus: 'pending',
+    contextWindow: model.contextWindow ?? null,
+    lastVerifiedAt: null,
+    lastError: null,
+  };
+}
+
+function catalogRowProbeCandidate(platform: Platform, row: ProviderCatalogModel): DetectedFreeModel | null {
+  if (!row.id) return null;
+  return toDetectedModel(platform, {
+    modelId: row.id,
+    displayName: row.displayName || row.id,
+    detectionMethod: 'unclassified_provider',
+    contextWindow: row.contextWindow ?? null,
+  });
+}
+
 export class FreeModelUpdater {
   private readonly now: () => Date;
   private readonly providers?: DiscoveryProvider[];
@@ -375,11 +406,13 @@ export class FreeModelUpdater {
       : defaultProviders();
     const detected: DetectedFreeModel[] = [];
     const scannedProviders: Array<{ platform: Platform; source: 'built-in' | 'custom' }> = [];
+    const probeResults = new Map<string, ProbeResult>();
     const errors: string[] = [];
 
     for (const provider of providers) {
       const platform = String(provider.platform);
-      const policy = provider.detectionPolicy ?? freeModelPolicyForPlatform(platform);
+      const source = provider.source ?? (isCustomEndpoint(provider.platform) ? 'custom' : 'built-in');
+      const policy = provider.detectionPolicy ?? (source === 'custom' ? 'custom_catalog' : freeModelPolicyForPlatform(platform));
       const key = this.keyResolver(provider.platform);
       const canListAnonymously = provider.canListAnonymously ?? (this.providers !== undefined || ANONYMOUS_MODEL_CATALOG_PLATFORMS.has(platform));
       let catalog: ProviderCatalogModel[] = [];
@@ -387,7 +420,7 @@ export class FreeModelUpdater {
       if (key || canListAnonymously) {
         try {
           catalog = await provider.listModels(key ?? '');
-          scannedProviders.push({ platform: provider.platform, source: provider.source ?? 'built-in' });
+          scannedProviders.push({ platform: provider.platform, source });
         } catch (error) {
           errors.push(`${platform}: ${shortError(error)}`);
           if (this.failRefreshOnProviderError) throw error;
@@ -395,17 +428,33 @@ export class FreeModelUpdater {
       }
 
       if (!policy && catalog.length === 0) continue;
-      for (const model of filterFreeModels(provider.platform, catalog, policy)) {
-        detected.push({
-          platform: model.platform,
-          modelId: model.modelId,
-          displayName: model.displayName,
-          detectionMethod: model.detectionMethod,
-          verificationStatus: 'pending',
-          contextWindow: model.contextWindow,
-          lastVerifiedAt: null,
-          lastError: null,
+
+      if (source === 'custom' || policy === 'custom_catalog') {
+        const explicitFree = new Map<string, DetectedFreeModel>();
+        for (const model of filterFreeModels(provider.platform, catalog, 'custom_catalog')) {
+          const detectedModel = toDetectedModel(model.platform, model);
+          explicitFree.set(detectedKey(detectedModel), detectedModel);
+        }
+
+        const probeCandidates = catalog
+          .map(row => catalogRowProbeCandidate(provider.platform, row))
+          .filter((model): model is DetectedFreeModel => model !== null);
+        const probe = this.injectedProbeModel ?? (model => this.defaultProbeModel(model));
+        const accepted = new Map<string, DetectedFreeModel>();
+        await runWithConcurrency(probeCandidates, PROBE_CONCURRENCY, async model => {
+          const result = await probe(model);
+          if (!result.ok) return;
+          const keyForModel = detectedKey(model);
+          accepted.set(keyForModel, explicitFree.get(keyForModel) ?? model);
+          probeResults.set(keyForModel, result);
         });
+
+        detected.push(...accepted.values());
+        continue;
+      }
+
+      for (const model of filterFreeModels(provider.platform, catalog, policy)) {
+        detected.push(toDetectedModel(model.platform, model));
       }
     }
 
@@ -413,7 +462,7 @@ export class FreeModelUpdater {
       throw new Error(`Free model discovery failed: ${errors.join('; ')}`);
     }
 
-    return { detected, scannedProviders };
+    return { detected, scannedProviders, probeResults };
   }
 
   async detectFreeModels(): Promise<DetectedFreeModel[]> {
@@ -606,7 +655,7 @@ export class FreeModelUpdater {
 
       const probe = this.injectedProbeModel ?? (model => this.defaultProbeModel(model));
       await runWithConcurrency(detected.map((model, index) => ({ model, modelDbId: modelDbIds[index] })), PROBE_CONCURRENCY, async item => {
-        const result = await probe(item.model);
+        const result = discovery.probeResults.get(detectedKey(item.model)) ?? await probe(item.model);
         this.applyProbeResult(item.modelDbId, result);
       });
 

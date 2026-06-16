@@ -95,27 +95,38 @@ describe('FreeModelUpdater', () => {
     expect(detected.map(model => `${model.platform}:${model.modelId}`)).toEqual(['groq:llama-3.3-70b-versatile']);
   });
 
-  it('discovers selected custom endpoint catalog rows even when they have no free keyword or pricing', async () => {
+  it('probes every selected custom endpoint catalog row and returns only responsive models', async () => {
     getDb().prepare(`
       INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
       VALUES ('custom-local-vllm', 'Local vLLM', 'http://127.0.0.1:18888/v1', 120000, 1)
     `).run();
     const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
-      data: [{ id: 'Qwen/Qwen3-Coder-30B-A3B-Instruct', name: 'Qwen Coder', context_length: 32768 }],
+      data: [
+        { id: 'Qwen/Qwen3-Coder-30B-A3B-Instruct', name: 'Qwen Coder', context_length: 32768 },
+        { id: 'paid/broken-model', name: 'Broken paid model' },
+        { id: 'free/by-name', name: 'Free by name' },
+        { id: 'priced/free-cost', name: 'Zero cost', pricing: { prompt: '0', completion: '0' } },
+      ],
     }) as any);
-    const updater = new FreeModelUpdater({ keyResolver: () => null });
+    const probe = vi.fn(async model => ({ ok: model.modelId !== 'paid/broken-model' }));
+    const updater = new FreeModelUpdater({ keyResolver: () => null, probeModel: probe });
     updater.setSelectedProviders(['custom-local-vllm']);
 
     const detected = await updater.detectFreeModels();
 
     expect(fetchSpy).toHaveBeenCalledWith('http://127.0.0.1:18888/v1/models', expect.objectContaining({ method: 'GET' }));
-    expect(detected).toMatchObject([
-      {
-        platform: 'custom-local-vllm',
-        modelId: 'Qwen/Qwen3-Coder-30B-A3B-Instruct',
-        detectionMethod: 'unclassified_provider',
-      },
-    ]);
+    expect(probe).toHaveBeenCalledTimes(4);
+    expect(probe.mock.calls.map(([model]) => model.modelId).sort()).toEqual([
+      'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+      'free/by-name',
+      'paid/broken-model',
+      'priced/free-cost',
+    ].sort());
+    expect(detected.map(model => `${model.modelId}:${model.detectionMethod}`).sort()).toEqual([
+      'Qwen/Qwen3-Coder-30B-A3B-Instruct:unclassified_provider',
+      'free/by-name:keyword',
+      'priced/free-cost:pricing_tier',
+    ].sort());
   });
 
   it('clamps enable interval to 1-24 hours and computes next run', () => {
@@ -227,10 +238,10 @@ describe('FreeModelUpdater', () => {
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled)
       VALUES ('custom-local-vllm', 'stale-model', 'Stale', 1, 1, 'Custom', 'custom', 1)
     `).run();
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ data: [{ id: 'fresh-model' }] }) as any);
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ data: [{ id: 'fresh-model' }, { id: 'paid-broken-model' }] }) as any);
     const updater = new FreeModelUpdater({
       keyResolver: () => null,
-      probeModel: async () => ({ ok: true }),
+      probeModel: async model => ({ ok: model.modelId === 'fresh-model' }),
     });
     updater.setSelectedProviders(['custom-local-vllm']);
 
@@ -239,8 +250,10 @@ describe('FreeModelUpdater', () => {
     const staleRow = db.prepare('SELECT enabled FROM models WHERE id = ?').get(Number(stale.lastInsertRowid)) as any;
     const staleMeta = db.prepare('SELECT verification_status FROM model_free_metadata WHERE model_id = ?').get(Number(stale.lastInsertRowid)) as any;
     const fresh = db.prepare("SELECT enabled, monthly_token_budget FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'fresh-model'").get() as any;
+    const failed = db.prepare("SELECT id FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'paid-broken-model'").get();
     expect(fresh.enabled).toBe(1);
     expect(fresh.monthly_token_budget).toBe('auto-discovered custom endpoint');
+    expect(failed).toBeUndefined();
     expect(staleRow.enabled).toBe(0);
     expect(staleMeta.verification_status).toBe('expired');
   });

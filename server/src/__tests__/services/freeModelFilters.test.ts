@@ -56,10 +56,18 @@ describe('free model filters', () => {
     expect(result.map(row => row.modelId)).toEqual(['codestral-latest']);
   });
 
-  it('keeps custom catalog rows even when they are unpriced', () => {
-    const result = filterFreeModels('custom-local-vllm', [model('local/qwen-coder')], 'custom_catalog');
-    expect(result.map(row => row.modelId)).toEqual(['local/qwen-coder']);
-    expect(result[0].detectionMethod).toBe('unclassified_provider');
+  it('keeps only custom catalog rows with free keywords or free pricing', () => {
+    const result = filterFreeModels('custom-local-vllm', [
+      model('local/qwen-coder'),
+      model('local/free-coder'),
+      model('local/zero-cost', { pricing: { prompt: '0', completion: '0' } }),
+      model('local/string-free', { pricing: 'free' }),
+    ], 'custom_catalog');
+    expect(result.map(row => `${row.modelId}:${row.detectionMethod}`)).toEqual([
+      'local/free-coder:keyword',
+      'local/zero-cost:pricing_tier',
+      'local/string-free:pricing_tier',
+    ]);
   });
 
   it('deduplicates by platform and model id', () => {

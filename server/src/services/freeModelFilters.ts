@@ -31,6 +31,7 @@ function rawRecord(row: ProviderCatalogModel): Record<string, unknown> {
 }
 
 function hasZeroPricing(pricing: unknown): boolean {
+  if (numericZero(pricing)) return true;
   if (!pricing || typeof pricing !== 'object') return false;
   const obj = pricing as Record<string, unknown>;
   const prompt = obj.prompt ?? obj.input ?? obj.prompt_tokens ?? obj.input_tokens ?? obj.input_token ?? obj.prompt_price;
@@ -136,7 +137,11 @@ export function filterFreeModels(platform: Platform, catalog: ProviderCatalogMod
     if (!isActive(row) || !isLikelyChatTextModel(platform, row)) continue;
 
     if (policy === 'custom_catalog') {
-      candidates.push(candidateFromRow(platform, row, 'unclassified_provider'));
+      if (zeroPrice) {
+        candidates.push(candidateFromRow(platform, row, 'pricing_tier'));
+        continue;
+      }
+      if (keyword) candidates.push(candidateFromRow(platform, row, keyword));
       continue;
     }
 
