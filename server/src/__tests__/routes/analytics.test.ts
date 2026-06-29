@@ -29,6 +29,7 @@ describe('analytics ranges', () => {
     `);
     insert.run('openai', 'gpt-recent', 1, 'success', 10, 5, 100, null, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString());
     insert.run('openai', 'gpt-old', 1, 'success', 20, 10, 200, null, new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString());
+    insert.run('openai', 'gpt-legacy', 1, 'success', 40, 20, 300, null, '');
   });
 
   it('supports all-time analytics beside bounded ranges', async () => {
@@ -39,11 +40,11 @@ describe('analytics ranges', () => {
 
     const all = await request(app, '/api/analytics/summary?range=alltime');
     expect(all.status).toBe(200);
-    expect(all.body.totalRequests).toBe(2);
-    expect(all.body.totalInputTokens).toBe(30);
+    expect(all.body.totalRequests).toBe(3);
+    expect(all.body.totalInputTokens).toBe(70);
 
     const allAlias = await request(app, '/api/analytics/by-model?range=all');
     expect(allAlias.status).toBe(200);
-    expect(allAlias.body.map((row: any) => row.modelId).sort()).toEqual(['gpt-old', 'gpt-recent']);
+    expect(allAlias.body.map((row: any) => row.modelId).sort()).toEqual(['gpt-legacy', 'gpt-old', 'gpt-recent']);
   });
 });

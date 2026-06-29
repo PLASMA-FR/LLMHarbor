@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 
-type TimeRange = '24h' | '7d' | '30d' | 'all'
+type TimeRange = '24h' | '7d' | '30d' | 'alltime'
 
 interface AnalyticsSummary {
   totalRequests: number
@@ -95,7 +95,7 @@ const timeRanges: Array<{ value: TimeRange; label: string }> = [
   { value: '24h', label: '24h' },
   { value: '7d', label: '7d' },
   { value: '30d', label: '30d' },
-  { value: 'all', label: 'All time' },
+  { value: 'alltime', label: 'All time' },
 ]
 
 export default function AnalyticsPage() {

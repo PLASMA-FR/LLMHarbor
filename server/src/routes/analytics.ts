@@ -4,14 +4,15 @@ import { getDb } from '../db/index.js';
 
 export const analyticsRouter = Router();
 
-// Map range to a JS-computed ISO timestamp passed as a bind parameter,
-// so the SQL string never includes user-controlled fragments.
-function getSinceTimestamp(range: string): string {
+// Map range to a JS-computed ISO timestamp passed as a bind parameter.
+// All-time returns null and the SQL predicates explicitly bypass date filtering,
+// so it is truly every row rather than a lexical timestamp comparison.
+function getSinceTimestamp(range: string): string | null {
   const now = Date.now();
   switch (range) {
     case 'all':
     case 'alltime':
-      return '0000-01-01T00:00:00.000Z';
+      return null;
     case '24h':
       return new Date(now - 24 * 60 * 60 * 1000).toISOString();
     case '30d':
@@ -36,8 +37,8 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
       SUM(output_tokens) as total_output_tokens,
       AVG(latency_ms) as avg_latency_ms
     FROM requests
-    WHERE created_at >= ?
-  `).get(since) as any;
+    WHERE (? IS NULL OR created_at >= ?)
+  `).get(since, since) as any;
 
   const totalRequests = stats.total_requests ?? 0;
   const successRate = totalRequests > 0 ? (stats.success_count / totalRequests) * 100 : 0;
@@ -75,10 +76,10 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
       SUM(r.output_tokens) as total_output_tokens
     FROM requests r
     LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.created_at >= ?
+    WHERE (? IS NULL OR r.created_at >= ?)
     GROUP BY r.platform, r.model_id
     ORDER BY requests DESC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -107,10 +108,10 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
       SUM(input_tokens) as total_input_tokens,
       SUM(output_tokens) as total_output_tokens
     FROM requests
-    WHERE created_at >= ?
+    WHERE (? IS NULL OR created_at >= ?)
     GROUP BY platform
     ORDER BY requests DESC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -139,10 +140,10 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failure_count
     FROM requests
-    WHERE created_at >= ?
+    WHERE (? IS NULL OR created_at >= ?)
     GROUP BY strftime('${dateFormat}', created_at)
     ORDER BY timestamp ASC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   res.json(rows.map(r => ({
     timestamp: r.timestamp,
@@ -175,10 +176,10 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
       END as error_category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ?
+    WHERE status = 'error' AND (? IS NULL OR created_at >= ?)
     GROUP BY platform, error_category
     ORDER BY count DESC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   // Also get totals by category
   const byCategory = db.prepare(`
@@ -195,19 +196,19 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
       END as category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ?
+    WHERE status = 'error' AND (? IS NULL OR created_at >= ?)
     GROUP BY category
     ORDER BY count DESC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   // Errors by platform
   const byPlatform = db.prepare(`
     SELECT platform, COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND created_at >= ?
+    WHERE status = 'error' AND (? IS NULL OR created_at >= ?)
     GROUP BY platform
     ORDER BY count DESC
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   res.json({
     byCategory,
@@ -225,10 +226,10 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
   const rows = db.prepare(`
     SELECT id, platform, model_id, error, latency_ms, created_at
     FROM requests
-    WHERE status = 'error' AND created_at >= ?
+    WHERE status = 'error' AND (? IS NULL OR created_at >= ?)
     ORDER BY created_at DESC
     LIMIT 50
-  `).all(since) as any[];
+  `).all(since, since) as any[];
 
   res.json(rows.map(r => ({
     id: r.id,
