@@ -23,7 +23,8 @@ export type BuiltInPlatform =
   | 'kilo'
   | 'pollinations'
   | 'llm7'
-  | 'huggingface';
+  | 'huggingface'
+  | 'freebuff';
 
 // Custom OpenAI-compatible endpoints are stored with platform ids like
 // `custom-local-vllm`, so runtime platform values must remain open-ended.

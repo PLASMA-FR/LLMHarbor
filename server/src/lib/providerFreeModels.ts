@@ -30,6 +30,7 @@ export const FREE_MODEL_PROVIDER_POLICIES: Record<string, ProviderFreePolicy> = 
   pollinations: 'provider_tier_catalog',
   llm7: 'provider_tier_catalog',
   kilo: 'provider_declared_free_catalog',
+  freebuff: 'provider_declared_free_catalog',
 };
 
 export const ANONYMOUS_MODEL_CATALOG_PLATFORMS = new Set(['pollinations', 'llm7', 'openrouter', 'kilo']);

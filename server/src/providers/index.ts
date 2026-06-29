@@ -1,6 +1,7 @@
 import type { Platform } from '@llmharbor/shared/types.js';
 import type { BaseProvider } from './base.js';
 import { GoogleProvider } from './google.js';
+import { FreebuffProvider } from './freebuff.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
@@ -16,6 +17,7 @@ function register(provider: BaseProvider) {
 // Google - API-key Gemini API format and separate browser-account Code Assist surface.
 register(new GoogleProvider());
 register(new GoogleProvider({ platform: 'google-oauth', name: 'Antigravity Browser Account' }));
+register(new FreebuffProvider());
 
 // OpenAI - OpenAI-compatible chat, image, and audio endpoints.
 register(new OpenAICompatProvider({

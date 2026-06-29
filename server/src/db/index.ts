@@ -10,6 +10,7 @@ const DB_PATH = path.resolve(__dirname, '../../data/llmharbor.db');
 const LEGACY_DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 
 let db: Database.Database;
+let activeDbPath = DB_PATH;
 
 export function getDb(): Database.Database {
   if (!db) {
@@ -20,6 +21,7 @@ export function getDb(): Database.Database {
 
 export function initDb(dbPath?: string): Database.Database {
   const resolvedPath = dbPath ?? DB_PATH;
+  activeDbPath = resolvedPath;
   const isMemory = resolvedPath === ':memory:';
 
   if (!isMemory) {
@@ -58,11 +60,52 @@ export function initDb(dbPath?: string): Database.Database {
   migrateModelsV12(db);
   migrateModelsV13(db);
   migrateModelsV14(db);
+  migrateModelsV15(db);
   ensureBrowserAccountModels(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
+}
+
+export function getDbPath(): string {
+  return activeDbPath;
+}
+
+export async function backupDbToFile(destinationPath: string): Promise<void> {
+  await getDb().backup(destinationPath);
+}
+
+function validateBackupDatabase(sourcePath: string) {
+  const candidate = new Database(sourcePath, { readonly: true, fileMustExist: true });
+  try {
+    const integrity = candidate.pragma('integrity_check') as Array<{ integrity_check: string }>;
+    const ok = integrity.length === 1 && integrity[0].integrity_check === 'ok';
+    if (!ok) throw new Error(`SQLite integrity_check failed: ${JSON.stringify(integrity).slice(0, 300)}`);
+    const requiredTables = ['models', 'api_keys', 'settings', 'client_api_keys', 'oauth_accounts'];
+    const missing = requiredTables.filter(table => !candidate.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+    if (missing.length > 0) throw new Error(`Backup is missing required table(s): ${missing.join(', ')}`);
+  } finally {
+    candidate.close();
+  }
+}
+
+export function restoreDbFromBackupFile(sourcePath: string): { restoredPath: string; previousBackupPath: string | null } {
+  if (activeDbPath === ':memory:') throw new Error('Cannot restore a full-instance backup into an in-memory database. Use a file-backed database.');
+  validateBackupDatabase(sourcePath);
+
+  const previousBackupPath = fs.existsSync(activeDbPath)
+    ? `${activeDbPath}.pre-import-${new Date().toISOString().replace(/[:.]/g, '-')}.bak`
+    : null;
+  if (previousBackupPath) fs.copyFileSync(activeDbPath, previousBackupPath);
+
+  db.close();
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.rmSync(`${activeDbPath}${suffix}`, { force: true }); } catch {}
+  }
+  fs.copyFileSync(sourcePath, activeDbPath);
+  initDb(activeDbPath);
+  return { restoredPath: activeDbPath, previousBackupPath };
 }
 
 function createTables(db: Database.Database) {
@@ -347,6 +390,7 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
     SELECT
       CASE
         WHEN oa.provider = 'openai' THEN 'openai'
+        WHEN oa.provider = 'freebuff' THEN 'freebuff'
         ELSE 'google-oauth'
       END AS platform,
       oa.label,
@@ -358,7 +402,7 @@ function ensureOAuthAccountsProjectedAsKeys(db: Database.Database) {
       'oauth',
       oa.id
     FROM oauth_accounts oa
-    WHERE oa.provider IN ('openai', 'antigravity')
+    WHERE oa.provider IN ('openai', 'antigravity', 'freebuff')
       AND NOT EXISTS (SELECT 1 FROM api_keys ak WHERE ak.oauth_account_id = oa.id)
   `).run();
 }
@@ -1555,6 +1599,47 @@ function migrateModelsV14(db: Database.Database) {
      WHERE platform = 'cerebras'
        AND model_id IN ('qwen-3-235b-a22b-instruct-2507', 'llama3.1-8b')
   `).run();
+}
+
+/**
+ * V15 (June 2026): add Freebuff/Codebuff browser-account models. These rows
+ * are OAuth-token backed, not anonymous API-key endpoints, so they are enabled
+ * only when the user connects/imports a Freebuff account token.
+ */
+function migrateModelsV15(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'browser account', ?, 1)
+    ON CONFLICT(platform, model_id) DO UPDATE SET
+      display_name = excluded.display_name,
+      intelligence_rank = excluded.intelligence_rank,
+      speed_rank = excluded.speed_rank,
+      size_label = excluded.size_label,
+      monthly_token_budget = excluded.monthly_token_budget,
+      context_window = excluded.context_window
+  `);
+  const rows: Array<[string, string, string, number, number, string, number | null]> = [
+    ['freebuff', 'moonshotai/kimi-k2.6', 'Kimi K2.6 (Freebuff browser account)', 1, 5, 'Frontier', 262144],
+    ['freebuff', 'deepseek/deepseek-v4-pro', 'DeepSeek V4 Pro (Freebuff browser account)', 2, 6, 'Frontier', 131072],
+    ['freebuff', 'minimax/minimax-m3', 'MiniMax M3 (Freebuff browser account)', 3, 2, 'Large', 196608],
+    ['freebuff', 'deepseek/deepseek-v4-flash', 'DeepSeek V4 Flash (Freebuff browser account)', 4, 2, 'Frontier', 131072],
+    ['freebuff', 'mimo/mimo-v2.5', 'MiMo 2.5 (Freebuff browser account)', 5, 3, 'Large', 196608],
+    ['freebuff', 'mimo/mimo-v2.5-pro', 'MiMo 2.5 Pro (Freebuff browser account)', 2, 6, 'Frontier', 196608],
+  ];
+  const apply = db.transaction(() => {
+    for (const row of rows) insert.run(...row);
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  apply();
 }
 
 function createClientApiKey(): string {

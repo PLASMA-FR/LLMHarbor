@@ -283,6 +283,14 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('api error 400');
 }
 
+function sanitizeProviderErrorMessage(value: unknown): string {
+  return String(value ?? 'unknown error')
+    .replace(/Bearer\s+[A-Za-z0-9._~+\-/]+=*/gi, 'Bearer [REDACTED]')
+    .replace(/(access_token|refresh_token|authToken|api[_-]?key)["'=:\s]+[A-Za-z0-9._~+\-/]+=*/gi, '$1=[REDACTED]')
+    .replace(/\b(sk-[A-Za-z0-9_-]{12,}|llmharbor-[A-Fa-f0-9]{16,})\b/g, '[REDACTED]')
+    .slice(0, 1000);
+}
+
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
@@ -473,7 +481,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
       // No more models available
       if (lastError) {
-        const lastMessage = String(lastError.message ?? lastError);
+        const lastMessage = sanitizeProviderErrorMessage(lastError.message ?? lastError);
         const strictRateLimited = strictPreferredModel && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
         res.status(strictPreferredModel ? (strictRateLimited ? 429 : 502) : 429).json({
           error: {
@@ -546,11 +554,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // the client hanging or letting Express's default handler take over.
             // Full upstream message goes to the log; the client sees a generic
             // message so we don't leak provider internals into a partial stream.
-            console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
+            const sanitizedStreamError = sanitizeProviderErrorMessage(streamErr.message ?? streamErr);
+            console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, sanitizedStreamError);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, streamErr.message);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizedStreamError);
             return;
           }
           // Pre-stream error — bubble to outer retry/502 handler.
@@ -587,7 +596,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
+      const sanitizedError = sanitizeProviderErrorMessage(err.message ?? err);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, sanitizedError);
 
       if (isRetryableError(err)) {
         // Put this model+key on cooldown and try the next one
@@ -601,14 +611,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
-        console.log(`[Proxy] ${err.message.slice(0, 60)} from ${route.displayName}, ${strictPreferredModel ? 'retrying same requested model/key pool' : 'falling back'} (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        console.log(`[Proxy] ${sanitizedError.slice(0, 60)} from ${route.displayName}, ${strictPreferredModel ? 'retrying same requested model/key pool' : 'falling back'} (attempt ${attempt + 1}/${MAX_RETRIES})`);
         continue;
       }
 
       // Non-retryable error (auth, 4xx, etc.): don't retry
       res.status(502).json({
         error: {
-          message: `Provider error (${route.displayName}): ${err.message}`,
+          message: `Provider error (${route.displayName}): ${sanitizedError}`,
           type: 'provider_error',
         },
       });
@@ -617,7 +627,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   // Exhausted all retries
-  const lastMessage = String(lastError?.message ?? lastError ?? 'unknown error');
+  const lastMessage = sanitizeProviderErrorMessage(lastError?.message ?? lastError ?? 'unknown error');
   const strictRateLimited = strictPreferredModel && /(429|rate limit|too many requests|quota|resource_exhausted)/i.test(lastMessage);
   res.status(strictPreferredModel ? (strictRateLimited ? 429 : 502) : 429).json({
     error: {

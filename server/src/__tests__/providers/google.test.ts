@@ -310,6 +310,34 @@ describe('GoogleProvider', () => {
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
 
+  it('streams Antigravity non-thinking models via generateContent fallback', async () => {
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      capturedUrl = typeof url === 'string' ? url : url.toString();
+      expect(JSON.parse((init as any).body).model).toBe('gemini-2.5-pro');
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          response: {
+            candidates: [{ content: { parts: [{ text: 'oauth stream ok' }] }, finishReason: 'STOP' }],
+            usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 3, totalTokenCount: 5 },
+          },
+        }),
+      } as any;
+    });
+
+    const chunks = await collect(provider.streamChatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+      { oauth: { accountId: 7, provider: 'antigravity', accountHint: 'captain@example.com', metadata: { cloudaicompanionProject: 'cloud-project-123' } } },
+    ));
+
+    expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent');
+    expect(chunks.map(c => c.choices[0].delta.content ?? '').join('')).toBe('oauth stream ok');
+    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('stop');
+  });
+
   it('uses Antigravity Code Assist wrapper for Google browser OAuth requests', async () => {
     let capturedUrl = '';
     let capturedHeaders: any;

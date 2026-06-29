@@ -99,7 +99,7 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
   it('starts browser OAuth directly, exchanges callback codes, and stores encrypted account tokens', async () => {
     const catalog = await request(app, 'GET', '/api/oauth/providers');
     expect(catalog.status).toBe(200);
-    expect(catalog.body.providers.map((p: any) => p.id)).toEqual(['openai', 'antigravity']);
+    expect(catalog.body.providers.map((p: any) => p.id)).toEqual(['openai', 'antigravity', 'freebuff']);
     expect(JSON.stringify(catalog.body)).not.toContain('google-ai-studio');
     expect(JSON.stringify(catalog.body)).not.toContain('Gemini CLI');
     expect(JSON.stringify(catalog.body)).not.toContain('oauth.llmharbor.app');
@@ -197,6 +197,48 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(models.status).toBe(200);
     expect(models.body.models.map((m: any) => m.id).sort()).toEqual(['gpt-5', 'gpt-5.4-mini', 'gpt-5.5']);
     expect(models.body.limits[0].usedPercent).toBe(12);
+  });
+
+  it('connects Freebuff with device OAuth and projects it as an encrypted provider key', async () => {
+    const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    let statusCalls = 0;
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr === 'https://freebuff.com/api/auth/cli/code') {
+        expect(JSON.parse(String((init as any).body)).fingerprintId).toMatch(/^llmharbor-/);
+        return Response.json({ loginUrl: 'https://freebuff.com/login?code=BUFFY7', fingerprintHash: 'hash-123', expiresAt });
+      }
+      if (urlStr.startsWith('https://freebuff.com/api/auth/cli/status')) {
+        statusCalls += 1;
+        const params = new URL(urlStr).searchParams;
+        expect(params.get('fingerprintHash')).toBe('hash-123');
+        if (statusCalls === 1) return new Response('', { status: 401 });
+        return Response.json({ user: { authToken: 'freebuff-auth-token', email: 'buffy@example.com', name: 'Buffy' } });
+      }
+      return origFetch(url, init);
+    });
+
+    const start = await request(app, 'POST', '/api/oauth/connect/freebuff/start');
+    expect(start.status).toBe(200);
+    expect(start.body).toMatchObject({ loginMode: 'device-oauth', userCode: 'BUFFY7', verificationUri: 'https://freebuff.com' });
+
+    const pending = await request(app, 'POST', '/api/oauth/connect/freebuff/complete', { state: start.body.state });
+    expect(pending.status).toBe(200);
+    expect(pending.body.pending).toBe(true);
+
+    const completed = await request(app, 'POST', '/api/oauth/connect/freebuff/complete', { state: start.body.state });
+    expect(completed.status).toBe(200);
+    expect(completed.body.account.provider).toBe('freebuff');
+    expect(completed.body.account.maskedToken).not.toBe('freebuff-auth-token');
+
+    const keys = await request(app, 'GET', '/api/keys');
+    expect(keys.body[0]).toMatchObject({ platform: 'freebuff', source: 'oauth', oauthAccountId: completed.body.account.id, status: 'healthy', enabled: true });
+
+    const inventory = await request(app, 'GET', `/api/oauth/accounts/${completed.body.account.id}/models`);
+    expect(inventory.status).toBe(200);
+    expect(inventory.body.models.map((m: any) => m.id)).toContain('moonshotai/kimi-k2.6');
+    expect(inventory.body.provider).toBe('freebuff');
   });
 
   it('exchanges Antigravity callback codes with the bundled desktop client when env secret is unset', async () => {

@@ -14,6 +14,7 @@ import { settingsRouter } from './routes/settings.js';
 import { freeModelUpdaterRouter } from './routes/freeModelUpdater.js';
 import { endpointsRouter } from './routes/endpoints.js';
 import { oauthRouter } from './routes/oauth.js';
+import { backupRouter } from './routes/backup.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,7 +92,7 @@ function createBaseApp() {
       callback(null, !origin || allowedCorsOrigins.has(origin));
     },
   }));
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '150mb' }));
 
   // Public liveness probe: no credentials or config data. The split public API
   // listener exposes this too so operators can check the port without an API key.
@@ -143,6 +144,7 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/health', healthRouter);
   app.use('/api/settings/free-model-updater', freeModelUpdaterRouter);
+  app.use('/api/settings/backup', backupRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/endpoints', endpointsRouter);
   app.use('/api/oauth', oauthRouter);

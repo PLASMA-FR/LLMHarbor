@@ -14,10 +14,10 @@ type BrowserOAuthProvider = {
   id: string;
   name: string;
   kind: string;
-  loginMode: 'browser-oauth';
+  loginMode: 'browser-oauth' | 'device-oauth';
   authorizationUrl: string;
-  tokenUrl: string;
-  clientId: string;
+  tokenUrl?: string;
+  clientId?: string;
   clientSecret?: string;
   audience?: string;
   modelsUrl: string | null;
@@ -53,7 +53,21 @@ const BROWSER_OAUTH_PROVIDERS: BrowserOAuthProvider[] = [
     supportsDiscovery: true,
     notes: 'Antigravity-native Google OAuth using the public native client from antigravity-claude-proxy: localhost:51121/oauth-callback, Code Assist scopes, live model discovery only, encrypted local storage.',
   },
+  {
+    id: 'freebuff',
+    name: 'Freebuff / Codebuff browser account',
+    kind: 'freebuff',
+    loginMode: 'device-oauth',
+    authorizationUrl: 'https://freebuff.com/api/auth/cli/code',
+    modelsUrl: 'https://www.codebuff.com/api/v1/freebuff/session',
+    scopes: ['Codebuff CLI browser session'],
+    supportsDiscovery: true,
+    notes: 'Device-code OAuth using the same browser-account auth token as Freebuff/Codebuff CLI. LLMHarbor stores the token encrypted and exposes Freebuff models through the OpenAI-compatible API.',
+  },
 ];
+
+const FREEBUFF_AUTH_BASE_URLS = ['https://freebuff.com', 'https://www.codebuff.com'];
+const FREEBUFF_OAUTH_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Bun/1.3.11' };
 
 const callbackSchema = z.object({
   state: z.string().min(16),
@@ -75,6 +89,7 @@ const googleCallbackServers = new Map<string, HttpServer>();
 function runtimePlatformFor(providerId: string) {
   if (providerId === 'openai') return 'openai';
   if (providerId === 'antigravity') return 'google-oauth';
+  if (providerId === 'freebuff') return 'freebuff';
   return providerId;
 }
 
@@ -116,6 +131,9 @@ function syncProviderKeyForOAuthAccount(accountId: number, rawAccessToken?: stri
 }
 
 async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string, code: string) {
+  if (!provider.clientId || !provider.tokenUrl) throw new Error(`${provider.name} is not a browser OAuth provider.`);
+  const clientId = provider.clientId;
+  const tokenUrl = provider.tokenUrl;
   const stateRow = getDb().prepare(`
     SELECT * FROM oauth_login_states
     WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
@@ -123,7 +141,7 @@ async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string,
   if (!stateRow) throw new Error('OAuth login state expired. Return to LLMHarbor and start login again.');
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
-    client_id: provider.clientId,
+    client_id: clientId,
     code,
     redirect_uri: stateRow.redirect_uri,
   });
@@ -135,7 +153,7 @@ async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string,
     if (!secret) throw new Error('Antigravity OAuth client secret was not found. Set LLMHARBOR_ANTIGRAVITY_OAUTH_CLIENT_SECRET.');
     params.set('client_secret', secret);
   }
-  const upstream = await fetch(provider.tokenUrl, {
+  const upstream = await fetch(tokenUrl, {
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
@@ -200,7 +218,7 @@ function antigravityCallbackPort() {
   return 51121;
 }
 
-function metadataForToken(provider: BrowserOAuthProvider, tokenData: any, connectedVia: 'browser-oauth') {
+function metadataForToken(provider: BrowserOAuthProvider, tokenData: any, connectedVia: 'browser-oauth' | 'device-oauth') {
   return {
     tokenType: tokenData.token_type ?? 'Bearer',
     connectedVia,
@@ -210,6 +228,129 @@ function metadataForToken(provider: BrowserOAuthProvider, tokenData: any, connec
 
 function accountHintForToken(provider: BrowserOAuthProvider, tokenData: any) {
   return tokenData.email ?? tokenData.account_hint ?? `${provider.name} account`;
+}
+
+function freebuffUserCode(loginUrl: string) {
+  try {
+    const url = new URL(loginUrl);
+    return url.searchParams.get('code')
+      ?? url.searchParams.get('user_code')
+      ?? url.pathname.split('/').filter(Boolean).pop()
+      ?? 'OPEN';
+  } catch {
+    return 'OPEN';
+  }
+}
+
+function parseDeviceState(row: any) {
+  try {
+    const parsed = JSON.parse(row.code_verifier);
+    if (parsed && typeof parsed === 'object') return parsed as { fingerprintId: string; fingerprintHash: string; expiresAt: string; authBaseUrl: string };
+  } catch {}
+  throw new Error('Device login state is invalid. Start login again.');
+}
+
+function deviceExpiresAtMs(value: unknown) {
+  if (typeof value === 'number') return value < 10_000_000_000 ? value * 1000 : value;
+  const text = String(value ?? '');
+  if (/^\d+$/.test(text)) {
+    const numeric = Number(text);
+    return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : Date.now() + 10 * 60 * 1000;
+}
+
+async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider) {
+  const fingerprintId = `llmharbor-${crypto.randomBytes(12).toString('hex')}`;
+  let lastError = '';
+  for (const authBaseUrl of FREEBUFF_AUTH_BASE_URLS) {
+    const upstream = await fetch(`${authBaseUrl}/api/auth/cli/code`, {
+      method: 'POST',
+      headers: FREEBUFF_OAUTH_HEADERS,
+      body: JSON.stringify({ fingerprintId }),
+    }).catch(error => {
+      lastError = String(error?.message ?? error);
+      return null;
+    });
+    if (!upstream) continue;
+    if (!upstream.ok) {
+      lastError = `HTTP ${upstream.status}: ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
+      continue;
+    }
+    const data = await upstream.json() as any;
+    if (!data.loginUrl || !data.fingerprintHash || !data.expiresAt) {
+      lastError = 'Login response did not include loginUrl, fingerprintHash, and expiresAt.';
+      continue;
+    }
+    const state = crypto.randomUUID?.() ?? crypto.randomBytes(16).toString('hex');
+    const expiresAt = String(data.expiresAt);
+    const expiresAtMs = deviceExpiresAtMs(data.expiresAt);
+    const expiresInSeconds = Math.max(30, Math.floor((expiresAtMs - Date.now()) / 1000));
+    getDb().prepare(`
+      INSERT INTO oauth_login_states (state, provider, code_verifier, redirect_uri, expires_at)
+      VALUES (?, ?, ?, ?, datetime('now', ?))
+    `).run(
+      state,
+      provider.id,
+      JSON.stringify({ fingerprintId, fingerprintHash: data.fingerprintHash, expiresAt, authBaseUrl }),
+      String(data.loginUrl),
+      `+${Math.ceil(expiresInSeconds / 60)} minutes`,
+    );
+    return {
+      authUrl: String(data.loginUrl),
+      state,
+      userCode: freebuffUserCode(String(data.loginUrl)),
+      verificationUri: authBaseUrl,
+      verificationUriComplete: String(data.loginUrl),
+      expiresInSeconds,
+      intervalSeconds: 3,
+      loginMode: 'device-oauth' as const,
+    };
+  }
+  throw new Error(`Freebuff device login failed. ${lastError || 'No auth endpoint responded.'}`);
+}
+
+async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state: string) {
+  const stateRow = getDb().prepare(`
+    SELECT * FROM oauth_login_states
+    WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
+  `).get(state, provider.id) as any;
+  if (!stateRow) throw new Error('Device login state expired. Start Freebuff login again.');
+  const device = parseDeviceState(stateRow);
+  const statusUrl = new URL(`${device.authBaseUrl}/api/auth/cli/status`);
+  statusUrl.searchParams.set('fingerprintId', device.fingerprintId);
+  statusUrl.searchParams.set('fingerprintHash', device.fingerprintHash);
+  statusUrl.searchParams.set('expiresAt', device.expiresAt);
+  const upstream = await fetch(statusUrl, { headers: { Accept: 'application/json', 'User-Agent': 'Bun/1.3.11' } });
+  if (upstream.status === 401) return { pending: true };
+  if (!upstream.ok) throw new Error(`Freebuff login status failed with HTTP ${upstream.status}. ${(await upstream.text()).slice(0, 300)}`);
+  const data = await upstream.json() as any;
+  const user = data.user;
+  if (!user?.authToken) return { pending: true };
+
+  const token = String(user.authToken);
+  const access = encrypt(token);
+  const accountHint = user.email ?? user.name ?? 'Freebuff account';
+  let accountId = 0;
+  getDb().transaction(() => {
+    const result = getDb().prepare(`
+      INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, metadata_json, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(provider.id, `${provider.name} - ${accountHint}`, accountHint, access.encrypted, access.iv, access.authTag, JSON.stringify({
+      ...metadataForToken(provider, { token_type: 'Bearer' }, 'device-oauth'),
+      authBaseUrl: device.authBaseUrl,
+      userId: user.id ?? null,
+      name: user.name ?? null,
+      email: user.email ?? null,
+    }));
+    accountId = Number(result.lastInsertRowid);
+    syncProviderKeyForOAuthAccount(accountId, token);
+    getDb().prepare("UPDATE oauth_login_states SET consumed_at = datetime('now') WHERE state = ?").run(state);
+  })();
+  try { await refreshOAuthAccountInventory(getDb(), accountId); } catch {}
+  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(accountId) as any;
+  return { account: rowToAccount(row) };
 }
 
 function ensureAntigravityCallbackServer(provider: BrowserOAuthProvider) {
@@ -266,6 +407,9 @@ function escapeHtml(value: unknown) {
 }
 
 function publicProvider(provider: BrowserOAuthProvider) {
+  const configured = provider.loginMode === 'device-oauth'
+    ? true
+    : Boolean(provider.clientId) && (provider.kind !== 'google' || Boolean(antigravityOAuthSecret(provider)));
   return {
     id: provider.id,
     name: provider.name,
@@ -275,8 +419,8 @@ function publicProvider(provider: BrowserOAuthProvider) {
     loginMode: provider.loginMode,
     authorizationUrl: provider.authorizationUrl,
     callbackPath: `/api/oauth/callback/${provider.id}`,
-    configured: Boolean(provider.clientId) && (provider.kind !== 'google' || Boolean(antigravityOAuthSecret(provider))),
-    canConnect: Boolean(provider.clientId) && (provider.kind !== 'google' || Boolean(antigravityOAuthSecret(provider))),
+    configured,
+    canConnect: configured,
     notes: provider.notes,
   };
 }
@@ -330,6 +474,14 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
     res.status(404).json({ error: { message: 'Browser OAuth provider not found' } });
     return;
   }
+  if (provider.loginMode === 'device-oauth') {
+    try {
+      res.json(await startFreebuffDeviceOAuth(provider));
+    } catch (error: any) {
+      res.status(502).json({ error: { message: String(error?.message ?? error) } });
+    }
+    return;
+  }
   if (!provider.clientId) {
     res.status(409).json({ error: { message: `${provider.name} does not have a verified public browser OAuth client yet. LLMHarbor will not generate broken unauthorized_client URLs.` } });
     return;
@@ -379,6 +531,24 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
   }
 
   res.json({ authUrl: authUrl.toString(), state, expiresInSeconds: 600, callbackUrl: redirectUri, loginMode: 'browser-oauth' });
+});
+
+oauthRouter.post('/connect/:provider/complete', async (req: Request, res: Response) => {
+  const provider = providerById(String(req.params.provider));
+  const state = typeof req.body?.state === 'string' ? req.body.state : '';
+  if (!provider || provider.loginMode !== 'device-oauth') {
+    res.status(404).json({ error: { message: 'Device OAuth provider not found' } });
+    return;
+  }
+  if (!state) {
+    res.status(400).json({ error: { message: 'Device OAuth state is required' } });
+    return;
+  }
+  try {
+    res.json(await completeFreebuffDeviceOAuth(provider, state));
+  } catch (error: any) {
+    res.status(502).json({ error: { message: String(error?.message ?? error) } });
+  }
 });
 
 oauthRouter.get('/callback/:provider', async (req: Request, res: Response) => {

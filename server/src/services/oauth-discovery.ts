@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { decrypt, encrypt } from '../lib/crypto.js';
+import { FREEBUFF_CATALOG_MODELS } from '../providers/freebuff.js';
 import { oauthTokenClient } from './oauth-clients.js';
 
 export type OAuthLimitWindow = {
@@ -12,7 +13,7 @@ export type OAuthLimitWindow = {
 export type OAuthDiscoveredModel = {
   id: string;
   displayName: string;
-  platform: 'openai' | 'google-oauth';
+  platform: 'openai' | 'google-oauth' | 'freebuff';
   priority: number;
   speedRank: number;
   sizeLabel: string;
@@ -358,6 +359,25 @@ export async function discoverOAuthAccount(db: Database.Database, row: any): Pro
         codeAssistUpdatedAt: new Date().toISOString(),
         codeAssistModelCount: models.length,
       },
+    };
+  }
+
+  if (row.provider === 'freebuff') {
+    const models = FREEBUFF_CATALOG_MODELS.map((model): OAuthDiscoveredModel => ({
+      id: model.id,
+      displayName: model.displayName ?? `${model.id} (Freebuff browser account)`,
+      platform: 'freebuff',
+      priority: model.priority,
+      speedRank: model.speedRank,
+      sizeLabel: model.sizeLabel,
+      contextWindow: model.contextWindow ?? null,
+      supported: true,
+      visibility: 'list',
+    }));
+    return {
+      models,
+      limits: [{ label: 'Freebuff browser account quota', usedPercent: null, resetAfterSeconds: null, resetAt: null }],
+      metadata: { freebuffUpdatedAt: new Date().toISOString(), freebuffModelCount: models.length },
     };
   }
 

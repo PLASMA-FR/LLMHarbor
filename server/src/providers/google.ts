@@ -536,6 +536,47 @@ export class GoogleProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
+    if (isOAuthGoogleRequest(options) && !isCodeAssistThinkingModel(modelId)) {
+      // Code Assist rejects /v1internal:streamGenerateContent for several
+      // non-thinking Antigravity models (notably gemini-2.5-pro) with a bare
+      // INVALID_ARGUMENT. Use the supported generateContent endpoint and expose
+      // the result as a synthetic OpenAI stream so API clients that always set
+      // stream=true can still use OAuth-backed browser accounts.
+      const completion = await this.chatCompletion(apiKey, messages, modelId, options);
+      const choice = completion.choices[0];
+      const content = contentToString(choice?.message?.content ?? null);
+      const toolCalls = choice?.message?.tool_calls ?? [];
+      const id = this.makeId();
+      if (content.length > 0 || toolCalls.length > 0) {
+        yield {
+          id,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: modelId,
+          choices: [{
+            index: 0,
+            delta: {
+              ...(content.length > 0 ? { content } : {}),
+              ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+            },
+            finish_reason: null,
+          }],
+        };
+      }
+      yield {
+        id,
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: modelId,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: choice?.finish_reason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop'),
+        }],
+      };
+      return;
+    }
+
     const { contents, systemInstruction } = toGeminiContents(messages);
 
     const body: Record<string, unknown> = {
