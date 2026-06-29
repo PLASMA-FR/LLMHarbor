@@ -82,7 +82,17 @@ function validateBackupDatabase(sourcePath: string) {
     const integrity = candidate.pragma('integrity_check') as Array<{ integrity_check: string }>;
     const ok = integrity.length === 1 && integrity[0].integrity_check === 'ok';
     if (!ok) throw new Error(`SQLite integrity_check failed: ${JSON.stringify(integrity).slice(0, 300)}`);
-    const requiredTables = ['models', 'api_keys', 'settings', 'client_api_keys', 'oauth_accounts'];
+    const requiredTables = [
+      'models',
+      'api_keys',
+      'settings',
+      'client_api_keys',
+      'client_api_key_usage',
+      'client_api_key_route_policies',
+      'client_api_key_platform_policies',
+      'client_api_key_model_policies',
+      'oauth_accounts',
+    ];
     const missing = requiredTables.filter(table => !candidate.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
     if (missing.length > 0) throw new Error(`Backup is missing required table(s): ${missing.join(', ')}`);
   } finally {

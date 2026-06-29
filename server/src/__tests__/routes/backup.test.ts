@@ -39,16 +39,24 @@ describe('full-instance backup routes', () => {
   it('exports a restorable SQLite backup and requires explicit restore confirmation', async () => {
     const addKey = await request(app, 'POST', '/api/keys', { platform: 'openai', key: 'sk-test-backup-secret', label: 'backup-key' });
     expect(addKey.status).toBe(201);
+    const localProxyKey = await request(app, 'POST', '/api/settings/api-keys', { label: 'local-proxy-backup-key', limits: { rpm: 7, rpd: null, tpm: 700, tpd: null } });
+    expect(localProxyKey.status).toBe(201);
+    const localProxySecret = localProxyKey.body.key;
 
     const exported = await request(app, 'GET', '/api/settings/backup/export');
     expect(exported.status).toBe(200);
     expect(exported.body.format).toBe('llmharbor.full-instance-backup.v1');
     expect(exported.body.security.containsSecrets).toBe(true);
+    expect(exported.body.includes).toContain('local-proxy-keys');
+    expect(exported.body.includes).toContain('client-api-key-policies');
+    expect(exported.body.manifest.localProxyKeys).toBeGreaterThanOrEqual(1);
     expect(exported.body.database.encoding).toBe('base64');
     expect(exported.body.database.sha256).toMatch(/^[a-f0-9]{64}$/);
 
     getDb().prepare('DELETE FROM api_keys').run();
+    getDb().prepare('DELETE FROM client_api_keys').run();
     expect((await request(app, 'GET', '/api/keys')).body).toHaveLength(0);
+    expect((await request(app, 'GET', '/api/settings/api-keys')).body).toHaveLength(0);
 
     const rejected = await request(app, 'POST', '/api/settings/backup/import', {
       format: exported.body.format,
@@ -70,5 +78,10 @@ describe('full-instance backup routes', () => {
     expect(keys.body).toHaveLength(1);
     expect(keys.body[0]).toMatchObject({ platform: 'openai', label: 'backup-key' });
     expect(JSON.stringify(keys.body)).not.toContain('sk-test-backup-secret');
+
+    const restoredLocalProxyKeys = await request(app, 'GET', '/api/settings/api-keys');
+    expect(restoredLocalProxyKeys.body.some((key: any) => key.label === 'local-proxy-backup-key')).toBe(true);
+    const restoredLocalProxySecret = getDb().prepare("SELECT key FROM client_api_keys WHERE label = 'local-proxy-backup-key'").get() as { key: string };
+    expect(restoredLocalProxySecret.key).toBe(localProxySecret);
   });
 });

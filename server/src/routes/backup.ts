@@ -5,7 +5,7 @@ import path from 'path';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { backupDbToFile, getDbPath, restoreDbFromBackupFile } from '../db/index.js';
+import { backupDbToFile, getDb, getDbPath, restoreDbFromBackupFile } from '../db/index.js';
 
 export const backupRouter = Router();
 
@@ -36,6 +36,11 @@ function sha256(buffer: Buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
+function tableCount(table: string): number {
+  const row = getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number };
+  return row.count ?? 0;
+}
+
 backupRouter.get('/export', async (_req: Request, res: Response) => {
   try {
     const payload = await withTempDir(async dir => {
@@ -54,15 +59,25 @@ backupRouter.get('/export', async (_req: Request, res: Response) => {
           'settings',
           'providers',
           'api-keys',
+          'local-proxy-keys',
           'client-api-keys',
+          'client-api-key-usage',
+          'client-api-key-policies',
           'oauth-accounts',
           'request-analytics',
           'routing-policies',
           'local-endpoints',
         ],
+        manifest: {
+          providerApiKeys: tableCount('api_keys'),
+          localProxyKeys: tableCount('client_api_keys'),
+          localProxyKeyUsageRows: tableCount('client_api_key_usage'),
+          oauthAccounts: tableCount('oauth_accounts'),
+          requestRows: tableCount('requests'),
+        },
         security: {
           containsSecrets: true,
-          note: 'This backup contains client API keys and encrypted provider/OAuth credentials. Keep it private. If ENCRYPTION_KEY is supplied by the environment, restore with the same ENCRYPTION_KEY to decrypt existing provider credentials.',
+          note: 'This backup contains local proxy keys (client API keys), local proxy key policies/usage, and encrypted provider/OAuth credentials. Keep it private. If ENCRYPTION_KEY is supplied by the environment, restore with the same ENCRYPTION_KEY to decrypt existing provider credentials.',
         },
         restore: {
           endpoint: '/api/settings/backup/import',

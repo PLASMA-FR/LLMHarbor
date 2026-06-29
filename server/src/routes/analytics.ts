@@ -9,6 +9,9 @@ export const analyticsRouter = Router();
 function getSinceTimestamp(range: string): string {
   const now = Date.now();
   switch (range) {
+    case 'all':
+    case 'alltime':
+      return '0000-01-01T00:00:00.000Z';
     case '24h':
       return new Date(now - 24 * 60 * 60 * 1000).toISOString();
     case '30d':

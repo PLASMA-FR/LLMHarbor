@@ -9,7 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 
-type TimeRange = '24h' | '7d' | '30d'
+type TimeRange = '24h' | '7d' | '30d' | 'all'
 
 interface AnalyticsSummary {
   totalRequests: number
@@ -91,6 +91,12 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
 const axisStyle = { fontSize: 11, fill: 'var(--muted-foreground)' } as const
 const gridStyle = 'var(--border)'
 const primaryFill = 'var(--foreground)'
+const timeRanges: Array<{ value: TimeRange; label: string }> = [
+  { value: '24h', label: '24h' },
+  { value: '7d', label: '7d' },
+  { value: '30d', label: '30d' },
+  { value: 'all', label: 'All time' },
+]
 
 export default function AnalyticsPage() {
   const [range, setRange] = useState<TimeRange>('7d')
@@ -135,15 +141,15 @@ export default function AnalyticsPage() {
         description="Request volume, latency, token use, savings, and provider errors in one place."
         actions={
           <div className="flex gap-1 rounded-[var(--radius-input)] border border-border bg-card p-1 ">
-            {(['24h', '7d', '30d'] as TimeRange[]).map(r => (
+            {timeRanges.map(({ value, label }) => (
               <Button
-                key={r}
-                variant={range === r ? 'secondary' : 'ghost'}
+                key={value}
+                variant={range === value ? 'secondary' : 'ghost'}
                 size="xs"
-                aria-pressed={range === r}
-                onClick={() => setRange(r)}
+                aria-pressed={range === value}
+                onClick={() => setRange(value)}
               >
-                {r}
+                {label}
               </Button>
             ))}
           </div>

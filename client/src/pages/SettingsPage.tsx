@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -17,6 +17,21 @@ interface PolicyRoute { id: string; method: string; path: string; name: string; 
 interface PolicyPlatform { platform: string; name: string; baseUrl: string | null; timeoutMs: number | null; source: 'built-in' | 'custom' | 'catalog'; enabled: boolean }
 interface PolicyModel { modelDbId: number; platform: string; modelId: string; displayName: string; contextWindow: number | null; catalogEnabled: boolean; enabled: boolean }
 interface AccessPolicySnapshot { key: ClientApiKey; routes: PolicyRoute[]; platforms: PolicyPlatform[]; models: PolicyModel[] }
+interface FullBackupPayload {
+  format: 'llmharbor.full-instance-backup.v1'
+  exportedAt: string
+  includes: string[]
+  manifest?: {
+    providerApiKeys?: number
+    localProxyKeys?: number
+    localProxyKeyUsageRows?: number
+    oauthAccounts?: number
+    requestRows?: number
+  }
+  security: { containsSecrets: boolean; note: string }
+  database: { filename: string; encoding: 'base64'; bytes: number; sha256: string; content: string }
+}
+interface BackupImportResult { success: boolean; previousBackupPath: string | null; restoredPath: string; restartedDatabase: boolean }
 
 type PolicyPatch = Partial<{
   routes: Array<{ route: string; enabled: boolean }>
@@ -34,6 +49,15 @@ function formatContextWindow(value: number | null) {
   if (value >= 1_000) return `${Math.round(value / 1_000)}K ctx`
   return `${value} ctx`
 }
+
+function formatBytes(value?: number) {
+  if (!value) return '0 B'
+  if (value >= 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`
+  return `${value} B`
+}
+
+const RESTORE_CONFIRMATION = 'RESTORE_LLMHARBOR_BACKUP'
 
 function PolicyStateBadge({ enabled }: { enabled: boolean }) {
   return (
@@ -76,6 +100,10 @@ export default function SettingsPage() {
   const [platformFilter, setPlatformFilter] = useState('all')
   const [showBlockedOnly, setShowBlockedOnly] = useState(false)
   const [freeUpdaterInterval, setFreeUpdaterInterval] = useState('6')
+  const [backupStatus, setBackupStatus] = useState<string | null>(null)
+  const [backupError, setBackupError] = useState<string | null>(null)
+  const [backupFileName, setBackupFileName] = useState('')
+  const backupFileRef = useRef<HTMLInputElement | null>(null)
 
   const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
@@ -158,6 +186,45 @@ export default function SettingsPage() {
     },
   })
 
+  const exportBackup = useMutation({
+    mutationFn: () => apiFetch<FullBackupPayload>('/api/settings/backup/export'),
+    onSuccess: (payload) => {
+      const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const filename = `llmharbor-backup-${stamp}.json`
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      setBackupError(null)
+      setBackupStatus(`Downloaded ${filename} (${formatBytes(payload.database.bytes)}). Includes ${payload.manifest?.localProxyKeys ?? 0} local proxy key${payload.manifest?.localProxyKeys === 1 ? '' : 's'}.`)
+    },
+    onError: (error) => {
+      setBackupStatus(null)
+      setBackupError(error instanceof Error ? error.message : String(error))
+    },
+  })
+
+  const importBackup = useMutation({
+    mutationFn: (payload: FullBackupPayload) => apiFetch<BackupImportResult>('/api/settings/backup/import', {
+      method: 'POST',
+      body: JSON.stringify({ format: payload.format, confirm: RESTORE_CONFIRMATION, database: payload.database }),
+    }),
+    onSuccess: (result) => {
+      setBackupError(null)
+      setBackupStatus(`Backup restored. Previous database backup: ${result.previousBackupPath ?? 'not created'}. Refresh the dashboard if any counters look stale.`)
+      queryClient.invalidateQueries()
+    },
+    onError: (error) => {
+      setBackupStatus(null)
+      setBackupError(error instanceof Error ? error.message : String(error))
+    },
+  })
+
   useEffect(() => {
     if (freeUpdaterStatus) setFreeUpdaterInterval(String(freeUpdaterStatus.refreshIntervalHours))
   }, [freeUpdaterStatus])
@@ -227,6 +294,28 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleBackupFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setBackupFileName(file.name)
+    setBackupStatus(null)
+    setBackupError(null)
+    try {
+      const payload = JSON.parse(await file.text()) as FullBackupPayload
+      if (payload.format !== 'llmharbor.full-instance-backup.v1' || payload.database?.encoding !== 'base64') {
+        throw new Error('Choose an LLMHarbor full-instance backup JSON file.')
+      }
+      const keyCount = payload.manifest?.localProxyKeys ?? 'unknown number of'
+      const ok = window.confirm(`Restore ${file.name}? This replaces the local LLMHarbor database, including provider keys, OAuth accounts, analytics, and ${keyCount} local proxy key(s).`)
+      if (!ok) return
+      importBackup.mutate(payload)
+    } catch (error) {
+      setBackupError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (backupFileRef.current) backupFileRef.current.value = ''
+    }
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -239,6 +328,52 @@ export default function SettingsPage() {
           </Button>
         }
       />
+
+      <section className="panel-card rounded-2xl p-5 sm:p-6">
+        <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Full-instance backup"
+            description="Located here in Settings. Export or restore the whole SQLite instance: provider keys, OAuth accounts, analytics, routing policies, local proxy keys, and local proxy key limits/usage."
+            action={<Badge variant="secondary">Sensitive</Badge>}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" onClick={() => exportBackup.mutate()} disabled={exportBackup.isPending || importBackup.isPending}>
+              {exportBackup.isPending ? 'Exporting…' : 'Export backup'}
+            </Button>
+            <Button type="button" variant="outline" onClick={() => backupFileRef.current?.click()} disabled={exportBackup.isPending || importBackup.isPending}>
+              {importBackup.isPending ? 'Restoring…' : 'Import backup'}
+            </Button>
+            <Input
+              ref={backupFileRef}
+              className="hidden"
+              type="file"
+              accept="application/json,.json"
+              onChange={handleBackupFile}
+            />
+          </div>
+        </div>
+        <div className="mt-5 grid gap-3 md:grid-cols-3">
+          <SummaryTile label="Backup contents" value="Full DB" detail="Provider credentials, OAuth tokens, catalog, analytics, access policies, and local proxy keys." tone="warn" />
+          <SummaryTile label="Local proxy keys" value={clientKeys.length} detail="Client API keys are included in exports and restored on import." />
+          <SummaryTile label="Restore phrase" value={RESTORE_CONFIRMATION} detail="The dashboard sends this confirmation automatically after you choose a valid backup file." />
+        </div>
+        <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
+          Keep exported backups private. They contain local proxy keys and encrypted provider/OAuth credentials; if you run with an environment ENCRYPTION_KEY, restore with the same key.
+        </div>
+        {backupFileName && !backupStatus && !backupError && (
+          <p className="mt-3 text-xs text-muted-foreground">Selected file: {backupFileName}</p>
+        )}
+        {backupStatus && (
+          <div className="mt-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/8 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-200">
+            {backupStatus}
+          </div>
+        )}
+        {backupError && (
+          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+            {backupError}
+          </div>
+        )}
+      </section>
 
       <section className="panel-card rounded-2xl p-5 sm:p-6">
         <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
