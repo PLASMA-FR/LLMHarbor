@@ -135,10 +135,50 @@ describe('OpenAI multimodal array content', () => {
     expect(status).toBe(400);
   });
 
-  it('rejects an assistant message with neither content nor tool_calls', async () => {
-    const { status } = await request(app, 'POST', '/v1/chat/completions', {
+  it('drops empty assistant stubs left behind by interrupted streams', async () => {
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        providerBody = JSON.parse(String((init as RequestInit).body));
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-empty-assistant-stub', object: 'chat.completion', created: 1, model: 'openai/gpt-oss-120b',
+            choices: [{
+              index: 0,
+              message: { role: 'assistant', content: 'recovered' },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'build SignalForge' },
+        { role: 'assistant', content: '' },
+        { role: 'user', content: 'continue' },
+      ],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(providerBody.messages).toEqual([
+      { role: 'user', content: 'build SignalForge' },
+      { role: 'user', content: 'continue' },
+    ]);
+    expect(body.choices[0].message.content).toBe('recovered');
+  });
+
+  it('rejects a request with only empty assistant stubs', async () => {
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       messages: [{ role: 'assistant', content: [] }],
     }, authHeaders());
     expect(status).toBe(400);
+    expect(body.error.message).toContain('messages must include at least one non-empty message');
   });
 });

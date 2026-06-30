@@ -208,13 +208,13 @@ const assistantMessageSchema = z.object({
   content: z.union([contentSchema, z.null()]).optional(),
   name: z.string().optional(),
   tool_calls: z.array(toolCallSchema).optional(),
-}).refine((msg) => {
-  const hasContent = hasNonEmptyContent(msg.content);
-  const hasToolCalls = (msg.tool_calls?.length ?? 0) > 0;
-  return hasContent || hasToolCalls;
-}, {
-  message: 'assistant messages must include non-empty content or tool_calls',
 });
+
+function isEmptyAssistantStub(message: { role: string; content?: unknown; tool_calls?: unknown[] }): boolean {
+  return message.role === 'assistant'
+    && !hasNonEmptyContent(message.content)
+    && (message.tool_calls?.length ?? 0) === 0;
+}
 
 const toolMessageSchema = z.object({
   role: z.literal('tool'),
@@ -324,7 +324,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
-  const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
+  const requestMessages = parsed.data.messages.filter(m => !isEmptyAssistantStub(m));
+  if (requestMessages.length === 0) {
+    res.status(400).json({
+      error: {
+        message: 'Invalid request: messages must include at least one non-empty message',
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const messages: ChatMessage[] = requestMessages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       return {
         role: 'assistant',
