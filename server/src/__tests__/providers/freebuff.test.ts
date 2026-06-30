@@ -2,6 +2,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { FreebuffProvider } from '../../providers/freebuff.js';
 
 const MODEL = 'moonshotai/kimi-k2.6';
+const SWITCH_MODEL = 'mimo/mimo-v2.5-pro';
 const CHAT_URL = 'https://www.codebuff.com/api/v1/chat/completions';
 const SESSION_URL = 'https://www.codebuff.com/api/v1/freebuff/session';
 
@@ -148,5 +149,75 @@ describe('FreebuffProvider', () => {
     expect(body.messages[1].content).toContain('System instructions from the API client:');
     expect(body.messages[1].content).toContain('You are Hermes Agent.');
     expect(body.messages[1].content).toContain('User message:\nhello');
+  });
+
+  it('releases the held Freebuff session and rejoins when switching models', async () => {
+    const provider = new FreebuffProvider();
+    const calls: CapturedFetch[] = [];
+    const sessionPostResponses = [
+      new Response(JSON.stringify({
+        status: 'model_locked',
+        currentModel: MODEL,
+        requestedModel: SWITCH_MODEL,
+        accessTier: 'full',
+      }), { status: 409, headers: { 'content-type': 'application/json' } }),
+      Response.json({
+        status: 'active',
+        instanceId: 'mimo-session-456',
+        model: SWITCH_MODEL,
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    ];
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = String(url);
+      const requestInit = init ?? {};
+      calls.push({ url: urlStr, init: requestInit });
+
+      if (urlStr === SESSION_URL && requestInit.method === 'POST') {
+        const response = sessionPostResponses.shift();
+        if (!response) throw new Error('unexpected extra session POST');
+        return response;
+      }
+      if (urlStr === SESSION_URL && requestInit.method === 'DELETE') {
+        return Response.json({ status: 'none' });
+      }
+      if (urlStr === CHAT_URL) {
+        return Response.json({
+          id: 'chatcmpl-switch',
+          object: 'chat.completion',
+          created: 1,
+          model: SWITCH_MODEL,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'switched' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }
+      if (urlStr === 'https://www.codebuff.com/api/v1/agent-runs') {
+        const body = JSON.parse(String(requestInit.body ?? '{}'));
+        if (body.action === 'START') return Response.json({ runId: body.agentId === 'context-pruner' ? 'run-child-switch' : 'run-parent-switch' });
+        if (body.action === 'FINISH') return Response.json({ ok: true });
+      }
+      if (urlStr.includes('/api/v1/agent-runs/') && urlStr.endsWith('/steps')) {
+        return Response.json({ stepId: `step-${calls.length}` });
+      }
+      throw new Error(`unexpected Freebuff fetch ${requestInit.method ?? 'GET'} ${urlStr}`);
+    });
+
+    const completion = await provider.chatCompletion('freebuff-token-switch', [{ role: 'user', content: 'hello' }], SWITCH_MODEL);
+
+    expect(completion.choices[0].message.content).toBe('switched');
+    const sessionCalls = calls.filter(call => call.url === SESSION_URL);
+    expect(sessionCalls.map(call => call.init.method)).toEqual(['POST', 'DELETE', 'POST']);
+    expect(sessionCalls[0].init.headers).toEqual({
+      Authorization: 'Bearer freebuff-token-switch',
+      'x-freebuff-model': SWITCH_MODEL,
+    });
+    expect(sessionCalls[1].init.headers).toEqual({ Authorization: 'Bearer freebuff-token-switch' });
+    expect(sessionCalls[2].init.headers).toEqual({
+      Authorization: 'Bearer freebuff-token-switch',
+      'x-freebuff-model': SWITCH_MODEL,
+    });
+    const body = JSON.parse(String(findChatCall(calls).init.body));
+    expect(body.codebuff_metadata.freebuff_instance_id).toBe('mimo-session-456');
   });
 });

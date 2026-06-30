@@ -52,6 +52,7 @@ interface RunChain {
 }
 
 const sessionCache = new Map<string, FreebuffSession>();
+const sessionPromises = new Map<string, Promise<FreebuffSession>>();
 
 function freebuffModel(modelId: string): FreebuffCatalogModel {
   const model = FREEBUFF_CATALOG_MODELS.find(entry => entry.id === modelId);
@@ -115,6 +116,13 @@ function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
 
 function sessionKey(token: string, modelId: string) {
   return `${token}:${modelId}`;
+}
+
+function clearSessionCacheForToken(token: string) {
+  const prefix = `${token}:`;
+  for (const key of sessionCache.keys()) {
+    if (key.startsWith(prefix)) sessionCache.delete(key);
+  }
 }
 
 async function parseJsonOrThrow(res: Response, label: string): Promise<any> {
@@ -220,7 +228,31 @@ export class FreebuffProvider extends BaseProvider {
       method: 'POST',
       headers: freebuffHeaders(token, { 'x-freebuff-model': modelId }),
     }, 120000);
-    return parseJsonOrThrow(res, 'Freebuff session create');
+    const text = await res.text();
+    let data: any = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (error: any) {
+      if (!res.ok) throw new Error(`Freebuff session create failed ${res.status}: ${text.slice(0, 300) || res.statusText}`);
+      throw new Error(`Freebuff session create returned invalid JSON: ${error?.message ?? error}`);
+    }
+    if (!res.ok) {
+      if (res.status === 409 && data?.status === 'model_locked') return data;
+      throw new Error(`Freebuff session create failed ${res.status}: ${text.slice(0, 300) || res.statusText}`);
+    }
+    return data;
+  }
+
+  private async releaseSession(token: string): Promise<void> {
+    clearSessionCacheForToken(token);
+    const res = await this.fetchWithTimeout(`${CODEBUFF_BASE_URL}/api/v1/freebuff/session`, {
+      method: 'DELETE',
+      headers: freebuffHeaders(token),
+    }, 30000);
+    if (!res.ok && res.status !== 404) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(`Freebuff session release failed ${res.status}: ${text.slice(0, 300) || res.statusText}`);
+    }
   }
 
   private async getSession(token: string, instanceId: string): Promise<any> {
@@ -238,13 +270,37 @@ export class FreebuffProvider extends BaseProvider {
     const cached = sessionCache.get(key);
     if (cached && isSessionUsable(cached)) return cached;
 
+    const pending = sessionPromises.get(key);
+    if (pending) return pending;
+
+    const promise = this.ensureSessionUncached(token, targetModel, key);
+    sessionPromises.set(key, promise);
+    try {
+      return await promise;
+    } finally {
+      if (sessionPromises.get(key) === promise) sessionPromises.delete(key);
+    }
+  }
+
+  private async ensureSessionUncached(token: string, targetModel: string, key: string): Promise<FreebuffSession> {
     let state = await this.createSession(token, targetModel);
+    let switchedModel = false;
     for (let i = 0; i < 60; i++) {
       const status = String(state?.status ?? '').trim();
       if (status === 'active') {
         const session = sessionFromState(state, targetModel);
         sessionCache.set(key, session);
         return session;
+      }
+      if (status === 'model_locked') {
+        const currentModel = typeof state?.currentModel === 'string' ? state.currentModel : '';
+        if (!switchedModel && currentModel && currentModel !== targetModel) {
+          switchedModel = true;
+          await this.releaseSession(token);
+          state = await this.createSession(token, targetModel);
+          continue;
+        }
+        throw new Error(`Freebuff session is locked to ${currentModel || 'another model'} and could not switch to ${targetModel}`);
       }
       if (status === 'queued') {
         const wait = Math.min(Math.max(Number(state?.estimatedWaitMs ?? 500), 250), 2000);
