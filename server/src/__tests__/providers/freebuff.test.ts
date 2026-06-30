@@ -123,4 +123,30 @@ describe('FreebuffProvider', () => {
     expect(body).not.toHaveProperty('stream');
     expect(body.provider).toEqual({ allow_fallbacks: false });
   });
+
+  it('wraps client system prompts inside a CLI-compatible Buffy conversation', async () => {
+    const provider = new FreebuffProvider();
+    const calls = mockFreebuffFetch(Response.json({
+      id: 'chatcmpl-2',
+      object: 'chat.completion',
+      created: 1,
+      model: MODEL,
+      choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }));
+
+    await provider.chatCompletion('freebuff-token-system', [
+      { role: 'system', content: 'You are Hermes Agent.' },
+      { role: 'user', content: 'hello' },
+    ], MODEL);
+
+    const body = JSON.parse(String(findChatCall(calls).init.body));
+    const systemMessages = body.messages.filter((message: any) => message.role === 'system');
+    expect(systemMessages).toHaveLength(1);
+    expect(systemMessages[0].content).toContain('You are Buffy');
+    expect(body.messages[1]).toMatchObject({ role: 'user' });
+    expect(body.messages[1].content).toContain('System instructions from the API client:');
+    expect(body.messages[1].content).toContain('You are Hermes Agent.');
+    expect(body.messages[1].content).toContain('User message:\nhello');
+  });
 });
