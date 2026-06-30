@@ -10,7 +10,12 @@ import { BaseProvider, type CompletionOptions, type ProviderCatalogModel } from 
 import { contentToString } from '../lib/content.js';
 
 const CODEBUFF_BASE_URL = 'https://www.codebuff.com';
-const FREEBUFF_USER_AGENT = 'Freebuff-CLI/0.0.115';
+// Source-derived protocol constants.  Freebuff's CLI sends inference through
+// the Codebuff SDK's OpenAI-compatible provider rather than the public API
+// shape normal clients use.  In particular, the server gate keys off the SDK
+// user-agent plus codebuff_metadata/free session fields.
+const CODEBUFF_AI_SDK_VERSION = '1.0.0';
+const CODEBUFF_CHAT_USER_AGENT = `ai-sdk/openai-compatible/${CODEBUFF_AI_SDK_VERSION}/codebuff`;
 const CODEBUFF_JSON_USER_AGENT = 'Bun/1.3.11';
 const CONTEXT_PRUNER_AGENT_ID = 'context-pruner';
 const DEFAULT_STOP = ['"cb_easp"'];
@@ -66,14 +71,18 @@ function apiHeaders(token: string, extra: Record<string, string> = {}) {
 }
 
 function freebuffHeaders(token: string, extra: Record<string, string> = {}) {
-  return apiHeaders(token, { 'User-Agent': FREEBUFF_USER_AGENT, ...extra });
+  return {
+    Authorization: `Bearer ${token}`,
+    ...extra,
+  };
 }
 
 function chatHeaders(token: string) {
-  return apiHeaders(token, {
+  return {
+    Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
-    'User-Agent': 'ai-sdk/openai-compatible/0.0.0-test/codebuff ai-sdk/provider-utils/3.0.20 runtime/browser',
-  });
+    'user-agent': CODEBUFF_CHAT_USER_AGENT,
+  };
 }
 
 function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -130,7 +139,7 @@ function upstreamChatPayload(
   return {
     model: body.model,
     messages: normalizeMessages(body.messages),
-    stream,
+    ...(stream ? { stream: true } : {}),
     temperature: options?.temperature,
     max_tokens: options?.max_tokens,
     top_p: options?.top_p,
@@ -138,7 +147,7 @@ function upstreamChatPayload(
     tool_choice: options?.tool_choice,
     parallel_tool_calls: options?.parallel_tool_calls,
     stop: DEFAULT_STOP,
-    provider: { data_collection: 'deny' },
+    provider: { allow_fallbacks: false },
     codebuff_metadata: {
       freebuff_instance_id: session.instanceId,
       trace_session_id: crypto.randomUUID(),
@@ -192,8 +201,7 @@ export class FreebuffProvider extends BaseProvider {
   private async createSession(token: string, modelId: string): Promise<any> {
     const res = await this.fetchWithTimeout(`${CODEBUFF_BASE_URL}/api/v1/freebuff/session`, {
       method: 'POST',
-      headers: freebuffHeaders(token, { 'Content-Type': 'application/json', 'x-freebuff-model': modelId }),
-      body: '{}',
+      headers: freebuffHeaders(token, { 'x-freebuff-model': modelId }),
     }, 120000);
     return parseJsonOrThrow(res, 'Freebuff session create');
   }
