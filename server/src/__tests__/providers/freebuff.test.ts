@@ -78,7 +78,9 @@ describe('FreebuffProvider', () => {
       chunks.push(chunk);
     }
 
-    expect(chunks).toHaveLength(1);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0].choices[0].delta).toMatchObject({ role: 'assistant', content: '' });
+    expect(chunks[1].choices[0].delta.content).toBe('hi');
     const sessionCall = calls.find(call => call.url === SESSION_URL && call.init.method === 'POST');
     expect(sessionCall?.init.headers).toEqual({
       Authorization: 'Bearer freebuff-token',
