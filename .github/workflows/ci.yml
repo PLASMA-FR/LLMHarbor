@@ -74,6 +74,7 @@ jobs:
           $unknownCommandExit = $LASTEXITCODE
           $ErrorActionPreference = 'Stop'
           if ($unknownCommandExit -eq 0) { throw 'An unknown command must return a non-zero exit code' }
+          exit 0 # Do not propagate the intentionally failing child process code.
 
   test:
     name: Node ${{ matrix.node-version }}
