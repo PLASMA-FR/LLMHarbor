@@ -28,6 +28,13 @@ function authHeaders() {
   return { Authorization: `Bearer ${getUnifiedApiKey()}` };
 }
 
+function sseData(raw: string): string[] {
+  return raw
+    .split(/\r?\n\r?\n/)
+    .map(event => event.split(/\r?\n/).find(line => line.startsWith('data: '))?.slice(6))
+    .filter((data): data is string => data !== undefined);
+}
+
 describe('Virtual "auto" model', () => {
   let app: Express;
 
@@ -97,6 +104,111 @@ describe('Virtual "auto" model', () => {
     expect(result.status).toBe(400);
     expect(result.body.error.type).toBe('invalid_request_error');
     expect(result.body.error.message).toContain('stream_options requires stream=true');
+  });
+
+  it('synthesizes one terminal OpenAI usage chunk when an adapter omits usage', async () => {
+    const credential = encrypt('google-stream-usage-test');
+    getDb().prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ('google', 'google stream usage', ?, ?, ?, 'healthy', 1)
+    `).run(credential.encrypted, credential.iv, credential.authTag);
+
+    const encoder = new TextEncoder();
+    const originalFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      if (!String(url).includes('generativelanguage.googleapis.com')) return originalFetch(url, init);
+      expect(JSON.parse(String(init?.body))).toMatchObject({ contents: expect.any(Array) });
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Gemini reply' }] } }] })}\n\n`
+            + `data: ${JSON.stringify({ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] })}\n\n`,
+          ));
+          controller.close();
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    });
+
+    const result = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'google/gemini-2.5-flash',
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: 'hello' }],
+    }, authHeaders());
+
+    expect(result.status).toBe(200);
+    const events = sseData(result.raw);
+    expect(events.at(-1)).toBe('[DONE]');
+    const chunks = events.slice(0, -1).map(event => JSON.parse(event));
+    const usageChunks = chunks.filter(chunk => chunk.choices.length === 0);
+    expect(usageChunks).toHaveLength(1);
+    expect(chunks.at(-1)).toBe(usageChunks[0]);
+    expect(usageChunks[0]).toMatchObject({
+      object: 'chat.completion.chunk',
+      model: 'google/gemini-2.5-flash',
+      choices: [],
+      usage: {
+        prompt_tokens: expect.any(Number),
+        completion_tokens: expect.any(Number),
+        total_tokens: expect.any(Number),
+      },
+    });
+    expect(usageChunks[0].usage.total_tokens).toBe(
+      usageChunks[0].usage.prompt_tokens + usageChunks[0].usage.completion_tokens,
+    );
+    expect(chunks.some(chunk => chunk.choices.some((choice: any) => choice.finish_reason === 'stop'))).toBe(true);
+  });
+
+  it('normalizes upstream usage-only frames without emitting a duplicate trailer', async () => {
+    const encoder = new TextEncoder();
+    const originalFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      if (!String(url).includes('api.groq.com/openai/v1/chat/completions')) return originalFetch(url, init);
+      expect(JSON.parse(String(init?.body)).stream_options).toEqual({ include_usage: true });
+      const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(
+            frame({
+              id: 'chatcmpl-upstream-usage', object: 'chat.completion.chunk', created: 1, model: 'upstream',
+              choices: [{ index: 0, delta: { content: 'hello' }, finish_reason: null }],
+            })
+            + frame({
+              id: 'chatcmpl-upstream-usage', object: 'chat.completion.chunk', created: 1, model: 'upstream',
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })
+            + frame({
+              id: 'chatcmpl-upstream-usage', object: 'chat.completion.chunk', created: 1, model: 'upstream',
+              choices: [], usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
+            })
+            + 'data: [DONE]\n\n',
+          ));
+          controller.close();
+        },
+      }), { headers: { 'content-type': 'text/event-stream' } });
+    });
+
+    const result = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'groq/llama-3.3-70b-versatile',
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: 'hello' }],
+    }, authHeaders());
+
+    expect(result.status).toBe(200);
+    const events = sseData(result.raw);
+    expect(events.at(-1)).toBe('[DONE]');
+    const chunks = events.slice(0, -1).map(event => JSON.parse(event));
+    const usageChunks = chunks.filter(chunk => chunk.choices.length === 0);
+    expect(usageChunks).toHaveLength(1);
+    expect(chunks.at(-1)).toBe(usageChunks[0]);
+    expect(usageChunks[0]).toMatchObject({
+      id: 'chatcmpl-upstream-usage',
+      model: 'groq/llama-3.3-70b-versatile',
+      choices: [],
+      usage: { prompt_tokens: 7, completion_tokens: 3, total_tokens: 10 },
+    });
+    expect(chunks.slice(0, -1).every(chunk => chunk.usage === undefined)).toBe(true);
   });
 
   it('hides browser-account models from /v1/models when no live OAuth key can route them', async () => {

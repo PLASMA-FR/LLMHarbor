@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import type { Express } from 'express';
 import { request as httpRequest } from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createApp, createPublicApiApp } from '../../app.js';
 import { initDb, isValidClientApiKey } from '../../db/index.js';
 
@@ -275,6 +278,24 @@ describe('Proxy authentication and CORS', () => {
     expect(policy).toContain("connect-src 'self'");
     expect(policy).toContain("frame-ancestors 'none'");
     expect(policy).not.toContain('upgrade-insecure-requests');
+  });
+
+  it('serves SPA deep links when the installation path contains a dotted segment', async () => {
+    const hiddenInstall = fs.mkdtempSync(path.join(os.tmpdir(), '.llmharbor-spa-'));
+    const clientDist = path.join(hiddenInstall, 'client', 'dist');
+    try {
+      fs.mkdirSync(clientDist, { recursive: true });
+      fs.writeFileSync(path.join(clientDist, 'index.html'), '<!doctype html><title>LLMHarbor deep-link fixture</title>');
+      const installedApp = createApp({ clientDistPath: clientDist });
+
+      const result = await request(installedApp, 'GET', '/overview');
+
+      expect(result.status).toBe(200);
+      expect(result.headers.get('content-type')).toContain('text/html');
+      expect(result.raw).toContain('LLMHarbor deep-link fixture');
+    } finally {
+      fs.rmSync(hiddenInstall, { recursive: true, force: true });
+    }
   });
 
   it('returns structured JSON for unknown dashboard-listener API routes', async () => {

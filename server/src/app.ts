@@ -24,6 +24,7 @@ type ControlPlaneAccess = 'local' | 'trusted-network';
 
 export interface CreateAppOptions {
   controlPlaneAccess?: ControlPlaneAccess;
+  clientDistPath?: string;
 }
 
 const DEFAULT_DASHBOARD_ORIGINS = [
@@ -328,7 +329,7 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
   app.use(errorHandler);
 
   // Serve client static files (after API error handler)
-  const clientDist = path.resolve(__dirname, '../../client/dist');
+  const clientDist = options.clientDistPath ?? path.resolve(__dirname, '../../client/dist');
   app.use(express.static(clientDist));
   // SPA fallback — serve index.html for dashboard routes only.
   app.use((req, res, next) => {
@@ -336,7 +337,11 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
       next();
       return;
     }
-    res.sendFile(path.join(clientDist, 'index.html'));
+    // Use a root-relative file name. Express' `send` dependency treats every
+    // dotted segment in an absolute path as a dotfile, which made deep links
+    // return 404 when the application lived under the default `~/.llmharbor`
+    // install directory even though the same index file was served at `/`.
+    res.sendFile('index.html', { root: clientDist });
   });
 
   // Express' default 404 is HTML. Keep every API namespace machine-readable,

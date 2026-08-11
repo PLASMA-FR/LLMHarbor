@@ -985,6 +985,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         let reportedTotalTokens = 0;
         let streamStarted = false;
         const bufferedUsageChunks: string[] = [];
+        const includeUsage = stream_options?.include_usage === true;
+        let usageChunkEnvelope: { id: string; created: number } | null = null;
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
@@ -996,12 +998,29 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               throw new ProviderProtocolError(`${route.displayName} returned a malformed streaming chunk.`);
             }
             const localRouteModelId = toLocalModelId(route.platform, route.modelId);
+            usageChunkEnvelope ??= {
+              id: typeof chunk.id === 'string' && chunk.id.length > 0
+                ? chunk.id
+                : `chatcmpl-${crypto.randomUUID()}`,
+              created: Number.isFinite(chunk.created) && chunk.created >= 0
+                ? chunk.created
+                : Math.floor(Date.now() / 1000),
+            };
             if (chunk.usage) {
               reportedPromptTokens = chunk.usage.prompt_tokens;
               reportedCompletionTokens = chunk.usage.completion_tokens;
               reportedTotalTokens = chunk.usage.total_tokens;
             }
-            const serialized = `data: ${JSON.stringify({ ...chunk, model: localRouteModelId })}\n\n`;
+            const usageOnly = chunk.choices.length === 0 && chunk.usage !== undefined;
+            // Normalize provider-specific usage behavior at the gateway. OpenAI's
+            // contract is one terminal choices:[] usage frame immediately before
+            // [DONE]. Hold any upstream usage-only frame (and strip usage attached
+            // to choice frames) so the terminal frame below cannot be duplicated.
+            if (includeUsage && usageOnly) continue;
+            const outboundChunk = includeUsage && chunk.usage !== undefined
+              ? { ...chunk, usage: undefined, model: localRouteModelId }
+              : { ...chunk, model: localRouteModelId };
+            const serialized = `data: ${JSON.stringify(outboundChunk)}\n\n`;
             // include_usage frames have choices:[] and are metadata, not proof
             // that the provider produced a completion. Keep them buffered until
             // the first substantive choice so an all-usage stream can fallback.
@@ -1036,12 +1055,29 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (!streamStarted) {
             throw new ProviderProtocolError(`${route.displayName} returned an empty streaming response.`);
           }
-          await writeResponseChunk(res, 'data: [DONE]\n\n', downstream.signal);
-          res.end();
-
           const actualInputTokens = reportedPromptTokens > 0 ? reportedPromptTokens : estimatedInputTokens;
           const actualOutputTokens = reportedCompletionTokens > 0 ? reportedCompletionTokens : estimatedOutputTokens;
           const totalTokens = reportedTotalTokens > 0 ? reportedTotalTokens : actualInputTokens + actualOutputTokens;
+          if (includeUsage) {
+            const envelope = usageChunkEnvelope ?? {
+              id: `chatcmpl-${crypto.randomUUID()}`,
+              created: Math.floor(Date.now() / 1000),
+            };
+            await writeResponseChunk(res, `data: ${JSON.stringify({
+              ...envelope,
+              object: 'chat.completion.chunk',
+              model: toLocalModelId(route.platform, route.modelId),
+              choices: [],
+              usage: {
+                prompt_tokens: actualInputTokens,
+                completion_tokens: actualOutputTokens,
+                total_tokens: totalTokens,
+              },
+            })}\n\n`, downstream.signal);
+          }
+          await writeResponseChunk(res, 'data: [DONE]\n\n', downstream.signal);
+          res.end();
+
           recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
           releaseProviderCapacity(route.capacityReservationId);
           settleClientCapacity(totalTokens);
