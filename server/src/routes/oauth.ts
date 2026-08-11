@@ -882,7 +882,7 @@ oauthRouter.get('/accounts/:id/models', (req: Request, res: Response) => {
     res.status(400).json({ error: { message: 'Invalid account ID' } });
     return;
   }
-  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ? AND enabled = 1').get(id) as any;
+  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(id) as any;
   if (!row) {
     res.status(404).json({ error: { message: 'OAuth account not found' } });
     return;

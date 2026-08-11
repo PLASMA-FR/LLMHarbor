@@ -97,13 +97,13 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(upstreamCalled).toBe(false);
   });
 
-  it('keeps OAuth inventory GET read-only and reserves network discovery for POST refresh', async () => {
+  it('allows disabled accounts to read cached OAuth inventory while refresh remains enabled-only', async () => {
     const token = encrypt('cached-inventory-token');
     const account = getDb().prepare(`
       INSERT INTO oauth_accounts (
         provider, label, encrypted_access_token, access_iv, access_auth_tag,
         metadata_json, enabled
-      ) VALUES ('freebuff', 'Cached inventory', ?, ?, ?, ?, 1)
+      ) VALUES ('freebuff', 'Cached inventory', ?, ?, ?, ?, 0)
     `).run(token.encrypted, token.iv, token.authTag, JSON.stringify({
       oauthLimits: [{ label: 'Cached quota', usedPercent: null }],
     }));
@@ -122,6 +122,11 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(cached.status).toBe(200);
     expect(cached.body.models).toContainEqual(expect.objectContaining({ id: 'moonshotai/kimi-k2.6' }));
     expect(cached.body.limits).toEqual([{ label: 'Cached quota', usedPercent: null }]);
+    expect(upstreamCalled).toBe(false);
+
+    const refresh = await request(app, 'POST', `/api/oauth/accounts/${account.lastInsertRowid}/models/refresh`);
+    expect(refresh.status).toBe(404);
+    expect(refresh.body.error.message).toBe('OAuth account not found');
     expect(upstreamCalled).toBe(false);
   });
 

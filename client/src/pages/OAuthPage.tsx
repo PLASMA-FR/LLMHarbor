@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
@@ -67,6 +67,8 @@ interface OAuthAccount {
   accountHint: string | null
   maskedToken: string
   enabled: boolean
+  createdAt: string
+  lastUsedAt: string | null
   expiresAt: string | null
   lastDiscoveredAt: string | null
   limits?: AccountLimit[]
@@ -88,6 +90,15 @@ interface OAuthInventory {
   provider?: string
   automatic?: boolean
 }
+
+interface OAuthAccountGroup {
+  provider: string
+  providerName: string
+  accounts: OAuthAccount[]
+}
+
+const EMPTY_OAUTH_PROVIDERS: OAuthProvider[] = []
+const EMPTY_OAUTH_ACCOUNTS: OAuthAccount[] = []
 
 function formatReset(limit: AccountLimit) {
   if (typeof limit.resetAfterSeconds === 'number') {
@@ -114,6 +125,64 @@ function isLoopbackCallbackUrl(value: string) {
   }
 }
 
+function groupOAuthAccounts(accounts: OAuthAccount[]): OAuthAccountGroup[] {
+  const groups = new Map<string, OAuthAccountGroup>()
+  for (const account of accounts) {
+    const group = groups.get(account.provider)
+    if (group) {
+      group.accounts.push(account)
+    } else {
+      groups.set(account.provider, {
+        provider: account.provider,
+        providerName: account.providerName,
+        accounts: [account],
+      })
+    }
+  }
+
+  return [...groups.values()]
+    .sort((left, right) => left.providerName.localeCompare(right.providerName))
+}
+
+function accountCapacitySummary(limits?: AccountLimit[]) {
+  if (!limits || limits.length === 0) return 'Not reported'
+  const reported = limits
+    .map(limit => limit.usedPercent)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  if (reported.length === 0) return 'Provider managed'
+  return `${Math.round(Math.max(...reported))}% peak usage`
+}
+
+function metadataString(account: OAuthAccount, key: string) {
+  const value = account.metadata?.[key]
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function accountDiscriminator(account: OAuthAccount) {
+  return metadataString(account, 'cloudaicompanionProject')
+    ?? metadataString(account, 'email')
+    ?? account.accountHint
+    ?? `Account #${account.id}`
+}
+
+function accountDisplayName(account: OAuthAccount) {
+  const label = account.label.trim()
+  for (const separator of [' - ', ': ']) {
+    const prefix = `${account.providerName}${separator}`
+    if (label.startsWith(prefix) && label.length > prefix.length) return label.slice(prefix.length)
+  }
+  return label || account.accountHint || `Account #${account.id}`
+}
+
+function accountSecondaryLabel(account: OAuthAccount) {
+  const discriminator = accountDiscriminator(account)
+  return discriminator === accountDisplayName(account) ? `Account #${account.id}` : discriminator
+}
+
+function accountNeedsReconnect(account: OAuthAccount) {
+  return account.metadata?.oauthNeedsReconnect === true
+}
+
 function LimitBars({ limits }: { limits?: AccountLimit[] }) {
   if (!limits || limits.length === 0) {
     return <p className="mt-3 text-xs text-muted-foreground">Limits refresh automatically when model inventory is discovered.</p>
@@ -129,7 +198,14 @@ function LimitBars({ limits }: { limits?: AccountLimit[] }) {
               <span className="font-medium text-foreground">{limit.label}</span>
               <span className="text-muted-foreground">{used === null ? 'active' : `${used}% used`}</span>
             </div>
-            <div className="mt-2 h-2 overflow-hidden rounded-full bg-background">
+            <div
+              className="mt-2 h-2 overflow-hidden rounded-full bg-background"
+              role={used === null ? undefined : 'progressbar'}
+              aria-label={used === null ? undefined : `${limit.label} usage`}
+              aria-valuemin={used === null ? undefined : 0}
+              aria-valuemax={used === null ? undefined : 100}
+              aria-valuenow={used ?? undefined}
+            >
               <div className={`h-full rounded-full ${tone}`} style={{ width: `${used ?? 100}%`, opacity: used === null ? 0.35 : 1 }} />
             </div>
             <p className="mt-2 text-[11px] text-muted-foreground">{formatReset(limit)}</p>
@@ -149,13 +225,21 @@ export default function OAuthPage() {
   const [copyError, setCopyError] = useState<string | null>(null)
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null)
   const [manualCallbackUrl, setManualCallbackUrl] = useState('')
+  const [connectionExpanded, setConnectionExpanded] = useState<boolean | null>(null)
   const pendingPopup = useRef<Window | null>(null)
   const remoteDashboard = !isLoopbackHostname(window.location.hostname)
 
   const { data: providerData, isLoading: providersLoading, isError: providersError, error: providersQueryError, refetch: refetchProviders } = useQuery<{ providers: OAuthProvider[] }>({ queryKey: ['oauth-providers'], queryFn: ({ signal }) => apiFetch('/api/oauth/providers', { signal }) })
   const { data: accountData, isLoading: accountsLoading, isError: accountsError, error: accountsQueryError, refetch: refetchAccounts } = useQuery<{ accounts: OAuthAccount[] }>({ queryKey: ['oauth-accounts'], queryFn: ({ signal }) => apiFetch('/api/oauth/accounts', { signal }) })
-  const providers = providerData?.providers ?? []
-  const accounts = accountData?.accounts ?? []
+  const providers = providerData?.providers ?? EMPTY_OAUTH_PROVIDERS
+  const accounts = accountData?.accounts ?? EMPTY_OAUTH_ACCOUNTS
+  const accountGroups = useMemo(() => groupOAuthAccounts(accounts), [accounts])
+  const enabledAccountCount = accounts.reduce((count, account) => count + (account.enabled ? 1 : 0), 0)
+  const selectedAccountRecord = accounts.find(account => account.id === selectedAccount)
+    ?? accounts.find(account => account.enabled)
+    ?? accounts[0]
+    ?? null
+  const selectedAccountId = selectedAccountRecord?.id ?? null
 
   function invalidateOAuthRoutingState() {
     queryClient.invalidateQueries({ queryKey: ['oauth-accounts'] })
@@ -257,22 +341,28 @@ export default function OAuthPage() {
     }),
     onSuccess: (_, variables) => {
       invalidateOAuthRoutingState()
-      if (variables.body.enabled === false && variables.id === selectedAccount) setSelectedAccount(null)
+      if (variables.body.label !== undefined) {
+        setRenaming(current => {
+          const next = { ...current }
+          delete next[variables.id]
+          return next
+        })
+      }
     },
   })
 
   const deleteAccount = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/oauth/accounts/${id}`, { method: 'DELETE' }),
-    onSuccess: () => {
+    onSuccess: (_, deletedId) => {
       invalidateOAuthRoutingState()
-      setSelectedAccount(null)
+      setSelectedAccount(current => current === deletedId ? null : current)
     },
   })
 
   const models = useQuery<OAuthInventory>({
-    queryKey: ['oauth-models', selectedAccount],
-    queryFn: ({ signal }) => apiFetch(`/api/oauth/accounts/${selectedAccount}/models`, { signal, timeoutMs: 120_000 }),
-    enabled: selectedAccount !== null && accounts.some(account => account.id === selectedAccount && account.enabled),
+    queryKey: ['oauth-models', selectedAccountId],
+    queryFn: ({ signal }) => apiFetch(`/api/oauth/accounts/${selectedAccountId}/models`, { signal, timeoutMs: 120_000 }),
+    enabled: selectedAccountId !== null,
   })
 
   const refreshModels = useMutation({
@@ -316,13 +406,39 @@ export default function OAuthPage() {
     }
   }
 
+  const selectedLabelDraft = selectedAccountRecord
+    ? (renaming[selectedAccountRecord.id] ?? selectedAccountRecord.label)
+    : ''
+  const connectionPanelOpen = activeConnection !== null || (connectionExpanded ?? accounts.length === 0)
+  const selectedUpdateError = updateAccount.isError && updateAccount.variables?.id === selectedAccountId
+    ? updateAccount.error
+    : null
+  const selectedDeleteError = deleteAccount.isError && deleteAccount.variables === selectedAccountId
+    ? deleteAccount.error
+    : null
+
   return (
     <div className="space-y-6">
       <PageHeader eyebrow="Browser authentication" title="OAuth accounts" description="Connect supported browser accounts, discover their live model inventory, and monitor provider-reported limit windows." />
 
-      <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
-        <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5">
-          <SectionTitle title="Connect a provider" description="LLMHarbor handles PKCE, loopback callbacks, encrypted credential storage, model discovery, and account-limit telemetry. Browser OAuth must run on the LLMHarbor host, or through a tunnel that makes its loopback callback reachable." />
+      <section className="flex min-w-0 flex-col gap-5">
+        <div className="panel-card min-w-0 overflow-hidden rounded-[var(--radius-panel)]">
+          <button
+            type="button"
+            className="flex w-full min-w-0 cursor-pointer items-center justify-between gap-4 px-5 py-4 text-left outline-none focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-70"
+            aria-expanded={connectionPanelOpen}
+            aria-controls="oauth-provider-connections"
+            disabled={activeConnection !== null}
+            onClick={() => setConnectionExpanded(!connectionPanelOpen)}
+          >
+            <span className="min-w-0">
+              <span className="block text-sm font-semibold text-foreground">Connect another account</span>
+              <span className="mt-0.5 block text-xs text-muted-foreground">{providers.length} OAuth providers available</span>
+            </span>
+            <span className="shrink-0 text-xs font-medium text-primary">{activeConnection ? 'Authorization in progress' : connectionPanelOpen ? 'Hide providers' : 'Choose provider'}</span>
+          </button>
+          {connectionPanelOpen ? <div id="oauth-provider-connections" className="border-t border-border px-5 pb-5">
+          <p className="mt-4 text-xs leading-5 text-muted-foreground">Choose a provider and complete its browser or device authorization flow. Credentials remain encrypted on this server.</p>
           {startLogin.error ? <InlineNotice className="mt-4" tone="critical">{startLogin.error.message}</InlineNotice> : null}
           {connectionNotice ? <InlineNotice className="mt-4" tone="warning">{connectionNotice}</InlineNotice> : null}
           {completeBrowserLogin.isSuccess ? <InlineNotice className="mt-4" tone="positive">Account connected. OAuth accounts and routing state are refreshing.</InlineNotice> : null}
@@ -404,94 +520,183 @@ export default function OAuthPage() {
               )}
             </div>
           )}
-          <div className="mt-5 grid min-w-0 grid-cols-[minmax(0,1fr)] gap-3 md:grid-cols-2">
+          <div className="mt-5 min-w-0 divide-y divide-border overflow-hidden rounded-[var(--radius-panel)] border border-border bg-background">
             {providersLoading ? (
-              <div className="md:col-span-2"><LoadingState title="Loading OAuth providers" description="Checking available browser-account integrations…" /></div>
+              <LoadingState title="Loading OAuth providers" description="Checking available browser-account integrations…" />
             ) : providersError ? (
-              <div className="md:col-span-2"><ErrorState title="Could not load OAuth providers" description={providersQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchProviders()}>Retry</Button>} /></div>
+              <ErrorState title="Could not load OAuth providers" description={providersQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchProviders()}>Retry</Button>} />
             ) : providers.map(provider => (
-              <article key={provider.id} className="min-w-0 rounded-[var(--radius-panel)] border border-border bg-background p-4">
-                <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
-                  <div className="min-w-0">
+              <article key={provider.id} className="flex min-w-0 flex-col gap-4 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <h3 className="break-words font-semibold tracking-[-0.02em]">{provider.name}</h3>
-                    <p className="mt-1 text-xs text-muted-foreground">{provider.kind}</p>
+                    <Badge variant="outline">{provider.loginMode === 'device-oauth' ? 'Device code' : 'Browser OAuth'}</Badge>
                   </div>
-                  <StatusIndicator label={provider.canConnect ? 'Ready to connect' : 'Unavailable'} tone={provider.canConnect ? 'positive' : 'warning'} />
+                  <p className="mt-1 text-sm leading-6 text-muted-foreground">{provider.notes}</p>
+                  <p className="mt-1 truncate text-xs text-muted-foreground" title={provider.scopes.join(', ')}>
+                    {provider.scopes.length > 0 ? `${provider.scopes.length} requested scopes` : 'No additional scopes'} · {provider.kind}
+                  </p>
                 </div>
-                <p className="mt-3 text-sm leading-6 text-muted-foreground">{provider.notes}</p>
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {provider.scopes.slice(0, 4).map(scope => (
-                    <Badge
-                      key={scope}
-                      variant="outline"
-                      className="min-w-0 max-w-full truncate"
-                      style={{ flexShrink: 1 }}
-                      title={scope}
-                    >
-                      {scope}
-                    </Badge>
-                  ))}
+                <div className="flex shrink-0 flex-col gap-2 sm:flex-row sm:items-center lg:min-w-48 lg:justify-end">
+                  <StatusIndicator label={provider.canConnect ? 'Available' : 'Unavailable'} tone={provider.canConnect ? 'positive' : 'warning'} />
+                  <Button disabled={startLogin.isPending || !provider.canConnect} onClick={() => beginLogin(provider)} aria-label={`Connect ${provider.name}`}>
+                    {provider.canConnect ? (provider.loginMode === 'device-oauth' ? 'Get device code' : 'Connect') : 'Unavailable'}
+                  </Button>
                 </div>
-                <p className="mt-4 truncate rounded-[var(--radius-button)] bg-muted px-3 py-2 font-mono text-xs text-muted-foreground">{provider.authorizationUrl}</p>
-                <Button className="mt-4 w-full" disabled={startLogin.isPending || !provider.canConnect} onClick={() => beginLogin(provider)} aria-label={`Connect ${provider.name}`}>
-                  {provider.canConnect ? (provider.loginMode === 'device-oauth' ? 'Connect with device code' : 'Connect account') : 'Waiting for verified public client'}
-                </Button>
               </article>
             ))}
-            {!providersLoading && !providersError && providers.length === 0 ? <div className="md:col-span-2"><EmptyState title="No OAuth providers available" description="This server does not currently expose a browser-account integration." /></div> : null}
+            {!providersLoading && !providersError && providers.length === 0 ? <EmptyState title="No OAuth providers available" description="This server does not currently expose a browser-account integration." /> : null}
           </div>
           {copyError ? <InlineNotice className="mt-4" tone="critical">{copyError}</InlineNotice> : null}
+          </div> : null}
         </div>
 
-        <div className="min-w-0 space-y-5">
-          <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5">
-            <SectionTitle title="Connected accounts" description="Each account shows provider-reported model inventory and limit windows. Select an account to inspect its cached models." />
-            <div className="mt-5 space-y-3">
-              {accountsLoading ? <LoadingState title="Loading connected accounts" /> : accountsError ? <ErrorState title="Could not load accounts" description={accountsQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchAccounts()}>Retry</Button>} /> : accounts.length === 0 ? <EmptyState title="No connected accounts" description="Connect a provider account to make its OAuth-backed models available." /> : accounts.map(account => (
-                <div key={account.id} className="min-w-0 rounded-[var(--radius-panel)] border border-border bg-background p-4">
-                  <button onClick={() => setSelectedAccount(account.id)} disabled={!account.enabled} className="w-full rounded-[var(--radius-button)] text-left outline-none focus-visible:ring-3 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-65" aria-pressed={selectedAccount === account.id}>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-medium">{account.label}</span>
-                      <Badge variant="secondary">{account.providerName}</Badge>
-                      <Badge variant={account.enabled ? 'default' : 'outline'}>{account.enabled ? 'Enabled' : 'Disabled'}</Badge>
-                      {typeof account.modelCount === 'number' && <Badge variant="outline">{account.modelCount} models</Badge>}
-                    </div>
-                    <code className="mt-2 block truncate rounded-[var(--radius-button)] bg-muted px-3 py-2 text-xs">{account.maskedToken}</code>
-                    <p className="mt-2 text-xs text-muted-foreground">Inventory {formatRelativeTime(account.lastDiscoveredAt)} · Token expires {formatDateTime(account.expiresAt)}</p>
-                    <LimitBars limits={account.limits} />
-                  </button>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto_auto_auto]">
-                    <Input aria-label={`Rename ${account.label}`} value={renaming[account.id] ?? account.label} onChange={event => setRenaming(prev => ({ ...prev, [account.id]: event.target.value }))} maxLength={100} />
-                    <Button variant="outline" size="sm" disabled={updateAccount.isPending || !(renaming[account.id] ?? account.label).trim()} onClick={() => updateAccount.mutate({ id: account.id, body: { label: (renaming[account.id] ?? account.label).trim() } })}>Rename</Button>
-                    <Button variant="outline" size="sm" disabled={updateAccount.isPending} onClick={() => updateAccount.mutate({ id: account.id, body: { enabled: !account.enabled } })}>{account.enabled ? 'Disable' : 'Enable'}</Button>
-                    <Button variant="ghost" size="sm" disabled={deleteAccount.isPending} onClick={() => { if (window.confirm(`Remove OAuth account "${account.label}"?`)) deleteAccount.mutate(account.id) }}>Remove</Button>
+        <div className="grid min-w-0 gap-5 2xl:grid-cols-[minmax(0,1.15fr)_minmax(360px,0.85fr)] 2xl:items-start">
+          <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5" aria-labelledby="connected-accounts-heading">
+            <SectionTitle
+              id="connected-accounts-heading"
+              title="Connected accounts"
+              description="Accounts are grouped by provider. Select a row to inspect credentials, quota windows, and model inventory."
+              action={<p className="whitespace-nowrap text-xs text-muted-foreground">{enabledAccountCount} enabled · {accounts.length} total</p>}
+            />
+            <div className="mt-4">
+              {accountsLoading ? <LoadingState title="Loading connected accounts" /> : accountsError ? <ErrorState title="Could not load accounts" description={accountsQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchAccounts()}>Retry</Button>} /> : accounts.length === 0 ? <EmptyState title="No connected accounts" description="Connect a provider account to make its OAuth-backed models available." /> : (
+                <div className="overflow-hidden rounded-[var(--radius-panel)] border border-border bg-background">
+                  <div className="hidden grid-cols-[minmax(210px,1.5fr)_110px_70px_120px_120px_16px] gap-3 border-b border-border bg-muted/35 px-4 py-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground lg:grid">
+                    <span>Account</span>
+                    <span>Status</span>
+                    <span>Models</span>
+                    <span>Inventory</span>
+                    <span>Capacity</span>
+                    <span aria-hidden="true" />
+                  </div>
+                  <div className="divide-y divide-border">
+                    {accountGroups.map(group => {
+                      const groupEnabledCount = group.accounts.reduce((count, account) => count + (account.enabled ? 1 : 0), 0)
+                      return (
+                        <section key={group.provider} aria-labelledby={`oauth-provider-${group.provider}`}>
+                          <div className="flex min-w-0 items-center justify-between gap-3 bg-muted/25 px-4 py-2.5">
+                            <h3 id={`oauth-provider-${group.provider}`} className="truncate text-xs font-semibold text-foreground">{group.providerName}</h3>
+                            <span className="shrink-0 text-[11px] text-muted-foreground">{groupEnabledCount}/{group.accounts.length} enabled</span>
+                          </div>
+                          <ul className="divide-y divide-border" role="list">
+                            {group.accounts.map(account => {
+                              const reconnectRequired = accountNeedsReconnect(account)
+                              const selected = selectedAccountId === account.id
+                              return (
+                                <li key={account.id}>
+                                  <button
+                                    type="button"
+                                    className={`grid w-full min-w-0 grid-cols-1 gap-2 px-4 py-3 text-left outline-none transition-colors focus-visible:ring-3 focus-visible:ring-inset focus-visible:ring-ring/30 lg:grid-cols-[minmax(210px,1.5fr)_110px_70px_120px_120px_16px] lg:items-center lg:gap-3 ${selected ? 'bg-primary/[0.02] shadow-[inset_3px_0_0_var(--primary)]' : 'hover:bg-muted/35'}`}
+                                    onClick={() => setSelectedAccount(account.id)}
+                                    aria-pressed={selected}
+                                    aria-controls="oauth-account-details"
+                                  >
+                                    <span className="min-w-0">
+                                      <span className="block truncate text-sm font-medium text-foreground">{accountDisplayName(account)}</span>
+                                      <code className="mt-0.5 block truncate text-[11px] text-muted-foreground">{accountSecondaryLabel(account)}</code>
+                                    </span>
+                                    <span>
+                                      <span className="sr-only">Status: </span>
+                                      <StatusIndicator
+                                        label={reconnectRequired ? 'Reconnect' : account.enabled ? 'Enabled' : 'Disabled'}
+                                        tone={reconnectRequired ? 'critical' : account.enabled ? 'positive' : 'neutral'}
+                                      />
+                                    </span>
+                                    <span className="text-xs text-foreground"><span className="sr-only">Models: </span><span aria-hidden="true" className="text-muted-foreground lg:hidden">Models: </span>{account.modelCount ?? '—'}</span>
+                                    <span className="truncate text-xs text-muted-foreground"><span className="sr-only">Inventory: </span><span aria-hidden="true" className="lg:hidden">Inventory: </span>{formatRelativeTime(account.lastDiscoveredAt)}</span>
+                                    <span className="truncate text-xs text-muted-foreground"><span className="sr-only">Capacity: </span><span aria-hidden="true" className="lg:hidden">Capacity: </span>{accountCapacitySummary(account.limits)}</span>
+                                    <span className="hidden text-right text-muted-foreground lg:block" aria-hidden="true">›</span>
+                                  </button>
+                                </li>
+                              )
+                            })}
+                          </ul>
+                        </section>
+                      )
+                    })}
                   </div>
                 </div>
-              ))}
+              )}
             </div>
-            {updateAccount.isError || deleteAccount.isError ? <InlineNotice className="mt-4" tone="critical">{(updateAccount.error ?? deleteAccount.error)?.message ?? 'Could not update the OAuth account.'}</InlineNotice> : null}
           </div>
 
-          {selectedAccount !== null && <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5">
-            <SectionTitle
-              title="Automatic model inventory"
-              description="The cached inventory is safe to inspect. Refresh explicitly to contact the provider and reconcile stale model IDs."
-              action={<Button variant="outline" size="sm" disabled={refreshModels.isPending || models.isLoading} onClick={() => refreshModels.mutate(selectedAccount)}>{refreshModels.isPending ? 'Refreshing…' : 'Refresh inventory'}</Button>}
-            />
-            {refreshModels.isError && refreshModels.variables === selectedAccount ? <InlineNotice className="mb-4" tone="critical">{refreshModels.error.message}</InlineNotice> : null}
-            {refreshModels.isPending && refreshModels.variables === selectedAccount ? <InlineNotice className="mb-4">Contacting the provider and reconciling its model inventory…</InlineNotice> : null}
-            {models.isLoading ? <LoadingState title="Loading cached inventory" /> : models.error ? <ErrorState title="Could not load inventory" description={models.error.message} action={<Button variant="outline" size="sm" onClick={() => models.refetch()}>Retry</Button>} /> : models.data?.message ? <EmptyState title="No inventory available" description={models.data.message} /> : (
-              <div className="mt-4 space-y-4">
-                <LimitBars limits={models.data?.limits} />
-                <div className="max-h-80 divide-y divide-border overflow-y-auto rounded-[var(--radius-panel)] border border-border bg-background">{(models.data?.models ?? []).map(model => (
-                  <div key={model.id} className="flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-xs">
-                    <div className="min-w-0"><p className="truncate font-medium">{model.displayName ?? model.id}</p><code className="mt-0.5 block truncate text-muted-foreground">{model.id}</code></div>
-                    {model.contextWindow ? <Badge variant="outline">{Math.round(model.contextWindow / 1000)}K ctx</Badge> : null}
+          <div id="oauth-account-details" className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5 2xl:sticky 2xl:top-5">
+            {selectedAccountRecord ? (
+              <>
+                <SectionTitle
+                  title={accountDisplayName(selectedAccountRecord)}
+                  description={`${selectedAccountRecord.providerName} · ${accountDiscriminator(selectedAccountRecord)}`}
+                  action={<StatusIndicator
+                    label={accountNeedsReconnect(selectedAccountRecord) ? 'Reconnect required' : selectedAccountRecord.enabled ? 'Enabled' : 'Disabled'}
+                    tone={accountNeedsReconnect(selectedAccountRecord) ? 'critical' : selectedAccountRecord.enabled ? 'positive' : 'neutral'}
+                  />}
+                />
+
+                {accountNeedsReconnect(selectedAccountRecord) ? <InlineNotice className="mb-4" tone="critical">This provider marked the credentials for reconnection. Connect the account again below before relying on its routes.</InlineNotice> : null}
+                {!selectedAccountRecord.enabled ? <InlineNotice className="mb-4" tone="warning">This account is disabled. Its cached inventory remains available, but live refresh and routing are paused.</InlineNotice> : null}
+                {selectedUpdateError || selectedDeleteError ? <InlineNotice className="mb-4" tone="critical">{(selectedUpdateError ?? selectedDeleteError)?.message ?? 'Could not update the OAuth account.'}</InlineNotice> : null}
+
+                <dl className="grid grid-cols-1 gap-x-5 gap-y-3 rounded-[var(--radius-panel)] border border-border bg-muted/20 p-4 text-xs sm:grid-cols-2">
+                  <div className="min-w-0"><dt className="text-muted-foreground">Account</dt><dd className="mt-1 truncate font-medium text-foreground" title={accountDiscriminator(selectedAccountRecord)}>{accountDiscriminator(selectedAccountRecord)}</dd></div>
+                  <div className="min-w-0"><dt className="text-muted-foreground">Credential</dt><dd className="mt-1 truncate font-mono text-foreground">{selectedAccountRecord.maskedToken}</dd></div>
+                  <div><dt className="text-muted-foreground">Last used</dt><dd className="mt-1 font-medium text-foreground">{formatRelativeTime(selectedAccountRecord.lastUsedAt)}</dd></div>
+                  <div><dt className="text-muted-foreground">Connected</dt><dd className="mt-1 font-medium text-foreground">{formatDateTime(selectedAccountRecord.createdAt)}</dd></div>
+                  <div><dt className="text-muted-foreground">Token expiry</dt><dd className="mt-1 font-medium text-foreground">{formatDateTime(selectedAccountRecord.expiresAt)}</dd></div>
+                  <div><dt className="text-muted-foreground">Inventory</dt><dd className="mt-1 font-medium text-foreground">{formatRelativeTime(selectedAccountRecord.lastDiscoveredAt)}</dd></div>
+                </dl>
+
+                <form
+                  className="mt-4 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]"
+                  onSubmit={(event) => {
+                    event.preventDefault()
+                    const label = selectedLabelDraft.trim()
+                    if (label && label !== selectedAccountRecord.label) updateAccount.mutate({ id: selectedAccountRecord.id, body: { label } })
+                  }}
+                >
+                  <div className="min-w-0">
+                    <label className="mb-1.5 block text-xs font-medium text-foreground" htmlFor="oauth-account-label">Friendly name</label>
+                    <Input id="oauth-account-label" value={selectedLabelDraft} onChange={event => setRenaming(current => ({ ...current, [selectedAccountRecord.id]: event.target.value }))} maxLength={100} />
                   </div>
-                ))}</div>
-              </div>
-            )}
-          </div>}
+                  <Button className="sm:mt-[1.625rem]" type="submit" variant="outline" size="sm" disabled={updateAccount.isPending || !selectedLabelDraft.trim() || selectedLabelDraft.trim() === selectedAccountRecord.label}>Save name</Button>
+                </form>
+
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" disabled={updateAccount.isPending} onClick={() => {
+                    setSelectedAccount(selectedAccountRecord.id)
+                    updateAccount.mutate({ id: selectedAccountRecord.id, body: { enabled: !selectedAccountRecord.enabled } })
+                  }}>{selectedAccountRecord.enabled ? 'Disable routing' : 'Enable routing'}</Button>
+                  <Button variant="destructive" size="sm" disabled={deleteAccount.isPending} onClick={() => {
+                    const confirmed = window.confirm(`Disconnect OAuth account "${selectedAccountRecord.label}"? This removes its stored tokens and OAuth-backed routing capacity.`)
+                    if (confirmed) deleteAccount.mutate(selectedAccountRecord.id)
+                  }}>Disconnect account</Button>
+                </div>
+
+                <div className="mt-5 border-t border-border pt-5">
+                  <SectionTitle
+                    title="Model inventory"
+                    description="Cached models and provider-reported limit windows for this account."
+                    action={<Button variant="outline" size="sm" disabled={!selectedAccountRecord.enabled || refreshModels.isPending || models.isLoading} onClick={() => refreshModels.mutate(selectedAccountRecord.id)}>{refreshModels.isPending ? 'Refreshing…' : 'Refresh'}</Button>}
+                  />
+                  {refreshModels.isError && refreshModels.variables === selectedAccountRecord.id ? <InlineNotice className="mb-4" tone="critical">{refreshModels.error.message}</InlineNotice> : null}
+                  {refreshModels.isPending && refreshModels.variables === selectedAccountRecord.id ? <InlineNotice className="mb-4">Contacting the provider and reconciling its model inventory…</InlineNotice> : null}
+                  {models.isLoading ? <LoadingState title="Loading cached inventory" /> : models.error ? <ErrorState title="Could not load inventory" description={models.error.message} action={<Button variant="outline" size="sm" onClick={() => models.refetch()}>Retry</Button>} /> : models.data?.message ? <EmptyState title="No inventory available" description={models.data.message} /> : (
+                    <div className="space-y-4">
+                      <LimitBars limits={models.data?.limits ?? selectedAccountRecord.limits} />
+                      {(models.data?.models ?? []).length === 0 ? <EmptyState title={selectedAccountRecord.modelCount ? `${selectedAccountRecord.modelCount} models reported` : 'No models discovered'} description={selectedAccountRecord.modelCount ? 'Refresh to reconcile the provider inventory and load its current model details.' : 'Refresh this account after the provider exposes a model inventory.'} /> : (
+                        <div className="max-h-80 divide-y divide-border overflow-y-auto rounded-[var(--radius-panel)] border border-border bg-background">{(models.data?.models ?? []).map(model => (
+                          <div key={model.id} className="flex min-w-0 items-center justify-between gap-3 px-3 py-2.5 text-xs">
+                            <div className="min-w-0"><p className="truncate font-medium">{model.displayName ?? model.id}</p><code className="mt-0.5 block truncate text-muted-foreground">{model.id}</code></div>
+                            {model.contextWindow ? <Badge variant="outline">{Math.round(model.contextWindow / 1000)}K ctx</Badge> : null}
+                          </div>
+                        ))}</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : <EmptyState title="Select an account" description="Connected OAuth accounts and their operational details will appear here." />}
+          </div>
         </div>
       </section>
     </div>
