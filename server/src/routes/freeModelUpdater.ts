@@ -28,6 +28,16 @@ freeModelUpdaterRouter.put('/providers', (req: Request, res: Response) => {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
+  if (freeModelUpdater.getStatus().enabled && parsed.data.selectedProviders.length === 0) {
+    res.status(409).json({
+      error: {
+        message: 'Disable the free model updater before clearing its provider selection.',
+        type: 'invalid_request_error',
+        code: 'updater_requires_provider',
+      },
+    });
+    return;
+  }
   try {
     const status = freeModelUpdater.setSelectedProviders(parsed.data.selectedProviders);
     res.json({ status, providers: freeModelUpdater.getProviderOptions() });

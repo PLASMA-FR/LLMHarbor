@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
 import type { ProviderCatalogModel } from '../../providers/base.js';
+import { clearDynamicProvider } from '../../providers/index.js';
 import { FreeModelUpdater, type DiscoveryProvider } from '../../services/freeModelUpdater.js';
 
 const provider = (models: ProviderCatalogModel[]): DiscoveryProvider => ({
@@ -31,6 +34,7 @@ describe('FreeModelUpdater', () => {
   beforeEach(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
+    clearDynamicProvider('custom-local-vllm');
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
@@ -96,37 +100,48 @@ describe('FreeModelUpdater', () => {
   });
 
   it('probes every selected custom endpoint catalog row and returns only responsive models', async () => {
-    getDb().prepare(`
-      INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
-      VALUES ('custom-local-vllm', 'Local vLLM', 'http://127.0.0.1:18888/v1', 120000, 1)
-    `).run();
-    const fetchSpy = vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
-      data: [
-        { id: 'Qwen/Qwen3-Coder-30B-A3B-Instruct', name: 'Qwen Coder', context_length: 32768 },
-        { id: 'paid/broken-model', name: 'Broken paid model' },
-        { id: 'free/by-name', name: 'Free by name' },
-        { id: 'priced/free-cost', name: 'Zero cost', pricing: { prompt: '0', completion: '0' } },
-      ],
-    }) as any);
-    const probe = vi.fn(async model => ({ ok: model.modelId !== 'paid/broken-model' }));
-    const updater = new FreeModelUpdater({ keyResolver: () => null, probeModel: probe });
-    updater.setSelectedProviders(['custom-local-vllm']);
+    let requestedPath = '';
+    const server = createServer((req, res) => {
+      requestedPath = req.url ?? '';
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        data: [
+          { id: 'Qwen/Qwen3-Coder-30B-A3B-Instruct', name: 'Qwen Coder', context_length: 32768 },
+          { id: 'paid/broken-model', name: 'Broken paid model' },
+          { id: 'free/by-name', name: 'Free by name' },
+          { id: 'priced/free-cost', name: 'Zero cost', pricing: { prompt: '0', completion: '0' } },
+        ],
+      }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const port = (server.address() as AddressInfo).port;
+      getDb().prepare(`
+        INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
+        VALUES ('custom-local-vllm', 'Local vLLM', ?, 120000, 1)
+      `).run(`http://127.0.0.1:${port}/v1`);
+      const probe = vi.fn(async model => ({ ok: model.modelId !== 'paid/broken-model' }));
+      const updater = new FreeModelUpdater({ keyResolver: () => null, probeModel: probe });
+      updater.setSelectedProviders(['custom-local-vllm']);
 
-    const detected = await updater.detectFreeModels();
+      const detected = await updater.detectFreeModels();
 
-    expect(fetchSpy).toHaveBeenCalledWith('http://127.0.0.1:18888/v1/models', expect.objectContaining({ method: 'GET' }));
-    expect(probe).toHaveBeenCalledTimes(4);
-    expect(probe.mock.calls.map(([model]) => model.modelId).sort()).toEqual([
-      'Qwen/Qwen3-Coder-30B-A3B-Instruct',
-      'free/by-name',
-      'paid/broken-model',
-      'priced/free-cost',
-    ].sort());
-    expect(detected.map(model => `${model.modelId}:${model.detectionMethod}`).sort()).toEqual([
-      'Qwen/Qwen3-Coder-30B-A3B-Instruct:unclassified_provider',
-      'free/by-name:keyword',
-      'priced/free-cost:pricing_tier',
-    ].sort());
+      expect(requestedPath).toBe('/v1/models');
+      expect(probe).toHaveBeenCalledTimes(4);
+      expect(probe.mock.calls.map(([model]) => model.modelId).sort()).toEqual([
+        'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+        'free/by-name',
+        'paid/broken-model',
+        'priced/free-cost',
+      ].sort());
+      expect(detected.map(model => `${model.modelId}:${model.detectionMethod}`).sort()).toEqual([
+        'Qwen/Qwen3-Coder-30B-A3B-Instruct:unclassified_provider',
+        'free/by-name:keyword',
+        'priced/free-cost:pricing_tier',
+      ].sort());
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it('clamps enable interval to 1-24 hours and computes next run', () => {
@@ -230,32 +245,41 @@ describe('FreeModelUpdater', () => {
 
   it('disables stale custom endpoint models missing from a successful selected catalog refresh', async () => {
     const db = getDb();
+    const server = createServer((_req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ data: [{ id: 'fresh-model' }, { id: 'paid-broken-model' }] }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as AddressInfo).port;
     db.prepare(`
       INSERT INTO custom_endpoints (platform, name, base_url, timeout_ms, enabled)
-      VALUES ('custom-local-vllm', 'Local vLLM', 'http://127.0.0.1:18888/v1', 120000, 1)
-    `).run();
+      VALUES ('custom-local-vllm', 'Local vLLM', ?, 120000, 1)
+    `).run(`http://127.0.0.1:${port}/v1`);
     const stale = db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled)
       VALUES ('custom-local-vllm', 'stale-model', 'Stale', 1, 1, 'Custom', 'custom', 1)
     `).run();
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ data: [{ id: 'fresh-model' }, { id: 'paid-broken-model' }] }) as any);
     const updater = new FreeModelUpdater({
       keyResolver: () => null,
       probeModel: async model => ({ ok: model.modelId === 'fresh-model' }),
     });
     updater.setSelectedProviders(['custom-local-vllm']);
 
-    await updater.refreshNow();
+    try {
+      await updater.refreshNow();
 
-    const staleRow = db.prepare('SELECT enabled FROM models WHERE id = ?').get(Number(stale.lastInsertRowid)) as any;
-    const staleMeta = db.prepare('SELECT verification_status FROM model_free_metadata WHERE model_id = ?').get(Number(stale.lastInsertRowid)) as any;
-    const fresh = db.prepare("SELECT enabled, monthly_token_budget FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'fresh-model'").get() as any;
-    const failed = db.prepare("SELECT id FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'paid-broken-model'").get();
-    expect(fresh.enabled).toBe(1);
-    expect(fresh.monthly_token_budget).toBe('auto-discovered custom endpoint');
-    expect(failed).toBeUndefined();
-    expect(staleRow.enabled).toBe(0);
-    expect(staleMeta.verification_status).toBe('expired');
+      const staleRow = db.prepare('SELECT enabled FROM models WHERE id = ?').get(Number(stale.lastInsertRowid)) as any;
+      const staleMeta = db.prepare('SELECT verification_status FROM model_free_metadata WHERE model_id = ?').get(Number(stale.lastInsertRowid)) as any;
+      const fresh = db.prepare("SELECT enabled, monthly_token_budget FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'fresh-model'").get() as any;
+      const failed = db.prepare("SELECT id FROM models WHERE platform = 'custom-local-vllm' AND model_id = 'paid-broken-model'").get();
+      expect(fresh.enabled).toBe(1);
+      expect(fresh.monthly_token_budget).toBe('auto-discovered custom endpoint');
+      expect(failed).toBeUndefined();
+      expect(staleRow.enabled).toBe(0);
+      expect(staleMeta.verification_status).toBe('expired');
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it('marks discovered models no_key when no provider key is available', async () => {
@@ -302,7 +326,7 @@ describe('FreeModelUpdater', () => {
     updater.setSelectedProviders(['openrouter']);
 
     await expect(updater.refreshNow()).rejects.toThrow('catalog down');
-    expect(updater.getStatus()).toMatchObject({ status: 'error', errorMessage: expect.stringContaining('catalog down') });
+    expect(updater.getStatus()).toMatchObject({ status: 'error', errorMessage: 'Provider operation failed.' });
   });
 
   it('does not run overlapping refreshes', async () => {
@@ -335,7 +359,6 @@ describe('FreeModelUpdater', () => {
     updater.setSelectedProviders(['openrouter']);
 
     updater.enable(1);
-    updater.start();
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
     expect(refresh).toHaveBeenCalledTimes(1);
 

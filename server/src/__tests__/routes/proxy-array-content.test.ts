@@ -27,7 +27,7 @@ function authHeaders() {
   return { Authorization: `Bearer ${getUnifiedApiKey()}` };
 }
 
-describe('OpenAI multimodal array content', () => {
+describe('OpenAI text array content', () => {
   let app: Express;
 
   beforeAll(() => {
@@ -79,8 +79,8 @@ describe('OpenAI multimodal array content', () => {
     }
   });
 
-  it('accepts mixed text + image_url blocks (image blocks are silently dropped)', async () => {
-    const { status } = await request(app, 'POST', '/v1/chat/completions', {
+  it('rejects unsupported image/audio blocks instead of silently dropping them', async () => {
+    const image = await request(app, 'POST', '/v1/chat/completions', {
       messages: [{
         role: 'user',
         content: [
@@ -89,7 +89,16 @@ describe('OpenAI multimodal array content', () => {
         ],
       }],
     }, authHeaders());
-    expect(status).not.toBe(400);
+    expect(image.status).toBe(400);
+    expect(image.body.error.type).toBe('invalid_request_error');
+
+    const audio = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{
+        role: 'user',
+        content: [{ type: 'input_audio', input_audio: { data: 'AAAA', format: 'wav' } }],
+      }],
+    }, authHeaders());
+    expect(audio.status).toBe(400);
   });
 
   it('successfully routes an array-content request and gets a 200 (mocked groq)', async () => {

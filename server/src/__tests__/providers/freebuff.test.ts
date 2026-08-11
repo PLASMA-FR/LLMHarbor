@@ -79,8 +79,8 @@ describe('FreebuffProvider', () => {
     }
 
     expect(chunks).toHaveLength(2);
-    expect(chunks[0].choices[0].delta).toMatchObject({ role: 'assistant', content: '' });
-    expect(chunks[1].choices[0].delta.content).toBe('hi');
+    expect(chunks[0].choices[0].delta.content).toBe('hi');
+    expect(chunks[1].choices[0].finish_reason).toBe('stop');
     const sessionCall = calls.find(call => call.url === SESSION_URL && call.init.method === 'POST');
     expect(sessionCall?.init.headers).toEqual({
       Authorization: 'Bearer freebuff-token',
@@ -151,6 +151,142 @@ describe('FreebuffProvider', () => {
     expect(body.messages[1].content).toContain('System instructions from the API client:');
     expect(body.messages[1].content).toContain('You are Hermes Agent.');
     expect(body.messages[1].content).toContain('User message:\nhello');
+  });
+
+  it('rejects an empty or truncated stream before emitting a synthetic chunk', async () => {
+    const provider = new FreebuffProvider();
+    mockFreebuffFetch(new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }));
+    await expect((async () => {
+      const chunks = [];
+      for await (const chunk of provider.streamChatCompletion('freebuff-token-empty', [{ role: 'user', content: 'hello' }], MODEL)) chunks.push(chunk);
+      return chunks;
+    })()).rejects.toMatchObject({ code: 'malformed_provider_response' });
+
+    vi.restoreAllMocks();
+    mockFreebuffFetch(new Response(
+      'data: {"id":"partial","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    ));
+    await expect((async () => {
+      for await (const _chunk of provider.streamChatCompletion('freebuff-token-truncated', [{ role: 'user', content: 'hello' }], MODEL)) { /* consume */ }
+    })()).rejects.toThrow(/truncated/i);
+  });
+
+  it('uses typed provider errors and isolates cancellation between shared session waiters', async () => {
+    const provider = new FreebuffProvider();
+    mockFreebuffFetch(new Response(JSON.stringify({ error: 'expired' }), { status: 401 }));
+    await expect(provider.chatCompletion('freebuff-token-unauthorized', [{ role: 'user', content: 'hello' }], MODEL))
+      .rejects.toMatchObject({ statusCode: 401, retryable: true });
+
+    vi.restoreAllMocks();
+    const controller = new AbortController();
+    let setupSignal: AbortSignal | undefined;
+    let sessionCalls = 0;
+    let resolveSession!: (response: Response) => void;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const target = String(url);
+      if (target === SESSION_URL) {
+        sessionCalls++;
+        setupSignal = init?.signal ?? undefined;
+        return new Promise<Response>(resolve => { resolveSession = resolve; });
+      }
+      if (target === 'https://www.codebuff.com/api/v1/agent-runs') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        if (body.action === 'START') return Response.json({ runId: body.agentId === 'context-pruner' ? 'run-child-shared' : 'run-parent-shared' });
+        return Response.json({ ok: true });
+      }
+      if (target.includes('/api/v1/agent-runs/') && target.endsWith('/steps')) return Response.json({ ok: true });
+      if (target === CHAT_URL) {
+        return Response.json({
+          id: 'shared-session-completion', object: 'chat.completion', created: 1, model: MODEL,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'remaining waiter completed' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        });
+      }
+      throw new Error(`unexpected request ${target}`);
+    });
+    const cancelled = provider.chatCompletion('freebuff-token-shared', [{ role: 'user', content: 'hello' }], MODEL, { signal: controller.signal });
+    const remaining = provider.chatCompletion('freebuff-token-shared', [{ role: 'user', content: 'hello' }], MODEL);
+    controller.abort(new DOMException('Client disconnected.', 'AbortError'));
+    await expect(cancelled).rejects.toThrow(/Client disconnected/i);
+    expect(setupSignal?.aborted).toBe(false);
+    resolveSession(Response.json({
+      status: 'active', instanceId: 'shared-session', model: MODEL,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    await expect(remaining).resolves.toMatchObject({ choices: [{ message: { content: 'remaining waiter completed' } }] });
+    expect(sessionCalls).toBe(1);
+  });
+
+  it('preserves a streaming safety refusal without falling back as empty output', async () => {
+    const provider = new FreebuffProvider();
+    mockFreebuffFetch(new Response(
+      [
+        'data: {"id":"refusal","object":"chat.completion.chunk","created":1,"model":"moonshotai/kimi-k2.6","choices":[{"index":0,"delta":{"refusal":"I cannot help with that."},"finish_reason":"content_filter"}]}',
+        'data: [DONE]',
+        '',
+      ].join('\n\n'),
+      { headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    const chunks = [];
+    for await (const chunk of provider.streamChatCompletion('freebuff-token-refusal', [{ role: 'user', content: 'unsafe' }], MODEL)) {
+      chunks.push(chunk);
+    }
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].choices[0].delta.refusal).toBe('I cannot help with that.');
+    expect(chunks[0].choices[0].finish_reason).toBe('content_filter');
+  });
+
+  it('finalizes a created run when stream setup fails before a response body is read', async () => {
+    const provider = new FreebuffProvider();
+    const calls = mockFreebuffFetch(new Response('upstream unavailable', { status: 503 }));
+    await expect((async () => {
+      for await (const _chunk of provider.streamChatCompletion(
+        'freebuff-token-stream-setup-failure', [{ role: 'user', content: 'hello' }], MODEL,
+      )) { /* consume */ }
+    })()).rejects.toMatchObject({ statusCode: 503, retryable: true });
+
+    const finishedRuns = calls
+      .filter(call => call.url.endsWith('/api/v1/agent-runs'))
+      .map(call => JSON.parse(String(call.init.body ?? '{}')))
+      .filter(body => body.action === 'FINISH')
+      .map(body => body.runId);
+    expect(finishedRuns).toContain('run-parent');
+  });
+
+  it('cleans up a partially-created run chain when child setup fails', async () => {
+    const provider = new FreebuffProvider();
+    const finishedRuns: string[] = [];
+    let startCalls = 0;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const target = String(url);
+      if (target === SESSION_URL) {
+        return Response.json({
+          status: 'active', instanceId: 'partial-chain-session', model: MODEL,
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        });
+      }
+      if (target === 'https://www.codebuff.com/api/v1/agent-runs') {
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        if (body.action === 'START') {
+          startCalls++;
+          return startCalls === 1
+            ? Response.json({ runId: 'partial-parent' })
+            : new Response('child setup failed', { status: 503 });
+        }
+        if (body.action === 'FINISH') {
+          finishedRuns.push(body.runId);
+          return Response.json({ ok: true });
+        }
+      }
+      throw new Error(`unexpected request ${target}`);
+    });
+
+    await expect(provider.chatCompletion(
+      'freebuff-token-partial-chain', [{ role: 'user', content: 'hello' }], MODEL,
+    )).rejects.toMatchObject({ statusCode: 503, retryable: true });
+    expect(finishedRuns).toEqual(['partial-parent']);
   });
 
   it('releases the held Freebuff session and rejoins when switching models', async () => {

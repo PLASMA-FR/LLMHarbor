@@ -47,9 +47,16 @@ describe('Split public API listener', () => {
     expect(root.status).toBe(404);
     expect(root.headers.get('content-type')).toContain('application/json');
     expect(root.body.error.message).toContain('public API listener');
+    expect(root.body.error.request_id).toBe(root.headers.get('x-request-id'));
 
     const keys = await request(app, 'GET', '/api/keys');
     expect(keys.status).toBe(404);
     expect(keys.body.error.type).toBe('not_found');
+
+    const playground = await request(app, 'POST', '/api/playground/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'must stay private' }],
+    });
+    expect(playground.status).toBe(404);
+    expect(playground.body.error.type).toBe('not_found');
   });
 });

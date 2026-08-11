@@ -7,7 +7,10 @@ import {
   recordTokens,
   getRateLimitStatus,
   getNextCooldownDuration,
+  releaseProviderCapacity,
+  reserveProviderCapacity,
 } from '../../services/ratelimit.js';
+import { getDb, initDb } from '../../db/index.js';
 
 function removeDbFile(dbPath: string) {
   for (const suffix of ['', '-shm', '-wal']) {
@@ -31,6 +34,8 @@ describe('Rate Limiter', () => {
   let testId: number;
 
   beforeEach(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
     testId = nextUniqueId();
   });
 
@@ -80,6 +85,64 @@ describe('Rate Limiter', () => {
         tpm: null, tpd: null,
       })).toBe(true);
     });
+
+    it('includes in-flight reservations so concurrent requests cannot oversubscribe TPM', () => {
+      const limits = { tpm: 100, tpd: null };
+      const reservation = reserveProviderCapacity('groq', `concurrent-${testId}`, testId, 80);
+      try {
+        expect(canUseTokens('groq', `concurrent-${testId}`, testId, 30, limits)).toBe(false);
+        expect(canUseTokens('groq', `concurrent-${testId}`, testId, 20, limits)).toBe(true);
+      } finally {
+        releaseProviderCapacity(reservation);
+      }
+      expect(canUseTokens('groq', `concurrent-${testId}`, testId, 30, limits)).toBe(true);
+    });
+
+    it('retains an active stream reservation beyond ten minutes until explicit settlement', () => {
+      vi.useFakeTimers();
+      const model = `long-stream-${testId}`;
+      const reservation = reserveProviderCapacity('groq', model, testId, 80);
+      try {
+        vi.advanceTimersByTime(11 * 60 * 1000);
+        expect(canUseTokens('groq', model, testId, 30, { tpm: 100, tpd: null })).toBe(false);
+      } finally {
+        releaseProviderCapacity(reservation);
+        vi.useRealTimers();
+      }
+    });
+
+    it('adds failed persistence writes to successful SQLite reads instead of failing open', () => {
+      const db = getDb();
+      db.prepare(`
+        CREATE TRIGGER fail_rate_limit_usage_insert
+        BEFORE INSERT ON rate_limit_usage
+        BEGIN
+          SELECT RAISE(FAIL, 'simulated busy write');
+        END
+      `).run();
+      recordTokens('groq', `write-failure-${testId}`, testId, 80);
+      db.prepare('DROP TRIGGER fail_rate_limit_usage_insert').run();
+
+      expect(canUseTokens('groq', `write-failure-${testId}`, testId, 30, {
+        tpm: 100, tpd: null,
+      })).toBe(false);
+    });
+  });
+
+  it('includes an unpersisted request when a later SQLite read succeeds', () => {
+    const db = getDb();
+    db.prepare(`
+      CREATE TRIGGER fail_rate_limit_usage_insert
+      BEFORE INSERT ON rate_limit_usage
+      BEGIN
+        SELECT RAISE(FAIL, 'simulated busy write');
+      END
+    `).run();
+    recordRequest('groq', `request-write-failure-${testId}`, testId);
+    db.prepare('DROP TRIGGER fail_rate_limit_usage_insert').run();
+    expect(canMakeRequest('groq', `request-write-failure-${testId}`, testId, {
+      rpm: 1, rpd: null, tpm: null, tpd: null,
+    })).toBe(false);
   });
 
   describe('getRateLimitStatus', () => {

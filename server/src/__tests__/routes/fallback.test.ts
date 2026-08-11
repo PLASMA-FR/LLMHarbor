@@ -48,6 +48,11 @@ describe('Fallback API', () => {
     expect(first).toHaveProperty('platform');
     expect(first).toHaveProperty('displayName');
     expect(first).toHaveProperty('intelligenceRank');
+    expect(first).toHaveProperty('configuredKeyCount');
+    expect(first).toHaveProperty('enabledKeyCount');
+    expect(first).toHaveProperty('routeableKeyCount');
+    expect(first).toHaveProperty('availableKeyCount');
+    expect(first).toHaveProperty('skipReason');
   });
 
   it('PUT /api/fallback updates order', async () => {

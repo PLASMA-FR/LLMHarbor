@@ -2,33 +2,35 @@
 
 import { getDb } from '../db/index.js';
 
-interface Window {
-  timestamps: number[];
-  tokenCount: number;
-  tokenTimestamps: { ts: number; tokens: number }[];
+// Successful usage lives in SQLite. Only failed writes are retained in memory,
+// bounded to the longest configured window, so unlimited routes cannot grow an
+// unbounded duplicate event log over process uptime.
+const unpersistedRequests = new Map<string, number[]>();
+const unpersistedTokens = new Map<string, Array<{ ts: number; tokens: number }>>();
+const unpersistedOverflowUntil = new Map<string, number>();
+const MAX_UNPERSISTED_EVENTS_PER_ROUTE = 10_000;
+interface CapacityReservation {
+  routeKey: string;
+  tokens: number;
+  requestReserved: boolean;
 }
-
-// Key format: "platform:modelId:keyId:type" where type is rpm|rpd|tpm|tpd
-const windows = new Map<string, Window>();
+const capacityReservations = new Map<string, CapacityReservation>();
+const reservedCapacity = new Map<string, { requests: number; tokens: number }>();
+let nextReservationId = 1;
+let lastPersistedUsageCleanupAt = 0;
+let lastPersistenceWarningAt = 0;
 type RateLimitDb = ReturnType<typeof getDb>;
 type UsageKind = 'request' | 'tokens';
 
-function getWindow(key: string): Window {
-  let w = windows.get(key);
-  if (!w) {
-    w = { timestamps: [], tokenCount: 0, tokenTimestamps: [] };
-    windows.set(key, w);
-  }
-  return w;
-}
-
-function pruneTimestamps(timestamps: number[], windowMs: number, now: number): number[] {
-  const cutoff = now - windowMs;
-  return timestamps.filter(ts => ts > cutoff);
-}
-
 const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
+const HOUR = 60 * MINUTE;
+
+function warnPersistenceUnavailable(now = Date.now()): void {
+  if (now - lastPersistenceWarningAt < MINUTE) return;
+  lastPersistenceWarningAt = now;
+  console.error('[RateLimit] SQLite usage persistence is unavailable; configured limits are being enforced conservatively.');
+}
 
 function withDb<T>(fn: (db: RateLimitDb) => T): T | undefined {
   try {
@@ -45,14 +47,22 @@ function recordUsage(
   kind: UsageKind,
   tokens: number,
   now: number,
-) {
-  withDb(db => {
+): boolean {
+  const persisted = withDb(db => {
     db.prepare(`
       INSERT INTO rate_limit_usage (platform, model_id, key_id, kind, tokens, created_at_ms)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(platform, modelId, keyId, kind, tokens, now);
-    db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+    // Cleanup is maintenance, not part of every request. Running DELETE on
+    // each usage write created needless WAL churn under concurrent streams.
+    if (now - lastPersistedUsageCleanupAt >= HOUR) {
+      db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+      lastPersistedUsageCleanupAt = now;
+    }
+    return true;
   });
+  if (persisted !== true) warnPersistenceUnavailable(now);
+  return persisted === true;
 }
 
 function countPersistedRequests(
@@ -97,16 +107,50 @@ function sumPersistedTokens(
   });
 }
 
-function memoryRequestCount(key: string, windowMs: number, now: number): number {
-  const w = getWindow(key);
-  w.timestamps = pruneTimestamps(w.timestamps, windowMs, now);
-  return w.timestamps.length;
+function noteUnpersistedRequest(key: string, now: number): void {
+  const events = (unpersistedRequests.get(key) ?? []).filter(ts => ts > now - DAY);
+  if (events.length >= MAX_UNPERSISTED_EVENTS_PER_ROUTE) {
+    unpersistedOverflowUntil.set(key, now + DAY);
+  } else {
+    events.push(now);
+    unpersistedRequests.set(key, events);
+  }
 }
 
-function memoryTokenCount(key: string, windowMs: number, now: number): number {
-  const w = getWindow(key);
-  w.tokenTimestamps = w.tokenTimestamps.filter(t => t.ts > now - windowMs);
-  return w.tokenTimestamps.reduce((sum, t) => sum + t.tokens, 0);
+function noteUnpersistedTokens(key: string, tokens: number, now: number): void {
+  const events = (unpersistedTokens.get(key) ?? []).filter(event => event.ts > now - DAY);
+  if (events.length >= MAX_UNPERSISTED_EVENTS_PER_ROUTE) {
+    unpersistedOverflowUntil.set(key, now + DAY);
+  } else {
+    events.push({ ts: now, tokens });
+    unpersistedTokens.set(key, events);
+  }
+}
+
+function hasUnpersistedOverflow(key: string, now: number): boolean {
+  const until = unpersistedOverflowUntil.get(key);
+  if (!until) return false;
+  if (until <= now) {
+    unpersistedOverflowUntil.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function unpersistedRequestCount(key: string, windowMs: number, now: number): number {
+  if (hasUnpersistedOverflow(key, now)) return Number.POSITIVE_INFINITY;
+  const events = (unpersistedRequests.get(key) ?? []).filter(ts => ts > now - DAY);
+  if (events.length === 0) unpersistedRequests.delete(key);
+  else unpersistedRequests.set(key, events);
+  return events.filter(ts => ts > now - windowMs).length;
+}
+
+function unpersistedTokenCount(key: string, windowMs: number, now: number): number {
+  if (hasUnpersistedOverflow(key, now)) return Number.POSITIVE_INFINITY;
+  const events = (unpersistedTokens.get(key) ?? []).filter(event => event.ts > now - DAY);
+  if (events.length === 0) unpersistedTokens.delete(key);
+  else unpersistedTokens.set(key, events);
+  return events.filter(event => event.ts > now - windowMs).reduce((sum, event) => sum + event.tokens, 0);
 }
 
 function requestCount(
@@ -117,9 +161,12 @@ function requestCount(
   now: number,
 ): number {
   const persisted = countPersistedRequests(platform, modelId, keyId, windowMs, now);
-  if (persisted !== undefined) return persisted;
-  const type = windowMs === MINUTE ? 'rpm' : 'rpd';
-  return memoryRequestCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
+  const key = reservationKey(platform, modelId, keyId);
+  if (persisted === undefined) {
+    warnPersistenceUnavailable(now);
+    return Number.POSITIVE_INFINITY;
+  }
+  return persisted + unpersistedRequestCount(key, windowMs, now);
 }
 
 function tokenCount(
@@ -130,9 +177,16 @@ function tokenCount(
   now: number,
 ): number {
   const persisted = sumPersistedTokens(platform, modelId, keyId, windowMs, now);
-  if (persisted !== undefined) return persisted;
-  const type = windowMs === MINUTE ? 'tpm' : 'tpd';
-  return memoryTokenCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
+  const key = reservationKey(platform, modelId, keyId);
+  if (persisted === undefined) {
+    warnPersistenceUnavailable(now);
+    return Number.POSITIVE_INFINITY;
+  }
+  return persisted + unpersistedTokenCount(key, windowMs, now);
+}
+
+function reservationKey(platform: string, modelId: string, keyId: number): string {
+  return `${platform}:${modelId}:${keyId}`;
 }
 
 export function canMakeRequest(
@@ -142,13 +196,14 @@ export function canMakeRequest(
   limits: { rpm: number | null; rpd: number | null; tpm: number | null; tpd: number | null },
 ): boolean {
   const now = Date.now();
+  const reserved = reservedCapacity.get(reservationKey(platform, modelId, keyId))?.requests ?? 0;
 
   if (limits.rpm !== null) {
-    if (requestCount(platform, modelId, keyId, MINUTE, now) >= limits.rpm) return false;
+    if (requestCount(platform, modelId, keyId, MINUTE, now) + reserved >= limits.rpm) return false;
   }
 
   if (limits.rpd !== null) {
-    if (requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd) return false;
+    if (requestCount(platform, modelId, keyId, DAY, now) + reserved >= limits.rpd) return false;
   }
 
   return true;
@@ -162,30 +217,59 @@ export function canUseTokens(
   limits: { tpm: number | null; tpd: number | null },
 ): boolean {
   const now = Date.now();
+  const reserved = reservedCapacity.get(reservationKey(platform, modelId, keyId))?.tokens ?? 0;
 
   if (limits.tpm !== null) {
     const used = tokenCount(platform, modelId, keyId, MINUTE, now);
-    if (used + estimatedTokens > limits.tpm) return false;
+    if (used + reserved + estimatedTokens > limits.tpm) return false;
   }
 
   if (limits.tpd !== null) {
     const used = tokenCount(platform, modelId, keyId, DAY, now);
-    if (used + estimatedTokens > limits.tpd) return false;
+    if (used + reserved + estimatedTokens > limits.tpd) return false;
   }
 
   return true;
 }
 
+export function reserveProviderCapacity(platform: string, modelId: string, keyId: number, estimatedTokens: number): string {
+  const routeKey = reservationKey(platform, modelId, keyId);
+  const totals = reservedCapacity.get(routeKey) ?? { requests: 0, tokens: 0 };
+  totals.requests++;
+  totals.tokens += Math.max(0, estimatedTokens);
+  reservedCapacity.set(routeKey, totals);
+  const id = `provider-${process.pid}-${nextReservationId++}`;
+  capacityReservations.set(id, { routeKey, tokens: Math.max(0, estimatedTokens), requestReserved: true });
+  return id;
+}
+
+export function commitProviderRequestReservation(id: string | undefined): void {
+  if (!id) return;
+  const reservation = capacityReservations.get(id);
+  if (!reservation?.requestReserved) return;
+  reservation.requestReserved = false;
+  const totals = reservedCapacity.get(reservation.routeKey);
+  if (totals) totals.requests = Math.max(0, totals.requests - 1);
+}
+
+export function releaseProviderCapacity(id: string | undefined): void {
+  if (!id) return;
+  const reservation = capacityReservations.get(id);
+  if (!reservation) return;
+  const totals = reservedCapacity.get(reservation.routeKey);
+  if (totals) {
+    if (reservation.requestReserved) totals.requests = Math.max(0, totals.requests - 1);
+    totals.tokens = Math.max(0, totals.tokens - reservation.tokens);
+    if (totals.requests === 0 && totals.tokens === 0) reservedCapacity.delete(reservation.routeKey);
+  }
+  capacityReservations.delete(id);
+}
+
 export function recordRequest(platform: string, modelId: string, keyId: number) {
   const now = Date.now();
-
-  const rpmKey = `${platform}:${modelId}:${keyId}:rpm`;
-  getWindow(rpmKey).timestamps.push(now);
-
-  const rpdKey = `${platform}:${modelId}:${keyId}:rpd`;
-  getWindow(rpdKey).timestamps.push(now);
-
-  recordUsage(platform, modelId, keyId, 'request', 0, now);
+  if (!recordUsage(platform, modelId, keyId, 'request', 0, now)) {
+    noteUnpersistedRequest(reservationKey(platform, modelId, keyId), now);
+  }
 }
 
 export function recordTokens(
@@ -195,14 +279,9 @@ export function recordTokens(
   tokens: number,
 ) {
   const now = Date.now();
-
-  const tpmKey = `${platform}:${modelId}:${keyId}:tpm`;
-  getWindow(tpmKey).tokenTimestamps.push({ ts: now, tokens });
-
-  const tpdKey = `${platform}:${modelId}:${keyId}:tpd`;
-  getWindow(tpdKey).tokenTimestamps.push({ ts: now, tokens });
-
-  recordUsage(platform, modelId, keyId, 'tokens', tokens, now);
+  if (!recordUsage(platform, modelId, keyId, 'tokens', tokens, now)) {
+    noteUnpersistedTokens(reservationKey(platform, modelId, keyId), tokens, now);
+  }
 }
 
 // Cooldown: when a provider returns 429, block that model+key for a period
@@ -215,7 +294,6 @@ const cooldowns = new Map<string, number>(); // key -> expiry timestamp
 // In-memory only — state resets on restart, which is fine (a clean restart
 // will re-escalate on the next 429 if the quota is genuinely exhausted).
 const cooldownHits = new Map<string, number[]>(); // key -> timestamps of recent cooldown set events
-const HOUR = 60 * MINUTE;
 const COOLDOWN_DURATIONS = [
   2 * MINUTE,   // 1st hit in 24h
   10 * MINUTE,  // 2nd

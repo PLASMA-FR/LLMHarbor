@@ -8,7 +8,7 @@ import type {
   ChatToolDefinition,
   TokenUsage,
 } from '@llmharbor/shared/types.js';
-import { BaseProvider, type CompletionOptions } from './base.js';
+import { BaseProvider, ProviderError, ProviderProtocolError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
 import { getDb } from '../db/index.js';
 
@@ -92,30 +92,55 @@ async function ensureCodeAssistProject(accessToken: string, options?: Completion
   if (existing) return existing;
 
   let lastError = '';
+  let lastStatus: number | null = null;
+  let sawMalformedResponse = false;
   for (const endpoint of LOAD_CODE_ASSIST_ENDPOINTS) {
-    const res = await fetch(`${endpoint}/v1internal:loadCodeAssist`, {
-      method: 'POST',
-      headers: {
-        ...CODE_ASSIST_HEADERS,
-        'Authorization': `Bearer ${accessToken}`,
-      },
-      body: JSON.stringify({
-        metadata: coreClientMetadata(),
-        mode: 1,
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => res.statusText);
-      lastError = `HTTP ${res.status}: ${errText.slice(0, 300)}`;
+    const timeoutSignal = AbortSignal.timeout(15_000);
+    const signal = options?.signal
+      ? AbortSignal.any([options.signal, timeoutSignal])
+      : timeoutSignal;
+    let res: Response;
+    try {
+      res = await fetch(`${endpoint}/v1internal:loadCodeAssist`, {
+        method: 'POST',
+        signal,
+        headers: {
+          ...CODE_ASSIST_HEADERS,
+          'Authorization': `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          metadata: coreClientMetadata(),
+          mode: 1,
+        }),
+      });
+    } catch (error) {
+      if (options?.signal?.aborted) throw options.signal.reason ?? error;
+      lastError = 'transport failure';
       continue;
     }
-    const data = await res.json() as any;
+    if (!res.ok) {
+      lastStatus = res.status;
+      await res.body?.cancel().catch(() => {});
+      lastError = `HTTP ${res.status}`;
+      continue;
+    }
+    let data: any;
+    try {
+      data = await res.json();
+    } catch {
+      sawMalformedResponse = true;
+      lastError = 'malformed response';
+      continue;
+    }
     const validationRequired = Array.isArray(data.ineligibleTiers)
       ? data.ineligibleTiers.find((tier: any) => tier?.reasonCode === 'VALIDATION_REQUIRED')
       : undefined;
     if (validationRequired) {
-      const message = String(validationRequired.reasonMessage ?? 'Verify your account to continue.');
-      throw new Error(`Google Code Assist account verification required: ${message}`);
+      throw new ProviderError('Google Code Assist account verification is required.', {
+        statusCode: 403,
+        retryable: true,
+        code: 'oauth_account_verification_required',
+      });
     }
     const projectId = data.cloudaicompanionProject?.id ?? data.cloudaicompanionProject;
     const metadata = {
@@ -129,7 +154,11 @@ async function ensureCodeAssistProject(accessToken: string, options?: Completion
     } catch {}
     return typeof projectId === 'string' ? projectId : undefined;
   }
-  throw new Error(`Google Code Assist OAuth setup failed on all endpoints. Last error: ${lastError || 'unknown error'}`);
+  throw new ProviderError(`Google Code Assist OAuth setup failed on all endpoints (${lastError || 'unknown error'}).`, {
+    ...(lastStatus === null ? {} : { statusCode: lastStatus }),
+    retryable: true,
+    code: sawMalformedResponse ? 'malformed_provider_response' : 'provider_error',
+  });
 }
 
 function codeAssistSessionId(options?: CompletionOptions) {
@@ -199,23 +228,49 @@ function fromCodeAssist(data: CodeAssistResponse): GeminiResponse {
 async function collectCodeAssistSseResponse(res: Response): Promise<GeminiResponse> {
   const raw = await res.text();
   const merged: GeminiResponse = { candidates: [{ content: { parts: [] } }] };
+  let sawDone = false;
+  let substantive = false;
+  let malformedFrames = 0;
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith('data: ')) continue;
-    const frame = trimmed.slice(6);
-    if (!frame || frame === '[DONE]') continue;
+    if (!trimmed.startsWith('data:')) continue;
+    const frame = trimmed.slice(5).trimStart();
+    if (!frame) continue;
+    if (frame === '[DONE]') {
+      sawDone = true;
+      continue;
+    }
     let chunk: GeminiResponse;
     try {
       chunk = fromCodeAssist(JSON.parse(frame) as CodeAssistResponse);
     } catch {
+      malformedFrames++;
       continue;
     }
     const candidate = chunk.candidates?.[0];
-    if (candidate?.content?.parts?.length) {
-      merged.candidates![0].content!.parts!.push(...candidate.content.parts);
+    if (candidate) {
+      const parts = candidate.content?.parts ?? [];
+      if (!Array.isArray(parts)) {
+        malformedFrames++;
+        continue;
+      }
+      if (parts.length > 0) {
+        merged.candidates![0].content!.parts!.push(...parts);
+        if (extractText(parts) || extractToolCalls(parts).length > 0) substantive = true;
+      }
+      if (candidate.finishReason) {
+        merged.candidates![0].finishReason = candidate.finishReason;
+        substantive = true;
+      }
+    } else if (!chunk.usageMetadata) {
+      malformedFrames++;
     }
-    if (candidate?.finishReason) merged.candidates![0].finishReason = candidate.finishReason;
     if (chunk.usageMetadata) merged.usageMetadata = chunk.usageMetadata;
+  }
+  if (malformedFrames > 0) throw new ProviderProtocolError('Google Code Assist returned malformed SSE data.');
+  if (!substantive) throw new ProviderProtocolError('Google Code Assist returned an empty completion stream.');
+  if (!sawDone && !merged.candidates?.[0]?.finishReason) {
+    throw new ProviderProtocolError('Google Code Assist returned a truncated completion stream.');
   }
   return merged;
 }
@@ -453,6 +508,8 @@ export class GoogleProvider extends BaseProvider {
     if (isOAuthGoogleRequest(options)) {
       const projectId = await ensureCodeAssistProject(apiKey, options);
       let lastError = '';
+      let lastStatus: number | null = null;
+      let sawMalformedResponse = false;
       let codeAssistJson: CodeAssistResponse | null = null;
       const payload = codeAssistBody(modelId, messages, options, projectId);
       const sessionId = String((payload.request as Record<string, unknown>).sessionId ?? '');
@@ -460,50 +517,84 @@ export class GoogleProvider extends BaseProvider {
         ? '/v1internal:streamGenerateContent?alt=sse'
         : '/v1internal:generateContent';
       for (const endpoint of CODE_ASSIST_ENDPOINTS) {
-        const res = await this.fetchWithTimeout(`${endpoint}${endpointPath}`, {
-          method: 'POST',
-          headers: codeAssistHeaders(apiKey, isCodeAssistThinkingModel(modelId) ? 'text/event-stream' : 'application/json', sessionId),
-          body: JSON.stringify(payload),
-        }, 120000);
-        if (!res.ok) {
-          const errText = await res.text().catch(() => res.statusText);
-          lastError = `HTTP ${res.status}: ${errText.slice(0, 300)}`;
+        let res: Response;
+        try {
+          res = await this.fetchWithTimeout(`${endpoint}${endpointPath}`, {
+            method: 'POST',
+            signal: options?.signal,
+            headers: codeAssistHeaders(apiKey, isCodeAssistThinkingModel(modelId) ? 'text/event-stream' : 'application/json', sessionId),
+            body: JSON.stringify(payload),
+          }, 120000);
+        } catch (error) {
+          if (options?.signal?.aborted) throw options.signal.reason ?? error;
+          lastError = 'transport failure';
           continue;
         }
-        if (isCodeAssistThinkingModel(modelId)) {
-          data = await collectCodeAssistSseResponse(res);
-          codeAssistJson = { response: data };
-        } else {
-          codeAssistJson = await res.json() as CodeAssistResponse;
-          data = fromCodeAssist(codeAssistJson);
+        if (!res.ok) {
+          lastStatus = res.status;
+          await res.body?.cancel().catch(() => {});
+          lastError = `HTTP ${res.status}`;
+          continue;
+        }
+        try {
+          if (isCodeAssistThinkingModel(modelId)) {
+            data = await collectCodeAssistSseResponse(res);
+            codeAssistJson = { response: data };
+          } else {
+            codeAssistJson = await res.json() as CodeAssistResponse;
+            data = fromCodeAssist(codeAssistJson);
+          }
+        } catch (error) {
+          if (options?.signal?.aborted) throw options.signal.reason ?? error;
+          sawMalformedResponse = error instanceof ProviderProtocolError || error instanceof SyntaxError;
+          lastError = 'malformed or truncated response';
+          codeAssistJson = null;
+          data = undefined;
+          continue;
         }
         break;
       }
       if (!codeAssistJson) {
-        throw new Error(`Google Code Assist OAuth error on all endpoints. Last error: ${lastError || 'unknown error'}`);
+        throw new ProviderError(`Google Code Assist OAuth error on all endpoints (${lastError || 'unknown error'}).`, {
+          ...(lastStatus === null ? {} : { statusCode: lastStatus }),
+          retryable: true,
+          code: sawMalformedResponse ? 'malformed_provider_response' : 'provider_error',
+        });
       }
     } else {
-      const url = `${API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+      const url = `${API_BASE}/models/${modelId}:generateContent`;
       const res = await this.fetchWithTimeout(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        signal: options?.signal,
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
         body: JSON.stringify(body),
       });
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+        throw new ProviderError(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
       }
 
-      data = await res.json() as GeminiResponse;
+      data = await res.json().catch(() => {
+        throw new ProviderProtocolError('Google API returned malformed JSON.');
+      }) as GeminiResponse;
     }
     if (!data) {
-      throw new Error('Google API returned no response data');
+      throw new ProviderProtocolError('Google API returned no response data.');
     }
     const candidate = data.candidates?.[0];
+    if (!candidate || typeof candidate !== 'object') {
+      throw new ProviderProtocolError('Google API returned a completion without candidates.');
+    }
     const parts = candidate?.content?.parts;
+    if (parts !== undefined && !Array.isArray(parts)) {
+      throw new ProviderProtocolError('Google API returned malformed candidate content.');
+    }
     const toolCalls = extractToolCalls(parts);
     const text = extractText(parts);
+    if (!text && toolCalls.length === 0 && !candidate.finishReason) {
+      throw new ProviderProtocolError('Google API returned an empty completion candidate.');
+    }
 
     const usage: TokenUsage = {
       prompt_tokens: data.usageMetadata?.promptTokenCount ?? 0,
@@ -557,7 +648,7 @@ export class GoogleProvider extends BaseProvider {
             index: 0,
             delta: {
               ...(content.length > 0 ? { content } : {}),
-              ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+              ...(toolCalls.length > 0 ? { tool_calls: toolCalls.map((call, index) => ({ ...call, index })) } : {}),
             },
             finish_reason: null,
           }],
@@ -595,53 +686,71 @@ export class GoogleProvider extends BaseProvider {
     let res: Response;
     if (isOAuthGoogleRequest(options)) {
       let lastError = '';
+      let lastStatus: number | null = null;
       let codeAssistResponse: Response | null = null;
       const payload = codeAssistBody(modelId, messages, options, projectId);
       const sessionId = String((payload.request as Record<string, unknown>).sessionId ?? '');
       for (const endpoint of CODE_ASSIST_ENDPOINTS) {
-        const upstream = await this.fetchWithTimeout(`${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
-          method: 'POST',
-          headers: codeAssistHeaders(apiKey, 'text/event-stream', sessionId),
-          body: JSON.stringify(payload),
-        }, 120000);
+        let upstream: Response;
+        try {
+          upstream = await this.fetchWithTimeout(`${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
+            method: 'POST',
+            signal: options?.signal,
+            headers: codeAssistHeaders(apiKey, 'text/event-stream', sessionId),
+            body: JSON.stringify(payload),
+          }, 120000);
+        } catch (error) {
+          if (options?.signal?.aborted) throw options.signal.reason ?? error;
+          lastError = 'transport failure';
+          continue;
+        }
         if (!upstream.ok) {
-          const errText = await upstream.text().catch(() => upstream.statusText);
-          lastError = `HTTP ${upstream.status}: ${errText.slice(0, 300)}`;
+          lastStatus = upstream.status;
+          await upstream.body?.cancel().catch(() => {});
+          lastError = `HTTP ${upstream.status}`;
           continue;
         }
         codeAssistResponse = upstream;
         break;
       }
       if (!codeAssistResponse) {
-        throw new Error(`Google Code Assist OAuth stream error on all endpoints. Last error: ${lastError || 'unknown error'}`);
+        throw new ProviderError(`Google Code Assist OAuth stream error on all endpoints (${lastError || 'unknown error'}).`, {
+          ...(lastStatus === null ? {} : { statusCode: lastStatus }),
+          retryable: true,
+        });
       }
       res = codeAssistResponse;
     } else {
-      const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse&key=${apiKey}`;
+      const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse`;
       res = await this.fetchWithTimeout(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        signal: options?.signal,
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
         body: JSON.stringify(body),
       }, 15000);
     }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw new ProviderError(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
     }
 
     const reader = res.body?.getReader();
-    if (!reader) throw new Error('No response body');
+    if (!reader) throw new ProviderProtocolError('Google API returned no streaming response body.');
 
     const decoder = new TextDecoder();
     const id = this.makeId();
     let buffer = '';
     let emittedFinish = false;
     let sawToolCalls = false;
+    let substantive = false;
+    let malformedFrames = 0;
 
     const seenToolCallKeys = new Set<string>();
+    let nextToolCallIndex = 0;
 
-    while (true) {
+    try {
+      while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -651,9 +760,11 @@ export class GoogleProvider extends BaseProvider {
 
       for (const line of lines) {
         const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const raw = trimmed.slice(6);
+        if (!trimmed || !trimmed.startsWith('data:')) continue;
+        const raw = trimmed.slice(5).trimStart();
         if (raw === '[DONE]') {
+          if (malformedFrames > 0) throw new ProviderProtocolError('Google API returned malformed streaming data.');
+          if (!substantive) throw new ProviderProtocolError('Google API returned an empty or malformed stream.');
           if (!emittedFinish) {
             emittedFinish = true;
             yield {
@@ -671,29 +782,33 @@ export class GoogleProvider extends BaseProvider {
           return;
         }
 
-        // Skip malformed SSE frames instead of aborting the whole stream.
-        // Matches the defensive parse in openai-compat / cohere / cloudflare:
-        // a single corrupt chunk shouldn't take down the rest of the response.
         let chunk: GeminiResponse;
         try {
           chunk = isOAuthGoogleRequest(options)
             ? fromCodeAssist(JSON.parse(raw) as CodeAssistResponse)
             : JSON.parse(raw) as GeminiResponse;
         } catch {
+          malformedFrames++;
           continue;
         }
         const candidate = chunk.candidates?.[0];
+        if (!candidate || typeof candidate !== 'object') {
+          if (!chunk.usageMetadata) malformedFrames++;
+          continue;
+        }
         const parts = candidate?.content?.parts ?? [];
+        if (!Array.isArray(parts)) throw new ProviderProtocolError('Google API returned malformed streaming candidate content.');
 
         const text = extractText(parts);
         const toolCalls = extractToolCalls(parts).filter(call => {
-          const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
+          const key = `${call.function.name}:${call.function.arguments}`;
           if (seenToolCallKeys.has(key)) return false;
           seenToolCallKeys.add(key);
           return true;
-        });
+        }).map(call => ({ ...call, index: nextToolCallIndex++ }));
 
         if ((text && text.length > 0) || toolCalls.length > 0) {
+          substantive = true;
           sawToolCalls = sawToolCalls || toolCalls.length > 0;
           yield {
             id,
@@ -712,6 +827,8 @@ export class GoogleProvider extends BaseProvider {
         }
 
         if (candidate?.finishReason && !emittedFinish) {
+          substantive = true;
+          if (malformedFrames > 0) throw new ProviderProtocolError('Google API returned malformed streaming data.');
           emittedFinish = true;
           yield {
             id,
@@ -727,31 +844,33 @@ export class GoogleProvider extends BaseProvider {
           return;
         }
       }
-    }
+      }
 
-    if (!emittedFinish) {
-      yield {
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: modelId,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
-        }],
-      };
+      if (malformedFrames > 0) throw new ProviderProtocolError('Google API returned malformed streaming data.');
+      if (!substantive) throw new ProviderProtocolError('Google API returned an empty or malformed stream.');
+      if (!emittedFinish) throw new ProviderProtocolError('Google API returned a truncated completion stream.');
+    } finally {
+      try { await reader.cancel(); } catch { /* body already closed */ }
     }
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, signal?: AbortSignal): Promise<boolean> {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable. Only confirmed 401/403 disables a key.
     const res = await this.fetchWithTimeout(
-      `${API_BASE}/models?key=${apiKey}`,
-      { method: 'GET' },
+      `${API_BASE}/models`,
+      { method: 'GET', signal, headers: { 'x-goog-api-key': apiKey } },
       10000,
     );
-    return res.status !== 401 && res.status !== 403;
+    if (res.status === 401 || res.status === 403) {
+      await res.body?.cancel().catch(() => {});
+      return false;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new ProviderError(`Google validation endpoint returned HTTP ${res.status}.`, { statusCode: res.status, retryable: true });
+    }
+    await res.body?.cancel().catch(() => {});
+    return true;
   }
 }

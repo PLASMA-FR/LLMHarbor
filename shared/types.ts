@@ -60,6 +60,7 @@ export interface ApiKey {
   oauthAccountId?: number | null;
   createdAt: string;
   lastCheckedAt: string | null;
+  lastSuccessAt: string | null;
 }
 
 export interface ApiKeyCreate {
@@ -94,6 +95,17 @@ export interface ChatToolCall {
   thought_signature?: string;
 }
 
+/** Partial tool call payload used by OpenAI streaming deltas. */
+export interface ChatToolCallDelta {
+  index: number;
+  id?: string;
+  type?: 'function';
+  function?: {
+    name?: string;
+    arguments?: string;
+  };
+}
+
 export interface ChatToolFunctionDefinition {
   name: string;
   description?: string;
@@ -117,10 +129,9 @@ export type ChatToolChoice =
     };
   };
 
-// OpenAI's multimodal envelope: clients like opencode / continue.dev send
-// content as an array of typed blocks even for text-only messages. We accept
-// it on the wire and flatten to string for providers that don't support it
-// (Cohere, Cloudflare). See server/src/lib/content.ts.
+// Text-only OpenAI content blocks are accepted. The gateway rejects image and
+// audio blocks until provider capability-aware multimodal routing exists,
+// rather than silently dropping user input.
 export type ChatContentBlock = { type: string; text?: string; [key: string]: unknown };
 export type ChatContent = string | null | ChatContentBlock[];
 
@@ -130,6 +141,8 @@ export interface ChatMessage {
   name?: string;
   tool_call_id?: string;
   tool_calls?: ChatToolCall[];
+  /** OpenAI safety refusal text, when returned instead of normal content. */
+  refusal?: string;
 }
 
 export interface ChatCompletionRequest {
@@ -142,6 +155,9 @@ export interface ChatCompletionRequest {
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;
   parallel_tool_calls?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
 }
 
 export interface ChatCompletionChoice {
@@ -179,16 +195,22 @@ export interface ChatCompletionChunk {
     delta: {
       role?: 'assistant';
       content?: string;
-      tool_calls?: ChatToolCall[];
+      refusal?: string;
+      tool_calls?: ChatToolCallDelta[];
     };
     finish_reason: string | null;
   }[];
+  /** OpenAI emits a final choices:[] chunk when include_usage is requested. */
+  usage?: TokenUsage;
 }
 
 // ---- Analytics Types ----
 
 export interface AnalyticsSummary {
   totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  cancelledRequests: number;
   successRate: number;
   totalInputTokens: number;
   totalOutputTokens: number;
@@ -199,6 +221,7 @@ export interface AnalyticsSummary {
 export interface PlatformStats {
   platform: Platform;
   requests: number;
+  cancelledRequests: number;
   successRate: number;
   avgLatencyMs: number;
   totalInputTokens: number;
@@ -210,13 +233,17 @@ export interface TimelinePoint {
   requests: number;
   successCount: number;
   failureCount: number;
+  cancelledCount: number;
 }
 
 export interface RequestLog {
   id: number;
+  requestId: string;
+  attempt: number;
+  isFinal: boolean;
   platform: Platform;
   modelId: string;
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'cancelled';
   inputTokens: number;
   outputTokens: number;
   latencyMs: number;

@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiFetch } from '@/lib/api'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { apiFetch, apiUrl } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { InlineNotice } from '@/components/status-indicator'
 import { cn } from '@/lib/utils'
 import type { DetectedFreeModel, FreeModelUpdaterProviderOption, FreeModelUpdaterStatus } from '../../../shared/types'
 
@@ -31,7 +34,18 @@ interface FullBackupPayload {
   security: { containsSecrets: boolean; note: string }
   database: { filename: string; encoding: 'base64'; bytes: number; sha256: string; content: string }
 }
-interface BackupImportResult { success: boolean; previousBackupPath: string | null; restoredPath: string; restartedDatabase: boolean }
+interface BackupImportResult {
+  success: boolean
+  staged: boolean
+  previousBackupPath: string | null
+  restoredPath: string
+  restartedDatabase: boolean
+  restartRequired: boolean
+}
+
+type BackupImportInput =
+  | { kind: 'database'; file: File }
+  | { kind: 'legacy-json'; payload: FullBackupPayload }
 
 type PolicyPatch = Partial<{
   routes: Array<{ route: string; enabled: boolean }>
@@ -58,6 +72,7 @@ function formatBytes(value?: number) {
 }
 
 const RESTORE_CONFIRMATION = 'RESTORE_LLMHARBOR_BACKUP'
+const MAX_LEGACY_BACKUP_JSON_BYTES = 32 * 1024 * 1024
 
 function PolicyStateBadge({ enabled }: { enabled: boolean }) {
   return (
@@ -70,7 +85,7 @@ function PolicyStateBadge({ enabled }: { enabled: boolean }) {
 function SummaryTile({ label, value, detail, tone = 'default' }: { label: string; value: string | number; detail: string; tone?: 'default' | 'good' | 'warn' }) {
   return (
     <div className={cn(
-      'panel-card min-w-0 rounded-2xl p-4',
+      'panel-card min-w-0 rounded-[var(--radius-panel)] p-4',
       tone === 'good' && 'border-emerald-500/20 bg-emerald-500/5',
       tone === 'warn' && 'border-amber-500/25 bg-amber-500/10',
     )}>
@@ -91,6 +106,8 @@ function PolicyActionButton({ children, onClick, disabled, variant = 'outline' }
 
 export default function SettingsPage() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
+  const location = useLocation()
   const [selectedKeyId, setSelectedKeyId] = useState<number | null>(() => {
     const keyParam = new URLSearchParams(window.location.search).get('key')
     const keyId = Number.parseInt(keyParam ?? '', 10)
@@ -99,28 +116,38 @@ export default function SettingsPage() {
   const [modelSearch, setModelSearch] = useState('')
   const [platformFilter, setPlatformFilter] = useState('all')
   const [showBlockedOnly, setShowBlockedOnly] = useState(false)
-  const [freeUpdaterInterval, setFreeUpdaterInterval] = useState('6')
+  const [freeUpdaterIntervalDraft, setFreeUpdaterIntervalDraft] = useState<string | null>(null)
+  const [manualRefreshActive, setManualRefreshActive] = useState(false)
   const [backupStatus, setBackupStatus] = useState<string | null>(null)
   const [backupError, setBackupError] = useState<string | null>(null)
   const [backupFileName, setBackupFileName] = useState('')
   const backupFileRef = useRef<HTMLInputElement | null>(null)
+  const lastUpdaterRunRef = useRef<string | null | undefined>(undefined)
 
-  const { data: clientKeys = [] } = useQuery<ClientApiKey[]>({
+  useEffect(() => {
+    if (!location.hash) return
+    const target = document.getElementById(location.hash.slice(1))
+    if (!target) return
+    const frame = window.requestAnimationFrame(() => target.scrollIntoView({ block: 'start' }))
+    return () => window.cancelAnimationFrame(frame)
+  }, [location.hash])
+
+  const { data: clientKeys = [], isLoading: clientKeysLoading, isError: clientKeysError, error: clientKeysQueryError, refetch: refetchClientKeys } = useQuery<ClientApiKey[]>({
     queryKey: ['client-api-keys'],
-    queryFn: () => apiFetch('/api/settings/api-keys'),
+    queryFn: ({ signal }) => apiFetch('/api/settings/api-keys', { signal }),
   })
 
   const { data: endpointData } = useQuery<{ endpoints: LocalEndpoint[] }>({
     queryKey: ['local-endpoints'],
-    queryFn: () => apiFetch('/api/settings/local-endpoints'),
+    queryFn: ({ signal }) => apiFetch('/api/settings/local-endpoints', { signal }),
   })
 
   const activeKeyId = clientKeys.some(key => key.id === selectedKeyId) ? selectedKeyId : clientKeys[0]?.id ?? null
   const selectedKey = useMemo(() => clientKeys.find(key => key.id === activeKeyId) ?? null, [clientKeys, activeKeyId])
 
-  const { data: policy, isLoading: policyLoading } = useQuery<AccessPolicySnapshot>({
+  const { data: policy, isLoading: policyLoading, isError: policyError, error: policyQueryError, refetch: refetchPolicy } = useQuery<AccessPolicySnapshot>({
     queryKey: ['client-api-key-access-policy', activeKeyId],
-    queryFn: () => apiFetch(`/api/settings/api-keys/${activeKeyId}/access-policy`),
+    queryFn: ({ signal }) => apiFetch(`/api/settings/api-keys/${activeKeyId}/access-policy`, { signal }),
     enabled: activeKeyId !== null,
   })
 
@@ -137,25 +164,41 @@ export default function SettingsPage() {
 
   const { data: freeUpdaterStatus, isLoading: freeUpdaterStatusLoading, isError: freeUpdaterStatusError, error: freeUpdaterStatusQueryError, refetch: refetchFreeUpdaterStatus } = useQuery<FreeModelUpdaterStatus>({
     queryKey: ['free-model-updater-status'],
-    queryFn: () => apiFetch('/api/settings/free-model-updater/status'),
+    queryFn: ({ signal }) => apiFetch('/api/settings/free-model-updater/status', { signal }),
+    refetchInterval: query => {
+      const status = query.state.data
+      if (manualRefreshActive || status?.status === 'running') return 2_000
+      return status?.enabled ? 30_000 : false
+    },
   })
 
   const { data: freeUpdaterProviderData, isLoading: freeUpdaterProvidersLoading, isError: freeUpdaterProvidersError, error: freeUpdaterProvidersQueryError, refetch: refetchFreeUpdaterProviders } = useQuery<{ providers: FreeModelUpdaterProviderOption[] }>({
     queryKey: ['free-model-updater-providers'],
-    queryFn: () => apiFetch('/api/settings/free-model-updater/providers'),
+    queryFn: ({ signal }) => apiFetch('/api/settings/free-model-updater/providers', { signal }),
   })
 
   const { data: detectedFreeModels = [], isFetching: detectingFreeModels } = useQuery<DetectedFreeModel[]>({
     queryKey: ['free-model-updater-detected-models', freeUpdaterStatus?.selectedProviders ?? []],
-    queryFn: () => apiFetch('/api/settings/free-model-updater/detected-models'),
+    queryFn: ({ signal }) => apiFetch('/api/settings/free-model-updater/detected-models', { signal }),
     staleTime: 60_000,
+    refetchInterval: manualRefreshActive || freeUpdaterStatus?.status === 'running' ? 5_000 : false,
   })
+
+  useEffect(() => {
+    const latest = freeUpdaterStatus?.lastRunAt
+    if (lastUpdaterRunRef.current !== undefined && latest && latest !== lastUpdaterRunRef.current) {
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
+      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
+    }
+    lastUpdaterRunRef.current = latest
+  }, [freeUpdaterStatus?.lastRunAt, queryClient])
 
   const enableFreeUpdater = useMutation({
     mutationFn: (refreshIntervalHours: number) => apiFetch<FreeModelUpdaterStatus>('/api/settings/free-model-updater/enable', {
       method: 'POST',
       body: JSON.stringify({ refreshIntervalHours }),
     }),
+    onSuccess: () => setFreeUpdaterIntervalDraft(null),
     onSettled: () => queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] }),
   })
 
@@ -165,8 +208,13 @@ export default function SettingsPage() {
   })
 
   const refreshFreeModels = useMutation({
-    mutationFn: () => apiFetch('/api/settings/free-model-updater/refresh-now', { method: 'POST' }),
+    mutationFn: () => apiFetch('/api/settings/free-model-updater/refresh-now', { method: 'POST', timeoutMs: 300_000 }),
+    onMutate: () => {
+      setManualRefreshActive(true)
+      void queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
+    },
     onSettled: () => {
+      setManualRefreshActive(false)
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
@@ -186,48 +234,31 @@ export default function SettingsPage() {
     },
   })
 
-  const exportBackup = useMutation({
-    mutationFn: () => apiFetch<FullBackupPayload>('/api/settings/backup/export'),
-    onSuccess: (payload) => {
-      const stamp = new Date(payload.exportedAt).toISOString().replace(/[:.]/g, '-').slice(0, 19)
-      const filename = `llmharbor-backup-${stamp}.json`
-      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
-      anchor.href = url
-      anchor.download = filename
-      document.body.appendChild(anchor)
-      anchor.click()
-      anchor.remove()
-      URL.revokeObjectURL(url)
-      setBackupError(null)
-      setBackupStatus(`Downloaded ${filename} (${formatBytes(payload.database.bytes)}). Includes ${payload.manifest?.localProxyKeys ?? 0} local proxy key${payload.manifest?.localProxyKeys === 1 ? '' : 's'}.`)
-    },
-    onError: (error) => {
-      setBackupStatus(null)
-      setBackupError(error instanceof Error ? error.message : String(error))
-    },
-  })
-
   const importBackup = useMutation({
-    mutationFn: (payload: FullBackupPayload) => apiFetch<BackupImportResult>('/api/settings/backup/import', {
-      method: 'POST',
-      body: JSON.stringify({ format: payload.format, confirm: RESTORE_CONFIRMATION, database: payload.database }),
-    }),
+    mutationFn: (input: BackupImportInput) => input.kind === 'database'
+      ? apiFetch<BackupImportResult>('/api/settings/backup/import/database', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'X-LLMHarbor-Restore-Confirmation': RESTORE_CONFIRMATION,
+          },
+          body: input.file,
+          timeoutMs: 300_000,
+        })
+      : apiFetch<BackupImportResult>('/api/settings/backup/import', {
+          method: 'POST',
+          body: JSON.stringify({ format: input.payload.format, confirm: RESTORE_CONFIRMATION, database: input.payload.database }),
+          timeoutMs: 300_000,
+        }),
     onSuccess: (result) => {
       setBackupError(null)
-      setBackupStatus(`Backup restored. Previous database backup: ${result.previousBackupPath ?? 'not created'}. Refresh the dashboard if any counters look stale.`)
-      queryClient.invalidateQueries()
+      setBackupStatus(`Backup verified and staged. Restart LLMHarbor to activate it. The current database remains active until restart; a pre-import backup was ${result.previousBackupPath ? `saved at ${result.previousBackupPath}` : 'not needed'}.`)
     },
     onError: (error) => {
       setBackupStatus(null)
       setBackupError(error instanceof Error ? error.message : String(error))
     },
   })
-
-  useEffect(() => {
-    if (freeUpdaterStatus) setFreeUpdaterInterval(String(freeUpdaterStatus.refreshIntervalHours))
-  }, [freeUpdaterStatus])
 
   const totalEndpoints = endpointData?.endpoints.length ?? 0
   const legacyDomains = endpointData?.endpoints.reduce((sum, endpoint) => sum + endpoint.domains.length, 0) ?? 0
@@ -253,10 +284,16 @@ export default function SettingsPage() {
   const freeUpdaterBusy = (freeUpdaterStatus?.status === 'running') || enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending || updateFreeUpdaterProviders.isPending
   const canRefreshFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
   const canEnableFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
+  const freeUpdaterInterval = freeUpdaterIntervalDraft ?? String(freeUpdaterStatus?.refreshIntervalHours ?? 6)
 
   function updatePolicy(patch: PolicyPatch) {
     if (!activeKeyId) return
     patchPolicy.mutate({ keyId: activeKeyId, patch })
+  }
+
+  function chooseKey(keyId: number) {
+    setSelectedKeyId(keyId)
+    navigate(`/settings?key=${keyId}#access-policies`, { replace: true })
   }
 
   function setAllRoutes(enabled: boolean) {
@@ -277,21 +314,40 @@ export default function SettingsPage() {
   function setFreeUpdaterProvider(platform: string, selected: boolean) {
     const next = new Set(selectedFreeUpdaterProviders.map(String))
     if (selected) next.add(platform)
-    else next.delete(platform)
+    else {
+      if (freeUpdaterStatus?.enabled && next.size === 1 && next.has(platform)) return
+      next.delete(platform)
+    }
     updateFreeUpdaterProviders.mutate(Array.from(next).sort((a, b) => a.localeCompare(b)))
   }
 
   function setAllFreeUpdaterProviders(selected: boolean) {
+    if (!selected && freeUpdaterStatus?.enabled) return
     updateFreeUpdaterProviders.mutate(selected ? freeUpdaterProviders.map(provider => provider.platform) : [])
+  }
+
+  function saveFreeUpdaterInterval() {
+    const parsed = Number.parseInt(freeUpdaterInterval, 10)
+    enableFreeUpdater.mutate(Number.isFinite(parsed) ? Math.min(24, Math.max(1, parsed)) : 6)
   }
 
   function toggleFreeUpdater(enabled: boolean) {
     if (enabled) {
-      const parsed = Number.parseInt(freeUpdaterInterval, 10)
-      enableFreeUpdater.mutate(Number.isFinite(parsed) ? Math.min(24, Math.max(1, parsed)) : 6)
+      saveFreeUpdaterInterval()
     } else {
       disableFreeUpdater.mutate()
     }
+  }
+
+  function downloadBackup() {
+    const anchor = document.createElement('a')
+    anchor.href = apiUrl('/api/settings/backup/export/database')
+    anchor.download = ''
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    setBackupError(null)
+    setBackupStatus('Secure SQLite backup download started. Keep the matching credential-encryption key separately.')
   }
 
   async function handleBackupFile(event: React.ChangeEvent<HTMLInputElement>) {
@@ -301,14 +357,25 @@ export default function SettingsPage() {
     setBackupStatus(null)
     setBackupError(null)
     try {
-      const payload = JSON.parse(await file.text()) as FullBackupPayload
-      if (payload.format !== 'llmharbor.full-instance-backup.v1' || payload.database?.encoding !== 'base64') {
-        throw new Error('Choose an LLMHarbor full-instance backup JSON file.')
+      const legacyJson = file.name.toLowerCase().endsWith('.json') || file.type === 'application/json'
+      if (legacyJson) {
+        if (file.size > MAX_LEGACY_BACKUP_JSON_BYTES) {
+          throw new Error(`Legacy JSON imports are limited to ${formatBytes(MAX_LEGACY_BACKUP_JSON_BYTES)} in the dashboard. Use the streamed .db backup format for larger instances.`)
+        }
+        const payload = JSON.parse(await file.text()) as FullBackupPayload
+        if (payload.format !== 'llmharbor.full-instance-backup.v1' || payload.database?.encoding !== 'base64') {
+          throw new Error('Choose an LLMHarbor .db backup or legacy backup JSON file.')
+        }
+        const keyCount = payload.manifest?.localProxyKeys ?? 'unknown number of'
+        const ok = window.confirm(`Stage ${file.name} for restore? After the next LLMHarbor restart it will replace provider and OAuth credentials, analytics, policies, and ${keyCount} local proxy key record(s). The matching credential-encryption key must already be installed.`)
+        if (!ok) return
+        importBackup.mutate({ kind: 'legacy-json', payload })
+        return
       }
-      const keyCount = payload.manifest?.localProxyKeys ?? 'unknown number of'
-      const ok = window.confirm(`Restore ${file.name}? This replaces the local LLMHarbor database, including provider keys, OAuth accounts, analytics, and ${keyCount} local proxy key(s).`)
+      if (file.size === 0) throw new Error('The SQLite backup is empty.')
+      const ok = window.confirm(`Stage ${file.name} for restore? After the next LLMHarbor restart it will replace credentials, analytics, routing, and access policies. The matching credential-encryption key must already be installed.`)
       if (!ok) return
-      importBackup.mutate(payload)
+      importBackup.mutate({ kind: 'database', file })
     } catch (error) {
       setBackupError(error instanceof Error ? error.message : String(error))
     } finally {
@@ -323,59 +390,65 @@ export default function SettingsPage() {
         title="Local API access controls"
         description="Give every app its own route, provider, and model policy. One local /v1 endpoint, many isolated permissions."
         actions={
-          <Button variant="outline" onClick={() => { window.location.href = '/keys' }}>
+          <Button variant="outline" onClick={() => navigate('/keys')}>
             Manage keys
           </Button>
         }
       />
 
-      <section className="panel-card rounded-2xl p-5 sm:p-6">
+      <nav className="nav-scroll -mt-2 flex gap-1 overflow-x-auto border-b border-border pb-3" aria-label="Settings sections">
+        <a href="#backup-restore" className="shrink-0 rounded-[var(--radius-button)] px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground">Backup & restore</a>
+        <a href="#free-model-updater" className="shrink-0 rounded-[var(--radius-button)] px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground">Free model updater</a>
+        <a href="#access-policies" className="shrink-0 rounded-[var(--radius-button)] px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground">Access policies</a>
+      </nav>
+
+      <section id="backup-restore" className="panel-card scroll-mt-24 rounded-[var(--radius-panel)] p-5">
         <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
           <SectionTitle
-            title="Full-instance backup"
-            description="Located here in Settings. Export or restore the whole SQLite instance: provider keys, OAuth accounts, analytics, routing policies, local proxy keys, and local proxy key limits/usage."
+            title="Database backup"
+            description="Export or stage the SQLite state: encrypted provider and OAuth credentials, analytics, routing policies, and hash-only local key records with their limits and usage."
             action={<Badge variant="secondary">Sensitive</Badge>}
           />
           <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" onClick={() => exportBackup.mutate()} disabled={exportBackup.isPending || importBackup.isPending}>
-              {exportBackup.isPending ? 'Exporting…' : 'Export backup'}
+            <Button type="button" onClick={downloadBackup} disabled={importBackup.isPending}>
+              Export backup
             </Button>
-            <Button type="button" variant="outline" onClick={() => backupFileRef.current?.click()} disabled={exportBackup.isPending || importBackup.isPending}>
-              {importBackup.isPending ? 'Restoring…' : 'Import backup'}
+            <Button type="button" variant="outline" onClick={() => backupFileRef.current?.click()} disabled={importBackup.isPending}>
+              {importBackup.isPending ? 'Verifying…' : 'Import backup'}
             </Button>
             <Input
               ref={backupFileRef}
               className="hidden"
               type="file"
-              accept="application/json,.json"
+              accept=".db,.sqlite,.json,application/vnd.sqlite3,application/octet-stream,application/json"
               onChange={handleBackupFile}
             />
           </div>
         </div>
         <div className="mt-5 grid gap-3 md:grid-cols-3">
-          <SummaryTile label="Backup contents" value="Full DB" detail="Provider credentials, OAuth tokens, catalog, analytics, access policies, and local proxy keys." tone="warn" />
-          <SummaryTile label="Local proxy keys" value={clientKeys.length} detail="Client API keys are included in exports and restored on import." />
-          <SummaryTile label="Restore phrase" value={RESTORE_CONFIRMATION} detail="The dashboard sends this confirmation automatically after you choose a valid backup file." />
+          <SummaryTile label="Backup contents" value="SQLite" detail="Encrypted credentials, catalog, analytics, access policies, and key hashes." tone="warn" />
+          <SummaryTile label="Local proxy keys" value={clientKeys.length} detail="Existing secrets keep working after restore, but cannot be recovered from the export." />
+          <SummaryTile label="Activation" value="Restart" detail="Imports are verified and staged; active traffic keeps using the current database." />
         </div>
-        <div className="mt-4 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
-          Keep exported backups private. They contain local proxy keys and encrypted provider/OAuth credentials; if you run with an environment ENCRYPTION_KEY, restore with the same key.
+        <div className="mt-4 rounded-[var(--radius-panel)] border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
+          Keep exports private. The credential-encryption key is deliberately excluded: preserve the matching <code>llmharbor.db.key</code> separately with mode 600, or restore under the same <code>ENCRYPTION_KEY</code>. An import with a mismatched key is rejected before activation.
         </div>
         {backupFileName && !backupStatus && !backupError && (
           <p className="mt-3 text-xs text-muted-foreground">Selected file: {backupFileName}</p>
         )}
         {backupStatus && (
-          <div className="mt-4 rounded-2xl border border-emerald-500/20 bg-emerald-500/8 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-200">
+          <div className="mt-4 rounded-[var(--radius-panel)] border border-emerald-500/20 bg-emerald-500/8 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-200" role="status">
             {backupStatus}
           </div>
         )}
         {backupError && (
-          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+          <div className="mt-4 rounded-[var(--radius-panel)] border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200" role="alert">
             {backupError}
           </div>
         )}
       </section>
 
-      <section className="panel-card rounded-2xl p-5 sm:p-6">
+      <section id="free-model-updater" className="panel-card scroll-mt-24 rounded-[var(--radius-panel)] p-5">
         <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
           <SectionTitle
             title="Free model updater"
@@ -383,14 +456,15 @@ export default function SettingsPage() {
             action={<Badge variant="secondary">Beta</Badge>}
           />
           <div className="flex flex-wrap items-center gap-3">
-            <Label className="text-xs text-muted-foreground">Interval (hours)</Label>
+            <Label htmlFor="free-updater-interval" className="text-xs text-muted-foreground">Interval (hours)</Label>
             <Input
+              id="free-updater-interval"
               className="h-9 w-24"
               type="number"
               min={1}
               max={24}
               value={freeUpdaterInterval}
-              onChange={event => setFreeUpdaterInterval(event.target.value)}
+              onChange={event => setFreeUpdaterIntervalDraft(event.target.value)}
             />
             <Switch
               checked={freeUpdaterStatus?.enabled ?? false}
@@ -398,6 +472,11 @@ export default function SettingsPage() {
               disabled={freeUpdaterBusy || (!(freeUpdaterStatus?.enabled ?? false) && !canEnableFreeUpdater)}
               aria-label={(freeUpdaterStatus?.enabled ?? false) ? 'Disable free model updater' : 'Enable free model updater'}
             />
+            {(freeUpdaterStatus?.enabled ?? false) && freeUpdaterIntervalDraft !== null && freeUpdaterIntervalDraft !== String(freeUpdaterStatus?.refreshIntervalHours ?? 6) ? (
+              <Button type="button" variant="outline" size="sm" disabled={freeUpdaterBusy} onClick={saveFreeUpdaterInterval}>
+                {enableFreeUpdater.isPending ? 'Saving…' : 'Save interval'}
+              </Button>
+            ) : null}
             <Button
               type="button"
               variant="outline"
@@ -411,17 +490,17 @@ export default function SettingsPage() {
         </div>
 
         <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <SummaryTile label="Status" value={freeUpdaterStatusLoading ? 'loading' : freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
+          <SummaryTile label="Status" value={manualRefreshActive ? 'running' : freeUpdaterStatusLoading ? 'loading' : freeUpdaterStatus?.status ?? 'idle'} detail={freeUpdaterStatus?.enabled ? 'Background refresh enabled.' : 'Background refresh disabled.'} />
           <SummaryTile label="Selected" value={freeUpdaterStatus?.selectedProviderCount ?? selectedFreeUpdaterProviders.length} detail="Only these providers are fetched." tone={selectedFreeUpdaterProviders.length ? 'good' : 'warn'} />
           <SummaryTile label="Detected" value={freeUpdaterStatus?.detectedCount ?? detectedFreeModels.length} detail="Candidates from the latest selected-provider refresh." />
           <SummaryTile label="Last run" value={freeUpdaterStatus?.lastRunAt ? new Date(freeUpdaterStatus.lastRunAt).toLocaleString() : 'Never'} detail="Most recent updater cycle." />
         </div>
 
-        <div className="mt-5 rounded-2xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
+        <div className="mt-5 rounded-[var(--radius-panel)] border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-900 dark:text-amber-100">
           <strong>Beta safeguard:</strong> the updater stays off until you opt in. Built-in providers appear only when a usable upstream key is enabled. Custom endpoints are opt-in, user-declared free/local catalogs. Review provider quotas before enabling background refresh.
         </div>
 
-        <div className="mt-5 rounded-2xl border border-border bg-background p-4">
+        <div className="mt-5 rounded-[var(--radius-panel)] border border-border bg-background p-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <p className="text-sm font-medium">Provider selection</p>
@@ -431,7 +510,7 @@ export default function SettingsPage() {
             </div>
             <div className="flex shrink-0 gap-2">
               <Button type="button" size="sm" variant="outline" disabled={freeUpdaterBusy || freeUpdaterProviders.length === 0} onClick={() => setAllFreeUpdaterProviders(true)}>Select all</Button>
-              <Button type="button" size="sm" variant="outline" disabled={freeUpdaterBusy || selectedFreeUpdaterProviders.length === 0} onClick={() => setAllFreeUpdaterProviders(false)}>Clear</Button>
+              <Button type="button" size="sm" variant="outline" disabled={freeUpdaterBusy || selectedFreeUpdaterProviders.length === 0 || Boolean(freeUpdaterStatus?.enabled)} onClick={() => setAllFreeUpdaterProviders(false)}>Clear</Button>
             </div>
           </div>
           <div className="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
@@ -442,13 +521,13 @@ export default function SettingsPage() {
             ) : freeUpdaterProviders.length === 0 ? (
               <EmptyState title="No ready providers" description="Add or enable an API key for a supported free-tier provider, or create/enable a custom OpenAI-compatible endpoint. The beta updater only shows providers it can actually refresh." />
             ) : freeUpdaterProviders.map(provider => (
-              <div key={provider.platform} className={cn('rounded-2xl border p-3 transition-colors', provider.selected ? 'border-primary bg-primary/5' : 'border-border bg-card')}>
+              <div key={provider.platform} className={cn('rounded-[var(--radius-panel)] border p-3 transition-colors', provider.selected ? 'border-primary bg-primary/5' : 'border-border bg-card')}>
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium">{provider.name}</p>
                     <code className="mt-1 block truncate text-[11px] text-muted-foreground">{provider.platform}</code>
                   </div>
-                  <Switch checked={provider.selected} disabled={freeUpdaterBusy} onCheckedChange={checked => setFreeUpdaterProvider(provider.platform, checked)} aria-label={`${provider.selected ? 'Deselect' : 'Select'} ${provider.name} for free model refresh`} />
+                  <Switch checked={provider.selected} disabled={freeUpdaterBusy || Boolean(freeUpdaterStatus?.enabled && provider.selected && selectedFreeUpdaterProviders.length === 1)} onCheckedChange={checked => setFreeUpdaterProvider(provider.platform, checked)} aria-label={`${provider.selected ? 'Deselect' : 'Select'} ${provider.name} for free model refresh`} />
                 </div>
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge variant="secondary">{provider.source}</Badge>
@@ -461,7 +540,7 @@ export default function SettingsPage() {
         </div>
 
         {freeUpdaterStatus?.errorMessage && (
-          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+          <div className="mt-4 rounded-[var(--radius-panel)] border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200" role="alert">
             {freeUpdaterStatus.errorMessage}
           </div>
         )}
@@ -473,12 +552,12 @@ export default function SettingsPage() {
         )}
 
         {freeUpdaterActionError && (
-          <div className="mt-4 rounded-2xl border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+          <div className="mt-4 rounded-[var(--radius-panel)] border border-rose-500/25 bg-rose-500/8 px-3 py-2 text-sm text-rose-700 dark:text-rose-200" role="alert">
             {freeUpdaterActionError.message}
           </div>
         )}
 
-        <div className="mt-5 rounded-2xl border border-border bg-background p-4">
+        <div className="mt-5 rounded-[var(--radius-panel)] border border-border bg-background p-4">
           <div className="flex items-center justify-between gap-3">
             <p className="text-sm font-medium">Detected free models preview</p>
             <Badge variant="secondary">{detectingFreeModels ? 'Loading…' : `${detectedFreeModels.length} candidates`}</Badge>
@@ -502,7 +581,11 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      <section className="grid min-w-0 max-w-full gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      <section id="access-policies" className="grid min-w-0 max-w-full scroll-mt-24 gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-labelledby="access-policies-title">
+        <div className="sm:col-span-2 xl:col-span-4">
+          <h2 id="access-policies-title" className="text-base font-semibold">Client access policies</h2>
+          <p className="mt-1 text-sm text-muted-foreground">Choose a local API key, then constrain its OpenAI-compatible routes, providers, and models.</p>
+        </div>
         <SummaryTile label="Client keys" value={clientKeys.length} detail="Per app, agent, laptop, or experiment." />
         <SummaryTile label="Routes allowed" value={`${allowedRoutes}/${policy?.routes.length ?? 0}`} detail="OpenAI-compatible surface area." tone={blockedRoutes ? 'warn' : 'good'} />
         <SummaryTile label="Providers allowed" value={`${allowedProviders}/${policy?.platforms.length ?? 0}`} detail="Whole endpoint families for this key." tone={blockedProviders ? 'warn' : 'good'} />
@@ -511,13 +594,17 @@ export default function SettingsPage() {
 
       <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 xl:grid-cols-[minmax(260px,0.72fr)_minmax(0,1.28fr)]">
         <aside className="min-w-0 space-y-4 xl:sticky xl:top-28 xl:self-start">
-          <div className="panel-card rounded-2xl p-5">
+          <div className="panel-card rounded-[var(--radius-panel)] p-5">
             <SectionTitle title="Choose a local key" description="Policies are isolated. Blocking a provider here will not affect other apps." />
-            {clientKeys.length === 0 ? (
+            {clientKeysLoading ? (
+              <LoadingState title="Loading client keys" />
+            ) : clientKeysError ? (
+              <ErrorState title="Could not load client keys" description={clientKeysQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchClientKeys()}>Retry</Button>} />
+            ) : clientKeys.length === 0 ? (
               <EmptyState
                 title="No local API keys"
                 description="Create a client key on the Keys page, then return here to set route, provider, and model policy."
-                action={<Button onClick={() => { window.location.href = '/keys' }}>Create a key</Button>}
+                action={<Button onClick={() => navigate('/keys')}>Create a key</Button>}
               />
             ) : (
               <div className="mt-4 space-y-2">
@@ -525,9 +612,9 @@ export default function SettingsPage() {
                   <button
                     key={key.id}
                     type="button"
-                    onClick={() => setSelectedKeyId(key.id)}
+                    onClick={() => chooseKey(key.id)}
                     className={cn(
-                      'w-full rounded-2xl border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/30',
+                      'w-full rounded-[var(--radius-panel)] border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/30',
                       activeKeyId === key.id ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-muted/60',
                     )}
                   >
@@ -547,7 +634,7 @@ export default function SettingsPage() {
             )}
           </div>
 
-          <div className="panel-card rounded-2xl p-5">
+          <div className="panel-card rounded-[var(--radius-panel)] p-5">
             <SectionTitle title="Compatibility surface" description="The router keeps the default /v1 path and host mappings. New segmentation happens through per-key policy." />
             <div className="grid gap-2 text-sm">
               <div className="flex justify-between gap-3 rounded-xl bg-background px-3 py-2"><span className="text-muted-foreground">Endpoint rows</span><span className="font-medium tabular-nums">{totalEndpoints}</span></div>
@@ -563,12 +650,15 @@ export default function SettingsPage() {
           {!selectedKey ? (
             <EmptyState title="Select a key" description="Choose a local client key to edit its access policy." />
           ) : policyLoading ? (
-            <div className="panel-card rounded-2xl p-6 text-sm text-muted-foreground">Loading access policy…</div>
+            <LoadingState title="Loading access policy" description="Resolving route, provider, and model rules…" />
+          ) : policyError ? (
+            <ErrorState title="Could not load access policy" description={policyQueryError.message} action={<Button variant="outline" size="sm" onClick={() => refetchPolicy()}>Retry</Button>} />
           ) : !policy ? (
             <EmptyState title="Policy unavailable" description="The selected key could not be loaded." />
           ) : (
             <>
-              <section className="panel-card rounded-2xl p-5 sm:p-6">
+              {patchPolicy.isError ? <InlineNotice tone="critical">{patchPolicy.error.message}</InlineNotice> : null}
+              <section className="panel-card rounded-[var(--radius-panel)] p-5">
                 <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
                   <div className="min-w-0">
                     <p className="text-xs font-medium text-primary/80">Active policy</p>
@@ -576,9 +666,9 @@ export default function SettingsPage() {
                     <code className="mt-2 block truncate rounded-xl bg-muted/70 px-3 py-2 font-mono text-xs text-muted-foreground">{policy.key.maskedKey}</code>
                   </div>
                   <div className="grid min-w-0 max-w-full gap-2 text-xs sm:grid-cols-3 lg:min-w-[460px]">
-                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Base URL</span><code className="mt-1 block truncate font-mono">/v1</code></div>
-                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Providers</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedProviders}/{policy.platforms.length} allowed</span></div>
-                    <div className="rounded-2xl bg-background p-3"><span className="block text-muted-foreground">Models</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedModels}/{policy.models.length} allowed</span></div>
+                    <div className="rounded-[var(--radius-button)] border border-border bg-background p-3"><span className="block text-muted-foreground">Base URL</span><code className="mt-1 block truncate font-mono">/v1</code></div>
+                    <div className="rounded-[var(--radius-button)] border border-border bg-background p-3"><span className="block text-muted-foreground">Providers</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedProviders}/{policy.platforms.length} allowed</span></div>
+                    <div className="rounded-[var(--radius-button)] border border-border bg-background p-3"><span className="block text-muted-foreground">Models</span><span className="mt-1 block truncate font-medium tabular-nums">{allowedModels}/{policy.models.length} allowed</span></div>
                   </div>
                 </div>
                 <div className="mt-5 grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
@@ -596,7 +686,7 @@ export default function SettingsPage() {
               </section>
 
               <section className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-                <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
+                <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5">
                   <SectionTitle
                     title="Route access"
                     description="Keep the proxy surface small for untrusted tools. Denied routes fail with a 403 before routing."
@@ -604,7 +694,7 @@ export default function SettingsPage() {
                   />
                   <div className="space-y-3">
                     {policy.routes.map(route => (
-                      <div key={route.id} className={cn('min-w-0 rounded-2xl border p-4 transition-colors', policyTone(route.enabled))}>
+                      <div key={route.id} className={cn('min-w-0 rounded-[var(--radius-panel)] border p-4 transition-colors', policyTone(route.enabled))}>
                         <div className="flex min-w-0 items-start justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
@@ -621,7 +711,7 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                <div className="panel-card min-w-0 rounded-2xl p-5 sm:p-6">
+                <div className="panel-card min-w-0 rounded-[var(--radius-panel)] p-5">
                   <SectionTitle
                     title="Provider endpoints"
                     description="Block whole upstream families while leaving the key valid for approved providers."
@@ -629,7 +719,7 @@ export default function SettingsPage() {
                   />
                   <div className="max-h-[440px] space-y-2 overflow-y-auto pr-1">
                     {policy.platforms.map(provider => (
-                      <div key={provider.platform} className={cn('min-w-0 rounded-2xl border p-3 transition-colors', provider.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
+                      <div key={provider.platform} className={cn('min-w-0 rounded-[var(--radius-panel)] border p-3 transition-colors', provider.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
                         <div className="flex min-w-0 items-center justify-between gap-3">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
@@ -650,20 +740,23 @@ export default function SettingsPage() {
                 </div>
               </section>
 
-              <section className="panel-card rounded-2xl p-5 sm:p-6">
+              <section className="panel-card rounded-[var(--radius-panel)] p-5">
                 <div className="flex flex-col gap-4 2xl:flex-row 2xl:items-end 2xl:justify-between">
                   <SectionTitle title="Model scope" description="Fine tune the catalog visible to this key. Explicit blocked model requests fail before any upstream call." />
                   <div className="grid w-full min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(180px,1fr)_minmax(140px,180px)_max-content] 2xl:max-w-[620px]">
                     <div className="grid gap-1">
-                      <Label className="text-xs text-muted-foreground">Search</Label>
-                      <Input value={modelSearch} onChange={event => setModelSearch(event.target.value)} placeholder="gpt, gemini, llama…" />
+                      <Label htmlFor="client-key-model-search" className="text-xs text-muted-foreground">Search</Label>
+                      <Input id="client-key-model-search" type="search" value={modelSearch} onChange={event => setModelSearch(event.target.value)} placeholder="gpt, gemini, llama…" />
                     </div>
                     <div className="grid gap-1">
                       <Label className="text-xs text-muted-foreground">Provider</Label>
-                      <select className="h-10 rounded-[var(--radius-input)] border border-input bg-background px-3 text-sm" value={platformFilter} onChange={event => setPlatformFilter(event.target.value)}>
-                        <option value="all">All</option>
-                        {providerOptions.map(platform => <option key={platform} value={platform}>{platform}</option>)}
-                      </select>
+                      <Select value={platformFilter} onValueChange={value => setPlatformFilter(value ?? 'all')}>
+                        <SelectTrigger className="w-full" aria-label="Filter models by provider"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="all">All providers</SelectItem>
+                          {providerOptions.map(platform => <SelectItem key={platform} value={platform}>{platform}</SelectItem>)}
+                        </SelectContent>
+                      </Select>
                     </div>
                     <Button type="button" className="h-10 w-full self-end whitespace-nowrap sm:col-span-2 lg:col-span-1 lg:w-auto" variant={showBlockedOnly ? 'default' : 'outline'} onClick={() => setShowBlockedOnly(prev => !prev)}>
                       {showBlockedOnly ? 'Show all models' : 'Blocked only'}
@@ -671,7 +764,7 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-background p-3">
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-panel)] border border-border bg-background p-3">
                   <p className="text-sm text-muted-foreground">
                     Showing <span className="font-medium text-foreground tabular-nums">{visibleModels.length}</span> of <span className="font-medium text-foreground tabular-nums">{policy.models.length}</span> models. <span className="font-medium text-foreground tabular-nums">{allowedModels}</span> currently allowed.
                   </p>
@@ -687,7 +780,7 @@ export default function SettingsPage() {
                   ) : visibleModels.map(model => {
                     const contextLabel = formatContextWindow(model.contextWindow)
                     return (
-                      <div key={model.modelDbId} className={cn('rounded-2xl border p-3 transition-colors', model.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
+                      <div key={model.modelDbId} className={cn('rounded-[var(--radius-panel)] border p-3 transition-colors', model.enabled ? 'border-border bg-background' : 'border-rose-500/25 bg-rose-500/5')}>
                         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">

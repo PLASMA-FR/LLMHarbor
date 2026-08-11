@@ -1,9 +1,9 @@
 import { getDb } from '../db/index.js';
 import { getProvider } from '../providers/index.js';
-import { decrypt, encrypt } from '../lib/crypto.js';
-import { canMakeRequest, canUseTokens, isOnCooldown } from './ratelimit.js';
-import type { BaseProvider } from '../providers/base.js';
-import { oauthTokenClient } from './oauth-clients.js';
+import { decrypt } from '../lib/crypto.js';
+import { canMakeRequest, canUseTokens, isOnCooldown, releaseProviderCapacity, reserveProviderCapacity } from './ratelimit.js';
+import { ProviderError, type BaseProvider } from '../providers/base.js';
+import { ensureFreshOAuthAccount } from './oauth-refresh.js';
 
 interface ModelRow {
   id: number;
@@ -25,35 +25,8 @@ interface KeyRow {
   status: string;
   enabled: number;
   oauth_account_id?: number | null;
-}
-
-function refreshTokenForProvider(provider: string, rawRefreshToken: string) {
-  // Antigravity-compatible tools may persist refresh tokens as
-  // refreshToken|duetProject|managedProject. Google only accepts the first
-  // segment at oauth2.googleapis.com/token.
-  return provider === 'antigravity' ? rawRefreshToken.split('|')[0] : rawRefreshToken;
-}
-
-
-function markOAuthAccountNeedsReconnect(db: ReturnType<typeof getDb>, account: any, message: string) {
-  let metadata: Record<string, unknown> = {};
-  try {
-    metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {};
-  } catch {}
-  metadata.oauthNeedsReconnect = true;
-  metadata.oauthDiscoveryError = message;
-  metadata.oauthModelCount = 0;
-  metadata.oauthLastDiscoveredAt = new Date().toISOString();
-  db.prepare(`
-    UPDATE oauth_accounts
-       SET metadata_json = ?, last_discovered_at = datetime('now')
-     WHERE id = ?
-  `).run(JSON.stringify(metadata), account.id);
-  db.prepare(`
-    UPDATE api_keys
-       SET status = 'invalid', enabled = 0, last_checked_at = datetime('now')
-     WHERE oauth_account_id = ?
-  `).run(account.id);
+  source?: string;
+  oauth_provider?: string | null;
 }
 
 interface OAuthAccountRow {
@@ -61,73 +34,6 @@ interface OAuthAccountRow {
   provider: string;
   account_hint: string | null;
   metadata_json: string | null;
-}
-
-async function refreshOAuthKeyIfNeeded(key: KeyRow): Promise<string | null> {
-  if (!key.oauth_account_id) return null;
-  const db = getDb();
-  const account = db.prepare('SELECT * FROM oauth_accounts WHERE id = ? AND enabled = 1').get(key.oauth_account_id) as any;
-  if (!account) return null;
-  const expiresAt = account.expires_at ? Date.parse(account.expires_at) : 0;
-  if (!expiresAt || expiresAt - Date.now() > 5 * 60 * 1000) return null;
-  if (!account.encrypted_refresh_token || !account.refresh_iv || !account.refresh_auth_tag) {
-    const providerName = account.provider === 'antigravity' ? 'Antigravity' : 'ChatGPT';
-    const message = `${providerName} OAuth access token expired and no refresh token is available.`;
-    markOAuthAccountNeedsReconnect(db, account, message);
-    const err = new Error(`${message} Reconnect the browser account.`) as any;
-    err.status = 401;
-    throw err;
-  }
-  const rawRefreshToken = decrypt(account.encrypted_refresh_token, account.refresh_iv, account.refresh_auth_tag);
-  const refreshToken = refreshTokenForProvider(account.provider, rawRefreshToken);
-  const client = oauthTokenClient(account.provider);
-  if (!client) return null;
-  if (client.requiresClientSecret && !client.clientSecret) return null;
-  const params = new URLSearchParams({
-    grant_type: 'refresh_token',
-    client_id: client.clientId,
-    refresh_token: refreshToken,
-  });
-  if (client.clientSecret) params.set('client_secret', client.clientSecret);
-  const upstream = await fetch(client.tokenUrl, {
-    method: 'POST',
-    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-  if (!upstream.ok) {
-    const message = `${client.name} token refresh failed with HTTP ${upstream.status}. ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
-    markOAuthAccountNeedsReconnect(db, account, message);
-    const err = new Error(`${message} Reconnect the browser account.`) as any;
-    err.status = 401;
-    throw err;
-  }
-  const tokenData = await upstream.json() as any;
-  if (!tokenData.access_token) {
-    const message = `${client.name} token refresh response did not contain an access token.`;
-    markOAuthAccountNeedsReconnect(db, account, message);
-    const err = new Error(`${message} Reconnect the browser account.`) as any;
-    err.status = 401;
-    throw err;
-  }
-  const access = encrypt(String(tokenData.access_token));
-  const nextRefresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
-  const expires = typeof tokenData.expires_in === 'number' ? new Date(Date.now() + tokenData.expires_in * 1000).toISOString() : account.expires_at;
-  const metadataJson = account.metadata_json ?? '{}';
-  db.prepare(`
-    UPDATE oauth_accounts
-    SET encrypted_access_token = ?, access_iv = ?, access_auth_tag = ?,
-        encrypted_refresh_token = COALESCE(?, encrypted_refresh_token),
-        refresh_iv = COALESCE(?, refresh_iv),
-        refresh_auth_tag = COALESCE(?, refresh_auth_tag),
-        expires_at = ?, metadata_json = ?, last_used_at = datetime('now')
-    WHERE id = ?
-  `).run(access.encrypted, access.iv, access.authTag, nextRefresh?.encrypted ?? null, nextRefresh?.iv ?? null, nextRefresh?.authTag ?? null, expires, metadataJson, account.id);
-  db.prepare(`
-    UPDATE api_keys
-    SET encrypted_key = ?, iv = ?, auth_tag = ?, status = 'healthy', last_checked_at = datetime('now')
-    WHERE id = ?
-  `).run(access.encrypted, access.iv, access.authTag, key.id);
-  return String(tokenData.access_token);
 }
 
 interface FallbackRow {
@@ -144,12 +50,31 @@ export interface RouteResult {
   keyId: number;
   platform: string;
   displayName: string;
+  capacityReservationId?: string;
   oauth?: {
     accountId: number;
     provider: string;
     accountHint?: string | null;
     metadata?: Record<string, unknown>;
   };
+}
+
+export class RoutePreparationError extends ProviderError {
+  readonly failedRoute: RouteResult;
+
+  constructor(error: unknown, failedRoute: RouteResult) {
+    const upstream = error instanceof ProviderError ? error : null;
+    super(error instanceof Error ? error.message : 'Provider credential preparation failed.', {
+      statusCode: upstream?.statusCode ?? undefined,
+      // Credential refresh/preparation failures belong to this route. Even a
+      // definitive invalid_grant must allow a different credential or model.
+      retryable: true,
+      code: upstream?.code ?? 'route_preparation_failed',
+    });
+    this.name = 'RoutePreparationError';
+    this.failedRoute = failedRoute;
+    this.cause = error;
+  }
 }
 
 function oauthOptionsForKey(db: ReturnType<typeof getDb>, key: KeyRow): RouteResult['oauth'] {
@@ -175,6 +100,10 @@ const roundRobinIndex = new Map<string, number>();
 // ── Dynamic priority: track 429s per model and demote accordingly ──
 // Key: model_db_id → { count, lastHit, penalty }
 const rateLimitPenalties = new Map<number, { count: number; lastHit: number; penalty: number }>();
+const routeFailureCircuits = new Map<number, { count: number; lastFailure: number; until: number }>();
+const ROUTE_FAILURE_RESET_MS = 5 * 60 * 1000;
+const ROUTE_FAILURE_BASE_COOLDOWN_MS = 15_000;
+const ROUTE_FAILURE_MAX_COOLDOWN_MS = 2 * 60 * 1000;
 
 // Penalty decays over time so models recover
 const PENALTY_PER_429 = 3;        // each 429 adds this many priority positions
@@ -201,6 +130,7 @@ export function recordRateLimitHit(modelDbId: number) {
  * Record a success for a model — reduces its penalty so it rises back up.
  */
 export function recordSuccess(modelDbId: number) {
+  routeFailureCircuits.delete(modelDbId);
   const existing = rateLimitPenalties.get(modelDbId);
   if (existing) {
     existing.penalty = Math.max(0, existing.penalty - 1);
@@ -208,6 +138,41 @@ export function recordSuccess(modelDbId: number) {
       rateLimitPenalties.delete(modelDbId);
     }
   }
+}
+
+/** A short, non-rate-limit circuit for repeatedly broken upstream routes. */
+export function recordRouteFailure(modelDbId: number): void {
+  const now = Date.now();
+  const previous = routeFailureCircuits.get(modelDbId);
+  const count = previous && now - previous.lastFailure < ROUTE_FAILURE_RESET_MS
+    ? previous.count + 1
+    : 1;
+  // One failure may be request-specific. Open only after a repeated failure,
+  // then back off independently from quota/rate-limit metrics.
+  const cooldown = count < 2
+    ? 0
+    : Math.min(ROUTE_FAILURE_BASE_COOLDOWN_MS * (2 ** Math.min(count - 2, 3)), ROUTE_FAILURE_MAX_COOLDOWN_MS);
+  routeFailureCircuits.set(modelDbId, { count, lastFailure: now, until: now + cooldown });
+}
+
+export function getRouteFailureCircuit(modelDbId: number): { count: number; until: number } | null {
+  const entry = routeFailureCircuits.get(modelDbId);
+  if (!entry) return null;
+  const now = Date.now();
+  if (now - entry.lastFailure >= ROUTE_FAILURE_RESET_MS) {
+    routeFailureCircuits.delete(modelDbId);
+    return null;
+  }
+  return { count: entry.count, until: entry.until };
+}
+
+export function getAllRouteFailureCircuits(): Array<{ modelDbId: number; count: number; until: number }> {
+  const result: Array<{ modelDbId: number; count: number; until: number }> = [];
+  for (const modelDbId of routeFailureCircuits.keys()) {
+    const entry = getRouteFailureCircuit(modelDbId);
+    if (entry) result.push({ modelDbId, ...entry });
+  }
+  return result;
 }
 
 /**
@@ -260,6 +225,7 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
  * @param preferredModelDbId - try this model first (sticky session)
  */
 export type RouteModelAccessFilter = (model: { id: number; platform: string; modelId: string; displayName: string }) => boolean;
+export type RouteKeyAccessFilter = (key: { id: number; platform: string; source?: string; oauthProvider?: string | null }) => boolean;
 
 export function routeRequest(
   estimatedTokens = 1000,
@@ -267,6 +233,7 @@ export function routeRequest(
   preferredModelDbId?: number,
   strictPreferredModel = false,
   accessFilter?: RouteModelAccessFilter,
+  keyAccessFilter?: RouteKeyAccessFilter,
 ): RouteResult {
   const db = getDb();
 
@@ -274,14 +241,14 @@ export function routeRequest(
   const fallbackChain = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled
     FROM fallback_config fc
-    ORDER BY fc.priority ASC
+    ORDER BY fc.priority ASC, fc.model_db_id ASC
   `).all() as FallbackRow[];
 
   // Apply dynamic penalties: sort by (base priority + penalty)
   const sortedChain = fallbackChain.map(entry => ({
     ...entry,
     effectivePriority: entry.priority + getPenalty(entry.model_db_id),
-  })).sort((a, b) => a.effectivePriority - b.effectivePriority);
+  })).sort((a, b) => a.effectivePriority - b.effectivePriority || a.priority - b.priority || a.model_db_id - b.model_db_id);
 
   // Sticky session: move preferred model to front of chain. Explicit model
   // requests use strict mode so provider errors/rate limits never silently
@@ -305,9 +272,16 @@ export function routeRequest(
 
   let sawDeniedRouteableCandidate = false;
   let sawAllowedRouteableCandidate = false;
+  let sawTemporaryCapacityBlock = false;
+  let sawCredentialFailure = false;
 
   for (const entry of sortedChain) {
     if (!entry.enabled) continue;
+    const failureCircuit = getRouteFailureCircuit(entry.model_db_id);
+    if (!strictPreferredModel && failureCircuit && failureCircuit.until > Date.now()) {
+      sawTemporaryCapacityBlock = true;
+      continue;
+    }
 
     // Get model details
     const model = db.prepare('SELECT * FROM models WHERE id = ? AND enabled = 1').get(entry.model_db_id) as ModelRow | undefined;
@@ -319,19 +293,41 @@ export function routeRequest(
 
     // Get enabled keys that have not already failed validation or decryption.
     const keys = db.prepare(
-      `SELECT ak.*
+      `SELECT ak.*, oa.provider AS oauth_provider
          FROM api_keys ak
          LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
         WHERE ak.platform = ?
           AND ak.enabled = 1
-          AND (ak.status IN ('healthy', 'unknown') OR ak.source = 'oauth')
+          AND (
+            ak.status IN ('healthy', 'unknown')
+            OR (ak.source = 'oauth' AND ak.status NOT IN ('invalid', 'error'))
+          )
           AND (
             ak.source != 'oauth'
-            OR (oa.enabled = 1 AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1)
-          )`
-    ).all(model.platform) as KeyRow[];
+            OR (
+              oa.enabled = 1
+              AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1
+              AND (
+                NOT EXISTS (SELECT 1 FROM oauth_account_models known WHERE known.oauth_account_id = ak.oauth_account_id)
+                OR EXISTS (
+                  SELECT 1 FROM oauth_account_models eligible
+                   WHERE eligible.oauth_account_id = ak.oauth_account_id
+                     AND eligible.platform = ak.platform
+                     AND eligible.model_id = ?
+                     AND eligible.supported = 1
+                )
+              )
+            )
+          )
+        ORDER BY CASE ak.status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
+                 ak.id ASC`
+    ).all(model.platform, model.model_id) as KeyRow[];
 
-    if (keys.length === 0) continue;
+    const eligibleKeys = keyAccessFilter
+      ? keys.filter(key => keyAccessFilter({ id: key.id, platform: key.platform, source: key.source, oauthProvider: key.oauth_provider }))
+      : keys;
+
+    if (eligibleKeys.length === 0) continue;
 
     if (accessFilter && !accessFilter({ id: model.id, platform: model.platform, modelId: model.model_id, displayName: model.display_name })) {
       sawDeniedRouteableCandidate = true;
@@ -352,23 +348,38 @@ export function routeRequest(
     const rrKey = `${model.platform}:${model.model_id}`;
     let idx = roundRobinIndex.get(rrKey) ?? 0;
 
-    for (let attempt = 0; attempt < keys.length; attempt++) {
-      const key = keys[idx % keys.length];
+    for (let attempt = 0; attempt < eligibleKeys.length; attempt++) {
+      const key = eligibleKeys[idx % eligibleKeys.length];
       idx++;
 
       const skipId = `${model.platform}:${model.model_id}:${key.id}`;
-      if (skipKeys?.has(skipId)) continue;
+      const routeSkipId = `${model.platform}:${model.model_id}:*`;
+      const credentialSkipId = `${model.platform}:*:${key.id}`;
+      if (skipKeys?.has(skipId) || skipKeys?.has(routeSkipId) || skipKeys?.has(credentialSkipId)) {
+        sawTemporaryCapacityBlock = true;
+        continue;
+      }
 
       // Check cooldown (from previous 429s)
-      if (isOnCooldown(model.platform, model.model_id, key.id)) continue;
+      if (isOnCooldown(model.platform, model.model_id, key.id)) {
+        sawTemporaryCapacityBlock = true;
+        continue;
+      }
 
-      if (!canMakeRequest(model.platform, model.model_id, key.id, limits)) continue;
-      if (!canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits)) continue;
+      if (!canMakeRequest(model.platform, model.model_id, key.id, limits)) {
+        sawTemporaryCapacityBlock = true;
+        continue;
+      }
+      if (!canUseTokens(model.platform, model.model_id, key.id, estimatedTokens, limits)) {
+        sawTemporaryCapacityBlock = true;
+        continue;
+      }
 
       let decryptedKey: string;
       try {
         decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
       } catch {
+        sawCredentialFailure = true;
         db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
           .run(key.id);
         continue;
@@ -404,8 +415,12 @@ export function routeRequest(
     throw err;
   }
 
-  const err = new Error('All models exhausted. Add more API keys or wait for rate limits to reset.') as any;
-  err.status = 429;
+  const noEligibleRoute = !sawAllowedRouteableCandidate || (sawCredentialFailure && !sawTemporaryCapacityBlock);
+  const err = new Error(noEligibleRoute
+    ? 'No eligible route is currently available. Enable a model and add a healthy provider credential.'
+    : 'All eligible routes are temporarily unavailable because of configured limits or cooldowns.') as any;
+  err.status = noEligibleRoute ? 503 : 429;
+  err.code = noEligibleRoute ? (sawCredentialFailure ? 'no_usable_credentials' : 'no_eligible_route') : 'route_capacity_exhausted';
   throw err;
 }
 
@@ -415,12 +430,43 @@ export async function routeRequestAsync(
   preferredModelDbId?: number,
   strictPreferredModel = false,
   accessFilter?: RouteModelAccessFilter,
+  signal?: AbortSignal,
+  keyAccessFilter?: RouteKeyAccessFilter,
 ): Promise<RouteResult> {
-  const route = routeRequest(estimatedTokens, skipKeys, preferredModelDbId, strictPreferredModel, accessFilter);
-  const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
-  if (key?.oauth_account_id) {
-    const refreshed = await refreshOAuthKeyIfNeeded(key);
-    if (refreshed) return { ...route, apiKey: refreshed, oauth: oauthOptionsForKey(getDb(), key) };
+  const selectionSkips = skipKeys ?? new Set<string>();
+  const preparationFailures = new Map<string, number>();
+  let lastPreparationError: RoutePreparationError | null = null;
+  for (let preparationAttempt = 0; preparationAttempt < 32; preparationAttempt++) {
+    let route: RouteResult;
+    try {
+      route = routeRequest(estimatedTokens, selectionSkips, preferredModelDbId, strictPreferredModel, accessFilter, keyAccessFilter);
+    } catch (selectionError) {
+      if (lastPreparationError) throw lastPreparationError;
+      throw selectionError;
+    }
+    const capacityReservationId = reserveProviderCapacity(route.platform, route.modelId, route.keyId, estimatedTokens);
+    const reservedRoute = { ...route, capacityReservationId };
+    try {
+      const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
+      if (key?.oauth_account_id) {
+        const account = await ensureFreshOAuthAccount(getDb(), key.oauth_account_id, signal);
+        const freshAccessToken = decrypt(account.encrypted_access_token, account.access_iv, account.access_auth_tag);
+        return { ...reservedRoute, apiKey: freshAccessToken, oauth: oauthOptionsForKey(getDb(), key) };
+      }
+      return reservedRoute;
+    } catch (error) {
+      releaseProviderCapacity(capacityReservationId);
+      if (signal?.aborted) throw error;
+      selectionSkips.add(`${route.platform}:*:${route.keyId}`);
+      const routeId = `${route.platform}:${route.modelId}`;
+      const failures = (preparationFailures.get(routeId) ?? 0) + 1;
+      preparationFailures.set(routeId, failures);
+      if (failures >= 8) selectionSkips.add(`${routeId}:*`);
+      lastPreparationError = new RoutePreparationError(error, reservedRoute);
+    }
   }
-  return route;
+  throw lastPreparationError ?? new ProviderError('OAuth route preparation budget was exhausted.', {
+    retryable: true,
+    code: 'route_preparation_exhausted',
+  });
 }

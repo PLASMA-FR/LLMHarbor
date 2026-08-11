@@ -1,28 +1,108 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
-jobs:
-  test:
-    name: Test & build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
-      - uses: actions/setup-node@v4
+jobs:
+  scripts:
+    name: Validate command-line scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '20'
+          persist-credentials: false
+
+      - name: Validate Bash scripts
+        run: |
+          bash -n bin/llmharbor install.sh install-macos.sh
+          shellcheck bin/llmharbor install.sh install-macos.sh
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('bin/llmharbor.ps1', 'install.ps1')) {
+            [void][scriptblock]::Create((Get-Content -LiteralPath $file -Raw))
+          }
+
+  scripts-native:
+    name: Native CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check macOS Bash entry points
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          /bin/bash -n bin/llmharbor install.sh install-macos.sh
+          /bin/bash bin/llmharbor help >/dev/null
+
+      - name: Check Windows PowerShell entry point
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('bin/llmharbor.ps1', 'install.ps1')) {
+            [void][scriptblock]::Create((Get-Content -LiteralPath $file -Raw))
+          }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File bin/llmharbor.ps1 help *> $null
+          if ($LASTEXITCODE -ne 0) { throw "llmharbor help exited with $LASTEXITCODE" }
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File bin/llmharbor.ps1 definitely-not-a-command *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'An unknown command must return a non-zero exit code' }
+
+  test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22.12.0', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
+
+      - name: Lint dashboard
+        run: npm run lint
 
       - name: Run tests
         run: npm test
 
       - name: Build workspaces
         run: npm run build
+
+      - name: Validate static website script
+        if: matrix.node-version == '24'
+        run: node --check website/script.js
+
+      - name: Audit production dependencies
+        if: matrix.node-version == '24'
+        run: npm audit --omit=dev --audit-level=high

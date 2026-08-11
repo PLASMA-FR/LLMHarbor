@@ -2,7 +2,9 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getAllPenalties } from '../services/router.js';
+import { getAllPenalties, getAllRouteFailureCircuits } from '../services/router.js';
+import { canMakeRequest, canUseTokens, isOnCooldown } from '../services/ratelimit.js';
+import { hasProvider } from '../providers/index.js';
 
 export const fallbackRouter = Router();
 
@@ -10,36 +12,98 @@ export const fallbackRouter = Router();
 fallbackRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT fc.model_db_id, fc.priority, fc.enabled,
+    SELECT fc.model_db_id, fc.priority, fc.enabled, m.enabled AS model_enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
-           m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
+           m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit,
            m.monthly_token_budget
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
-    ORDER BY fc.priority ASC
+    ORDER BY fc.priority ASC, fc.model_db_id ASC
   `).all() as any[];
 
-  // Count enabled keys per platform
-  const keyCounts = db.prepare(`
-    SELECT platform, COUNT(*) as count
-    FROM api_keys WHERE enabled = 1
-    GROUP BY platform
-  `).all() as { platform: string; count: number }[];
-  const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
+  const keysForModel = db.prepare(`
+    SELECT ak.id, ak.enabled, ak.status, ak.source,
+           oa.enabled AS oauth_enabled, oa.metadata_json,
+           CASE WHEN ak.oauth_account_id IS NULL THEN 0 ELSE (
+             SELECT COUNT(*) FROM oauth_account_models known
+              WHERE known.oauth_account_id = ak.oauth_account_id
+           ) END AS oauth_known_models,
+           CASE WHEN ak.oauth_account_id IS NULL THEN 1 ELSE EXISTS (
+             SELECT 1 FROM oauth_account_models eligible
+              WHERE eligible.oauth_account_id = ak.oauth_account_id
+                AND eligible.platform = ak.platform
+                AND eligible.model_id = ?
+                AND eligible.supported = 1
+           ) END AS oauth_model_eligible
+      FROM api_keys ak
+      LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
+     WHERE ak.platform = ?
+  `);
+  const customEndpointState = db.prepare('SELECT enabled FROM custom_endpoints WHERE platform = ?');
 
   // Get current dynamic penalties
   const penalties = getAllPenalties();
   const penaltyMap = new Map(penalties.map(p => [p.modelDbId, p]));
+  const failureCircuitMap = new Map(getAllRouteFailureCircuits().map(circuit => [circuit.modelDbId, circuit]));
 
   res.json(rows.map(r => {
     const penalty = penaltyMap.get(r.model_db_id);
+    const failureCircuit = failureCircuitMap.get(r.model_db_id);
+    const configuredKeys = keysForModel.all(r.model_id, r.platform) as any[];
+    const enabledKeys = configuredKeys.filter(key => key.enabled === 1);
+    const routeableKeys = enabledKeys.filter(key => {
+      if (!(key.status === 'healthy' || key.status === 'unknown'
+        || (key.source === 'oauth' && key.status !== 'invalid' && key.status !== 'error'))) return false;
+      if (key.source !== 'oauth') return true;
+      let metadata: Record<string, unknown> = {};
+      try { metadata = key.metadata_json ? JSON.parse(key.metadata_json) : {}; } catch {}
+      return key.oauth_enabled === 1
+        && metadata.oauthNeedsReconnect !== true
+        && (key.oauth_known_models === 0 || key.oauth_model_eligible === 1);
+    });
+    const activeCooldowns = routeableKeys.filter(key => isOnCooldown(r.platform, r.model_id, key.id)).length;
+    const limits = { rpm: r.rpm_limit, rpd: r.rpd_limit, tpm: r.tpm_limit, tpd: r.tpd_limit };
+    const availableKeys = routeableKeys.filter(key => (
+      !isOnCooldown(r.platform, r.model_id, key.id)
+      && canMakeRequest(r.platform, r.model_id, key.id, limits)
+      && canUseTokens(r.platform, r.model_id, key.id, 1, limits)
+    ));
+    const endpoint = customEndpointState.get(r.platform) as { enabled: number } | undefined;
+    const providerAvailable = hasProvider(r.platform);
+    const routeableKeyCount = routeableKeys.length;
+    const skipReason = r.enabled !== 1
+      ? 'Disabled in fallback configuration'
+      : r.model_enabled !== 1
+        ? 'Model is disabled'
+        : endpoint?.enabled === 0
+          ? 'Custom endpoint is disabled'
+            : !providerAvailable
+              ? 'Provider adapter is unavailable'
+            : failureCircuit && failureCircuit.until > Date.now()
+              ? 'Temporarily isolated after repeated upstream failures'
+            : configuredKeys.length === 0
+              ? 'No configured credential'
+              : enabledKeys.length === 0
+                ? 'All credentials are disabled'
+                : routeableKeyCount === 0
+                  ? 'No healthy credential supports this model'
+                  : availableKeys.length === 0 && activeCooldowns >= routeableKeyCount
+                    ? 'All routeable credentials are cooling down'
+                    : availableKeys.length === 0
+                      ? 'All routeable credentials are at a configured quota limit'
+                      : null;
     return {
       modelDbId: r.model_db_id,
       priority: r.priority,
       effectivePriority: r.priority + (penalty?.penalty ?? 0),
       penalty: penalty?.penalty ?? 0,
       rateLimitHits: penalty?.count ?? 0,
+      routeFailureCount: failureCircuit?.count ?? 0,
+      routeFailureUntil: failureCircuit?.until ? new Date(failureCircuit.until).toISOString() : null,
       enabled: r.enabled === 1,
+      modelEnabled: r.model_enabled === 1,
+      eligible: skipReason === null,
+      skipReason,
       platform: r.platform,
       modelId: r.model_id,
       displayName: r.display_name,
@@ -49,16 +113,21 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rpmLimit: r.rpm_limit,
       rpdLimit: r.rpd_limit,
       monthlyTokenBudget: r.monthly_token_budget,
-      keyCount: keyCountMap.get(r.platform) ?? 0,
+      keyCount: routeableKeyCount,
+      configuredKeyCount: configuredKeys.length,
+      enabledKeyCount: enabledKeys.length,
+      routeableKeyCount,
+      availableKeyCount: availableKeys.length,
+      activeCooldowns,
     };
   }));
 });
 
 const updateSchema = z.array(z.object({
-  modelDbId: z.number(),
-  priority: z.number(),
+  modelDbId: z.number().int().positive(),
+  priority: z.number().int().positive(),
   enabled: z.boolean(),
-}));
+}).strict()).min(1);
 
 // Update fallback chain (full replace)
 fallbackRouter.put('/', (req: Request, res: Response) => {
@@ -69,6 +138,20 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
   }
 
   const db = getDb();
+  const modelIds = parsed.data.map(entry => entry.modelDbId);
+  const priorities = parsed.data.map(entry => entry.priority);
+  if (new Set(modelIds).size !== modelIds.length || new Set(priorities).size !== priorities.length) {
+    res.status(400).json({ error: { message: 'Fallback entries must have unique model IDs and priorities.', type: 'invalid_request_error', code: 'duplicate_fallback_entry' } });
+    return;
+  }
+  const placeholders = modelIds.map(() => '?').join(', ');
+  const known = db.prepare(`SELECT model_db_id FROM fallback_config WHERE model_db_id IN (${placeholders})`).all(...modelIds) as Array<{ model_db_id: number }>;
+  if (known.length !== modelIds.length) {
+    const knownIds = new Set(known.map(row => row.model_db_id));
+    const unknown = modelIds.filter(id => !knownIds.has(id));
+    res.status(400).json({ error: { message: `Unknown fallback model ID(s): ${unknown.join(', ')}`, type: 'invalid_request_error', code: 'unknown_fallback_model' } });
+    return;
+  }
   const update = db.prepare(`
     UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?
   `);
@@ -100,7 +183,7 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const models = db.prepare(`SELECT m.id FROM models m ORDER BY ${orderBy}`).all() as { id: number }[];
+  const models = db.prepare(`SELECT m.id FROM models m ORDER BY ${orderBy}, m.id ASC`).all() as { id: number }[];
 
   const update = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
   const reorder = db.transaction(() => {
@@ -159,7 +242,7 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
     SELECT
       COALESCE(SUM(input_tokens + output_tokens), 0) as total_used
     FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
+    WHERE is_final = 1 AND created_at >= datetime('now', 'start of month')
   `).get() as { total_used: number };
 
   res.json({

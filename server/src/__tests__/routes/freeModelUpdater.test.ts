@@ -100,6 +100,11 @@ describe('free model updater routes', () => {
     expect(enabled.body.refreshIntervalHours).toBe(2);
     expect(enabled.body.selectedProviders).toEqual(['openrouter']);
 
+    const clearedWhileEnabled = await request(app, 'PUT', '/api/settings/free-model-updater/providers', { selectedProviders: [] });
+    expect(clearedWhileEnabled.status).toBe(409);
+    expect(clearedWhileEnabled.body.error.code).toBe('updater_requires_provider');
+    expect(freeModelUpdater.getStatus().selectedProviders).toEqual(['openrouter']);
+
     const disabled = await request(app, 'POST', '/api/settings/free-model-updater/disable');
     expect(disabled.status).toBe(200);
     expect(disabled.body.enabled).toBe(false);

@@ -3,7 +3,7 @@ import { cn } from '@/lib/utils'
 export function HarborLogo({ className, showWordmark = false }: { className?: string; showWordmark?: boolean }) {
   return (
     <div className={cn('flex items-center gap-3', className)}>
-      <svg className="size-10 shrink-0" viewBox="0 0 72 72" role="img" aria-label="LLMHarbor anchor logo">
+      <svg className="size-9 shrink-0" viewBox="0 0 72 72" aria-hidden="true">
         <rect x="4" y="4" width="64" height="64" rx="14" fill="#F4F6F3" />
         <rect x="4.5" y="4.5" width="63" height="63" rx="13.5" fill="none" stroke="#D7DED8" />
         <path d="M18 46c4.4 7.8 10.4 11.7 18 11.7S49.6 53.8 54 46" fill="none" stroke="#D7DED8" strokeWidth="7" strokeLinecap="round" />
@@ -20,7 +20,7 @@ export function HarborLogo({ className, showWordmark = false }: { className?: st
       {showWordmark && (
         <div className="leading-none">
           <span className="block text-[15px] font-semibold tracking-[-0.02em]">LLMHarbor</span>
-          <span className="mt-1 block text-[10px] font-medium text-muted-foreground">Local LLM routing</span>
+          <span className="mt-1 block text-[10px] font-medium text-muted-foreground">Control plane</span>
         </div>
       )}
     </div>

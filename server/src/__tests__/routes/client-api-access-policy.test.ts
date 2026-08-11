@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vite
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { getDb, getUnifiedApiKey, initDb } from '../../db/index.js';
+import { encrypt } from '../../lib/crypto.js';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0);
@@ -124,6 +125,30 @@ describe('client API access policies', () => {
     expect(allowed.body.data[0].id).toBe('auto');
   });
 
+  it('runs the dashboard Playground under the oldest enabled client key policy', async () => {
+    await addProviderKey(app, 'groq', 'gsk_playground_policy');
+    const oldest = await createLocalKey(app, 'playground policy owner');
+    await createLocalKey(app, 'newer unrestricted key');
+
+    const patched = await request(app, 'PATCH', `/api/settings/api-keys/${oldest.id}/access-policy`, {
+      routes: [{ route: 'v1.chat.completions', enabled: false }],
+    });
+    expect(patched.status).toBe(200);
+
+    const denied = await request(app, 'POST', '/api/playground/v1/chat/completions', {
+      model: 'auto',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.body.error.code).toBe('local_api_route_denied');
+
+    const disabled = await request(app, 'PATCH', `/api/settings/api-keys/${oldest.id}`, { enabled: false });
+    expect(disabled.status).toBe(200);
+    const available = await request(app, 'GET', '/api/playground/v1/models');
+    expect(available.status).toBe(200);
+    expect(available.body.data[0].id).toBe('auto');
+  });
+
   it('filters denied models from /v1/models and blocks explicit chat requests before upstream routing', async () => {
     await addProviderKey(app, 'google', 'google-policy-test');
     const local = await createLocalKey(app, 'no flash key');
@@ -154,6 +179,104 @@ describe('client API access policies', () => {
     expect(denied.status).toBe(403);
     expect(denied.body.error.code).toBe('model_access_denied');
     expect(upstreamCalled).toBe(false);
+  });
+
+  it('selects an allowed provider when an unprefixed model id exists on multiple providers', async () => {
+    const db = getDb();
+    const sharedModelId = 'duplicate-policy-route-test';
+    const insertModel = db.prepare(`
+      INSERT OR IGNORE INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled
+      ) VALUES (?, ?, ?, 1, 1, 'Test', 1)
+    `);
+    insertModel.run('cerebras', sharedModelId, 'Denied duplicate candidate');
+    insertModel.run('sambanova', sharedModelId, 'Allowed duplicate candidate');
+    const rows = db.prepare('SELECT id, platform FROM models WHERE model_id = ? ORDER BY id').all(sharedModelId) as Array<{ id: number; platform: string }>;
+    for (const row of rows) {
+      db.prepare('INSERT OR REPLACE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)')
+        .run(row.id, row.platform === 'cerebras' ? 1 : 2);
+    }
+    await addProviderKey(app, 'cerebras', 'csk-duplicate-policy-denied');
+    await addProviderKey(app, 'sambanova', 'samba-duplicate-policy-allowed');
+    const local = await createLocalKey(app, 'duplicate model policy');
+    const patched = await request(app, 'PATCH', `/api/settings/api-keys/${local.id}/access-policy`, {
+      platforms: [{ platform: 'cerebras', enabled: false }],
+    });
+    expect(patched.status).toBe(200);
+
+    let cerebrasCalled = false;
+    let sambaCalled = false;
+    const originalFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const target = String(url);
+      if (target.includes('api.cerebras.ai')) cerebrasCalled = true;
+      if (target.includes('api.sambanova.ai')) {
+        sambaCalled = true;
+        return Response.json({
+          id: 'duplicate-policy', object: 'chat.completion', created: 1, model: sharedModelId,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'allowed duplicate route' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+        });
+      }
+      return originalFetch(url, init);
+    });
+
+    const result = await request(app, 'POST', '/v1/chat/completions', {
+      model: sharedModelId,
+      messages: [{ role: 'user', content: 'choose allowed provider' }],
+    }, authHeaders(local.key));
+    expect(result.status).toBe(200);
+    expect(result.headers.get('x-routed-via')).toBe(`sambanova/${sharedModelId}`);
+    expect(cerebrasCalled).toBe(false);
+    expect(sambaCalled).toBe(true);
+  });
+
+  it('ignores a browser-OAuth duplicate that cannot preserve tool semantics', async () => {
+    const db = getDb();
+    const sharedModelId = 'duplicate-tool-route-test';
+    const insertModel = db.prepare(`
+      INSERT OR IGNORE INTO models (
+        platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled
+      ) VALUES (?, ?, ?, 1, 1, 'Test', 1)
+    `);
+    insertModel.run('openai', sharedModelId, 'Browser duplicate (ChatGPT browser account)');
+    insertModel.run('groq', sharedModelId, 'Tool-capable API duplicate');
+    const rows = db.prepare('SELECT id FROM models WHERE model_id = ?').all(sharedModelId) as Array<{ id: number }>;
+    for (const [index, row] of rows.entries()) {
+      db.prepare('INSERT OR REPLACE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(row.id, index + 1);
+    }
+    const oauthToken = encrypt('browser-duplicate-oauth-token');
+    const account = db.prepare(`
+      INSERT INTO oauth_accounts (provider, label, encrypted_access_token, access_iv, access_auth_tag, metadata_json, enabled)
+      VALUES ('openai', 'Browser duplicate', ?, ?, ?, '{}', 1)
+    `).run(oauthToken.encrypted, oauthToken.iv, oauthToken.authTag);
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('openai', 'Browser duplicate', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(oauthToken.encrypted, oauthToken.iv, oauthToken.authTag, Number(account.lastInsertRowid));
+    await addProviderKey(app, 'groq', 'gsk-tool-capable-duplicate');
+    const local = await createLocalKey(app, 'tool-capable duplicate selection');
+
+    let groqCalled = false;
+    const originalFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      if (!String(url).includes('api.groq.com/openai/v1/chat/completions')) return originalFetch(url, init);
+      groqCalled = true;
+      return Response.json({
+        id: 'duplicate-tool', object: 'chat.completion', created: 1, model: sharedModelId,
+        choices: [{ index: 0, message: { role: 'assistant', content: 'tool-capable route' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+      });
+    });
+
+    const result = await request(app, 'POST', '/v1/chat/completions', {
+      model: sharedModelId,
+      messages: [{ role: 'user', content: 'use a tool-capable route' }],
+      tools: [{ type: 'function', function: { name: 'ping', parameters: { type: 'object', properties: {} } } }],
+    }, authHeaders(local.key));
+    expect(result.status).toBe(200);
+    expect(result.headers.get('x-routed-via')).toBe(`groq/${sharedModelId}`);
+    expect(groqCalled).toBe(true);
   });
 
   it('can deny an entire provider endpoint while leaving the local key enabled', async () => {

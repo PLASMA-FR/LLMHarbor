@@ -4,7 +4,8 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@llmharbor/shared/types.js';
-import { BaseProvider, type CompletionOptions, type ProviderCatalogModel } from './base.js';
+import { BaseProvider, ProviderError, ProviderProtocolError, type CompletionOptions, type ProviderCatalogModel } from './base.js';
+import { fetchPinnedCustomEndpoint } from '../lib/urlSecurity.js';
 
 function catalogRows(body: any): any[] {
   if (Array.isArray(body)) return body;
@@ -54,6 +55,7 @@ export class OpenAICompatProvider extends BaseProvider {
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
   private readonly modelsUrl?: string;
+  private readonly redirect: 'follow' | 'error';
   /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted
    * inference (llama.cpp / vLLM on CPU) can take 30-120s for long prompts. Default 15000. */
   readonly timeoutMs: number;
@@ -66,6 +68,8 @@ export class OpenAICompatProvider extends BaseProvider {
     validateUrl?: string;
     modelsUrl?: string;
     timeoutMs?: number;
+    /** Custom endpoints must not redirect into a network location that was not validated. */
+    allowRedirects?: boolean;
   }) {
     super();
     this.platform = opts.platform;
@@ -75,15 +79,29 @@ export class OpenAICompatProvider extends BaseProvider {
     this.validateUrl = opts.validateUrl;
     this.modelsUrl = opts.modelsUrl;
     this.timeoutMs = opts.timeoutMs ?? 15000;
+    this.redirect = opts.allowRedirects === false ? 'error' : 'follow';
   }
 
   private endpoint(path: string): string {
     return `${this.baseUrl}${path}`;
   }
 
-  async listModels(apiKey: string): Promise<ProviderCatalogModel[]> {
-    const res = await this.fetchWithTimeout(this.modelsUrl ?? this.endpoint('/models'), {
+  private fetchEndpoint(url: string, init: RequestInit, headersTimeoutMs: number): Promise<Response> {
+    return this.fetchWithTimeout(
+      url,
+      init,
+      headersTimeoutMs,
+      Math.max(headersTimeoutMs, 120_000),
+      this.redirect === 'error' ? fetchPinnedCustomEndpoint : fetch,
+    );
+  }
+
+  async listModels(apiKey: string, signal?: AbortSignal): Promise<ProviderCatalogModel[]> {
+    const url = this.modelsUrl ?? this.endpoint('/models');
+    const res = await this.fetchEndpoint(url, {
       method: 'GET',
+      redirect: this.redirect,
+      signal,
       headers: {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         ...this.extraHeaders,
@@ -91,8 +109,10 @@ export class OpenAICompatProvider extends BaseProvider {
     }, 10000);
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`${this.name} model catalog error ${res.status}: ${text.slice(0, 240) || res.statusText}`);
+      // Do not retain an arbitrary upstream response body. Catalog failures are
+      // surfaced in updater state rendered by the dashboard.
+      await res.body?.cancel().catch(() => {});
+      throw new ProviderError(`${this.name} model catalog returned HTTP ${res.status}.`, { statusCode: res.status });
     }
 
     const body = await res.json() as any;
@@ -126,8 +146,11 @@ export class OpenAICompatProvider extends BaseProvider {
     if (this.platform === 'openai' && options?.oauth?.provider === 'openai') {
       return this.chatGptSubscriptionCompletion(apiKey, messages, modelId, options);
     }
-    const res = await this.fetchWithTimeout(this.endpoint('/chat/completions'), {
+    const url = this.endpoint('/chat/completions');
+    const res = await this.fetchEndpoint(url, {
       method: 'POST',
+      redirect: this.redirect,
+      signal: options?.signal,
       headers: {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         'Content-Type': 'application/json',
@@ -147,11 +170,14 @@ export class OpenAICompatProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw new ProviderError(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
     }
 
-    const data = await res.json() as ChatCompletionResponse;
-    normalizeChoices(data);
+    const raw = await res.json().catch((error: any) => {
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') throw error;
+      throw new ProviderProtocolError(`${this.name} returned malformed JSON.`);
+    });
+    const data = normalizeOpenAICompatibleResponse(raw, this.name, modelId, () => this.makeId());
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
   }
@@ -166,8 +192,11 @@ export class OpenAICompatProvider extends BaseProvider {
       yield* this.streamChatGptSubscriptionCompletion(apiKey, messages, modelId, options);
       return;
     }
-    const res = await this.fetchWithTimeout(this.endpoint('/chat/completions'), {
+    const url = this.endpoint('/chat/completions');
+    const res = await this.fetchEndpoint(url, {
       method: 'POST',
+      redirect: this.redirect,
+      signal: options?.signal,
       headers: {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         'Content-Type': 'application/json',
@@ -183,55 +212,136 @@ export class OpenAICompatProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
         stream: true,
+        stream_options: options?.stream_options,
       }),
     }, this.timeoutMs);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw new ProviderError(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
     }
 
     const reader = res.body?.getReader();
-    if (!reader) throw new Error('No response body');
+    if (!reader) throw new ProviderProtocolError(`${this.name} returned no streaming response body.`);
 
     const decoder = new TextDecoder();
     let buffer = '';
+    let validFrames = 0;
+    let substantiveFrames = 0;
+    let malformedFrames = 0;
+    let completionId: string | null = null;
+    let completionCreated: number | null = null;
+    let terminalFrames = 0;
+    let sawToolCallDelta = false;
+    const pendingChunks: ChatCompletionChunk[] = [];
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') return;
-        try {
-          yield JSON.parse(data) as ChatCompletionChunk;
-        } catch {
-          // Skip malformed chunks
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trimStart();
+          if (data === '[DONE]') {
+            if (substantiveFrames === 0) {
+              throw new ProviderProtocolError(`${this.name} returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without any completion choices' : 'an empty stream'}.`);
+            }
+            if (malformedFrames > 0) {
+              throw new ProviderProtocolError(`${this.name} returned malformed streaming data.`);
+            }
+            if (terminalFrames === 0) {
+              yield {
+                id: completionId!,
+                object: 'chat.completion.chunk',
+                created: completionCreated!,
+                model: modelId,
+                choices: [{ index: 0, delta: {}, finish_reason: sawToolCallDelta ? 'tool_calls' : 'stop' }],
+              };
+            }
+            return;
+          }
+          let chunk: unknown;
+          try {
+            chunk = JSON.parse(data);
+          } catch {
+            // Tolerate a corrupt frame when later valid frames may still arrive.
+            malformedFrames++;
+            continue;
+          }
+          if (!isOpenAIStreamChunk(chunk)) {
+            malformedFrames++;
+            continue;
+          }
+          validFrames++;
+          completionId ??= typeof (chunk as any).id === 'string' && (chunk as any).id
+            ? (chunk as any).id
+            : this.makeId();
+          completionCreated ??= finiteNonNegative((chunk as any).created) || Math.floor(Date.now() / 1000);
+          const normalized = normalizeOpenAIStreamChunk(chunk, modelId, completionId!, completionCreated!);
+          if (normalized.choices.some(choice => choice.finish_reason !== null)) terminalFrames++;
+          const substantive = hasSubstantiveOpenAIStreamDelta(normalized);
+          if (normalized.choices.some(choice => (choice.delta?.tool_calls?.length ?? 0) > 0)) sawToolCallDelta = true;
+          if (!substantiveFrames && !substantive) {
+            pendingChunks.push(normalized);
+            continue;
+          }
+          if (!substantiveFrames) {
+            for (const pending of pendingChunks) yield pending;
+          }
+          if (substantive) substantiveFrames++;
+          yield normalized;
         }
       }
+      if (substantiveFrames === 0) {
+        throw new ProviderProtocolError(`${this.name} returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without any completion choices' : 'an empty stream'}.`);
+      }
+      if (malformedFrames > 0) {
+        throw new ProviderProtocolError(`${this.name} returned malformed streaming data.`);
+      }
+      if (terminalFrames === 0) throw new ProviderProtocolError(`${this.name} returned a truncated completion stream.`);
+    } finally {
+      try { await reader.cancel(); } catch { /* body already closed */ }
     }
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, signal?: AbortSignal): Promise<boolean> {
     // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
     // health.ts catches them and marks status='error' WITHOUT incrementing
     // the consecutive-failure counter — only confirmed 401/403 disables a key.
     const url = this.validateUrl ?? `${this.baseUrl}/models`;
-    const res = await this.fetchWithTimeout(url, {
+    const res = await this.fetchEndpoint(url, {
       method: 'GET',
+      redirect: this.redirect,
+      signal,
       headers: {
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
         ...this.extraHeaders,
       },
     }, 10000);
-    return res.status !== 401 && res.status !== 403;
+    if (res.status >= 300 && res.status < 400) {
+      await res.body?.cancel().catch(() => {});
+      throw new ProviderError(`${this.name} validation endpoint returned a blocked redirect.`, {
+        statusCode: res.status,
+        retryable: true,
+        code: 'provider_redirect_blocked',
+      });
+    }
+    if (res.status === 401 || res.status === 403) {
+      await res.body?.cancel().catch(() => {});
+      return false;
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      throw new ProviderError(`${this.name} validation endpoint returned HTTP ${res.status}.`, { statusCode: res.status, retryable: true });
+    }
+    await res.body?.cancel().catch(() => {});
+    return true;
   }
 
   private chatGptHeaders(accessToken: string): Record<string, string> {
@@ -246,10 +356,15 @@ export class OpenAICompatProvider extends BaseProvider {
   }
 
   private responsesBody(messages: ChatMessage[], modelId: string, options?: CompletionOptions, stream = false): Record<string, unknown> {
+    const systemInstructions = messages
+      .filter(message => message.role === 'system')
+      .map(normalizeMessageText)
+      .filter(Boolean)
+      .join('\n\n');
     return {
       model: modelId,
-      instructions: 'You are Codex, a precise coding and reasoning assistant. Answer the user directly and concisely unless more detail is needed.',
-      input: messages.map(message => ({
+      instructions: systemInstructions || 'You are Codex, a precise coding and reasoning assistant. Answer the user directly and concisely unless more detail is needed.',
+      input: messages.filter(message => message.role !== 'system').map(message => ({
         role: message.role === 'assistant' ? 'assistant' : 'user',
         content: [{
           type: message.role === 'assistant' ? 'output_text' : 'input_text',
@@ -260,6 +375,7 @@ export class OpenAICompatProvider extends BaseProvider {
       store: false,
       temperature: options?.temperature,
       top_p: options?.top_p,
+      max_output_tokens: options?.max_tokens,
     };
   }
 
@@ -271,20 +387,30 @@ export class OpenAICompatProvider extends BaseProvider {
   ): Promise<ChatCompletionResponse> {
     const res = await this.fetchWithTimeout('https://chatgpt.com/backend-api/codex/responses', {
       method: 'POST',
+      signal: options?.signal,
       headers: this.chatGptHeaders(accessToken),
       body: JSON.stringify(this.responsesBody(messages, modelId, options, true)),
     }, 120000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`);
+      throw new ProviderError(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`, { statusCode: res.status });
     }
-    const text = await collectCodexStreamText(res);
+    const output = await collectCodexStreamText(res);
+    if (!output.text && !output.refusal) throw new ProviderProtocolError('ChatGPT Codex OAuth returned an empty completion stream.');
     return {
       id: this.makeId(),
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: modelId,
-      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: output.text || null,
+          ...(output.refusal ? { refusal: output.refusal } : {}),
+        },
+        finish_reason: output.refusal ? 'content_filter' : 'stop',
+      }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       _routed_via: { platform: this.platform, model: modelId },
     } as ChatCompletionResponse;
@@ -298,52 +424,85 @@ export class OpenAICompatProvider extends BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk> {
     const res = await this.fetchWithTimeout('https://chatgpt.com/backend-api/codex/responses', {
       method: 'POST',
+      signal: options?.signal,
       headers: this.chatGptHeaders(accessToken),
       body: JSON.stringify(this.responsesBody(messages, modelId, options, true)),
     }, 120000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`);
+      throw new ProviderError(`ChatGPT Codex OAuth error ${res.status}: ${(err as any).error?.message ?? (err as any).detail ?? res.statusText}`, { statusCode: res.status });
     }
     const reader = res.body?.getReader();
-    if (!reader) throw new Error('No response body');
+    if (!reader) throw new ProviderProtocolError('ChatGPT Codex OAuth returned no streaming response body.');
     const decoder = new TextDecoder();
     const id = this.makeId();
     let buffer = '';
     const accumulator = new CodexTextAccumulator();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const raw = trimmed.slice(6);
-        if (raw === '[DONE]') return;
-        try {
-          const event = JSON.parse(raw) as any;
-          const text = accumulator.push(event);
-          if (typeof text === 'string' && text.length > 0) {
-            yield {
-              id,
-              object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000),
-              model: modelId,
-              choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
-            };
-          }
-        } catch {}
-      }
-    }
-    yield {
+    let emittedContent = false;
+    let emittedRefusal = false;
+    let malformedFrames = 0;
+    let sawTerminalEvent = false;
+    const terminalChunk = (): ChatCompletionChunk => ({
       id,
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model: modelId,
-      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-    };
+      choices: [{ index: 0, delta: {}, finish_reason: emittedRefusal ? 'content_filter' : 'stop' }],
+    });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const raw = trimmed.slice(5).trimStart();
+          if (raw === '[DONE]') {
+            if (!emittedContent && !emittedRefusal) throw new ProviderProtocolError('ChatGPT Codex OAuth returned an empty completion stream.');
+            if (malformedFrames > 0) throw new ProviderProtocolError('ChatGPT Codex OAuth returned malformed streaming data.');
+            yield terminalChunk();
+            return;
+          }
+          try {
+            const event = JSON.parse(raw) as any;
+            if (event?.type === 'response.completed') sawTerminalEvent = true;
+            const delta = accumulator.push(event);
+            if (delta.content) {
+              emittedContent = true;
+              yield {
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: modelId,
+                choices: [{ index: 0, delta: { content: delta.content }, finish_reason: null }],
+              };
+            }
+            if (delta.refusal) {
+              emittedRefusal = true;
+              yield {
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: modelId,
+                choices: [{ index: 0, delta: { refusal: delta.refusal }, finish_reason: null }],
+              };
+            }
+          } catch (error) {
+            if (error instanceof ProviderProtocolError) throw error;
+            malformedFrames++;
+          }
+        }
+      }
+    } finally {
+      try { await reader.cancel(); } catch { /* body already closed */ }
+    }
+    if (!emittedContent && !emittedRefusal) throw new ProviderProtocolError('ChatGPT Codex OAuth returned an empty completion stream.');
+    if (malformedFrames > 0) throw new ProviderProtocolError('ChatGPT Codex OAuth returned malformed streaming data.');
+    if (!sawTerminalEvent) throw new ProviderProtocolError('ChatGPT Codex OAuth returned a truncated completion stream.');
+    yield terminalChunk();
   }
 }
 
@@ -393,25 +552,37 @@ function extractResponsesText(data: any): string {
 }
 
 class CodexTextAccumulator {
-  private emitted = '';
+  private emittedText = '';
+  private emittedRefusal = '';
 
-  push(event: any): string {
+  push(event: any): { content?: string; refusal?: string } {
+    const result: { content?: string; refusal?: string } = {};
     const candidates = codexEventTextCandidates(event);
     for (const candidate of candidates) {
       if (!candidate.text) continue;
-      const next = candidate.cumulative ? this.diffCumulative(candidate.text) : candidate.text;
+      const next = candidate.cumulative ? this.diffCumulative(candidate.text, 'text') : candidate.text;
       if (!next) continue;
-      this.emitted += next;
-      return next;
+      this.emittedText += next;
+      result.content = next;
+      break;
     }
-    return '';
+    for (const candidate of codexEventRefusalCandidates(event)) {
+      if (!candidate.text) continue;
+      const next = candidate.cumulative ? this.diffCumulative(candidate.text, 'refusal') : candidate.text;
+      if (!next) continue;
+      this.emittedRefusal += next;
+      result.refusal = next;
+      break;
+    }
+    return result;
   }
 
-  private diffCumulative(text: string): string {
-    if (!this.emitted) return text;
-    if (text === this.emitted) return '';
-    if (text.startsWith(this.emitted)) return text.slice(this.emitted.length);
-    if (this.emitted.includes(text)) return '';
+  private diffCumulative(text: string, kind: 'text' | 'refusal'): string {
+    const emitted = kind === 'text' ? this.emittedText : this.emittedRefusal;
+    if (!emitted) return text;
+    if (text === emitted) return '';
+    if (text.startsWith(emitted)) return text.slice(emitted.length);
+    if (emitted.includes(text)) return '';
     return text;
   }
 }
@@ -421,42 +592,248 @@ function codexEventTextCandidates(event: any): Array<{ text: string; cumulative:
   const isDeltaEvent = type.includes('delta');
   const candidates: Array<{ text: string; cumulative: boolean }> = [];
 
-  if (typeof event?.delta === 'string') candidates.push({ text: event.delta, cumulative: false });
-  if (typeof event?.text === 'string') candidates.push({ text: event.text, cumulative: !isDeltaEvent });
-  if (typeof event?.response?.output_text === 'string') candidates.push({ text: event.response.output_text, cumulative: true });
-  if (typeof event?.item?.content?.[0]?.text === 'string') candidates.push({ text: event.item.content[0].text, cumulative: true });
+  // Typed Responses events may carry reasoning or function arguments in the
+  // same `delta` shape. Only output-text events are assistant content. Keep a
+  // narrow untyped fallback for older Codex fixtures/proxies.
+  if (!type || type === 'response.output_text.delta') {
+    if (typeof event?.delta === 'string') candidates.push({ text: event.delta, cumulative: false });
+  }
+  if (!type || type === 'response.output_text.done') {
+    if (typeof event?.text === 'string') candidates.push({ text: event.text, cumulative: !isDeltaEvent });
+  }
+  if (type === 'response.completed' || !type) {
+    if (typeof event?.response?.output_text === 'string') candidates.push({ text: event.response.output_text, cumulative: true });
+  }
 
-  for (const item of event?.response?.output ?? event?.output ?? []) {
+  const output = type === 'response.completed' || !type
+    ? (event?.response?.output ?? event?.output ?? [])
+    : [];
+  for (const item of output) {
     for (const part of item?.content ?? []) {
-      if (typeof part?.text === 'string') candidates.push({ text: part.text, cumulative: true });
+      if ((part?.type === undefined || part?.type === 'output_text') && typeof part?.text === 'string') {
+        candidates.push({ text: part.text, cumulative: true });
+      }
     }
   }
 
   return candidates;
 }
 
-async function collectCodexStreamText(res: Response): Promise<string> {
+function codexEventRefusalCandidates(event: any): Array<{ text: string; cumulative: boolean }> {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  const candidates: Array<{ text: string; cumulative: boolean }> = [];
+  if (type === 'response.refusal.delta' && typeof event?.delta === 'string') {
+    candidates.push({ text: event.delta, cumulative: false });
+  }
+  if (type === 'response.refusal.done' && typeof event?.refusal === 'string') {
+    candidates.push({ text: event.refusal, cumulative: true });
+  }
+  if (type === 'response.completed' || !type) {
+    for (const item of event?.response?.output ?? event?.output ?? []) {
+      for (const part of item?.content ?? []) {
+        if (part?.type === 'refusal' && typeof part?.refusal === 'string') {
+          candidates.push({ text: part.refusal, cumulative: true });
+        }
+      }
+    }
+  }
+  return candidates;
+}
+
+async function collectCodexStreamText(res: Response): Promise<{ text: string; refusal: string }> {
   const reader = res.body?.getReader();
-  if (!reader) return '';
+  if (!reader) throw new ProviderProtocolError('ChatGPT Codex OAuth returned no streaming response body.');
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
+  let refusal = '';
   const accumulator = new CodexTextAccumulator();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data: ')) continue;
-      const raw = trimmed.slice(6);
-      if (raw === '[DONE]') return text;
-      try { text += accumulator.push(JSON.parse(raw)); } catch {}
+  let malformedFrames = 0;
+  let sawTerminalEvent = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const raw = trimmed.slice(5).trimStart();
+        if (raw === '[DONE]') {
+          if (!text && !refusal) throw new ProviderProtocolError('ChatGPT Codex OAuth returned an empty completion stream.');
+          if (malformedFrames > 0) throw new ProviderProtocolError('ChatGPT Codex OAuth returned malformed streaming data.');
+          return { text, refusal };
+        }
+        try {
+          const event = JSON.parse(raw);
+          if (event?.type === 'response.completed') sawTerminalEvent = true;
+          const delta = accumulator.push(event);
+          text += delta.content ?? '';
+          refusal += delta.refusal ?? '';
+        } catch { malformedFrames++; }
+      }
     }
+  } finally {
+    try { await reader.cancel(); } catch { /* body already closed */ }
   }
-  return text;
+  if (!text && !refusal) throw new ProviderProtocolError('ChatGPT Codex OAuth returned an empty completion stream.');
+  if (malformedFrames > 0) throw new ProviderProtocolError('ChatGPT Codex OAuth returned malformed streaming data.');
+  if (!sawTerminalEvent) throw new ProviderProtocolError('ChatGPT Codex OAuth returned a truncated completion stream.');
+  return { text, refusal };
+}
+
+function finiteNonNegative(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+export function isOpenAIStreamChunk(value: unknown): value is ChatCompletionChunk {
+  if (!value || typeof value !== 'object' || !Array.isArray((value as any).choices)) return false;
+  const choices = (value as any).choices as unknown[];
+  if (choices.length === 0) return isValidUsage((value as any).usage);
+  return choices.every((choice: unknown) => {
+    if (choice === null || typeof choice !== 'object') return false;
+    const delta = (choice as any).delta;
+    if (delta === null || typeof delta !== 'object') return false;
+    if (delta.content !== undefined && delta.content !== null && typeof delta.content !== 'string') return false;
+    if (delta.refusal !== undefined && delta.refusal !== null && typeof delta.refusal !== 'string') return false;
+    if ((choice as any).finish_reason !== undefined && (choice as any).finish_reason !== null && typeof (choice as any).finish_reason !== 'string') return false;
+    if (delta.tool_calls === undefined) return true;
+    return Array.isArray(delta.tool_calls) && delta.tool_calls.every((call: unknown) => {
+      if (!call || typeof call !== 'object' || !Number.isInteger((call as any).index) || (call as any).index < 0) return false;
+      const fn = (call as any).function;
+      return fn === undefined || (fn !== null && typeof fn === 'object'
+        && (fn.name === undefined || typeof fn.name === 'string')
+        && (fn.arguments === undefined || typeof fn.arguments === 'string'));
+    });
+  });
+}
+
+export function hasSubstantiveOpenAIStreamDelta(chunk: ChatCompletionChunk): boolean {
+  return chunk.choices.some(choice => (
+    Boolean(choice.delta?.content)
+    || Boolean((choice.delta as any)?.refusal)
+    || (choice.delta?.tool_calls?.length ?? 0) > 0
+    || (choice.finish_reason !== null && choice.finish_reason !== undefined)
+  ));
+}
+
+function normalizeOpenAIStreamChunk(
+  value: ChatCompletionChunk,
+  requestedModel: string,
+  completionId: string,
+  created: number,
+): ChatCompletionChunk {
+  return {
+    ...value,
+    id: completionId,
+    object: 'chat.completion.chunk',
+    created,
+    model: requestedModel,
+    choices: value.choices.map((choice, index) => ({
+      ...choice,
+      index: Number.isInteger(choice.index) && choice.index >= 0 ? choice.index : index,
+      delta: choice.delta,
+      finish_reason: typeof choice.finish_reason === 'string' || choice.finish_reason === null
+        ? choice.finish_reason
+        : null,
+    })),
+  };
+}
+
+function isValidUsage(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const usage = value as Record<string, unknown>;
+  return ['prompt_tokens', 'completion_tokens', 'total_tokens'].every(field => (
+    typeof usage[field] === 'number' && Number.isFinite(usage[field]) && (usage[field] as number) >= 0
+  ));
+}
+
+function normalizeChatCompletionResponse(
+  raw: unknown,
+  providerName: string,
+  requestedModel: string,
+  makeId: () => string,
+): ChatCompletionResponse {
+  if (!raw || typeof raw !== 'object') {
+    throw new ProviderProtocolError(`${providerName} returned a non-object chat completion response.`);
+  }
+  const data = raw as any;
+  if (!Array.isArray(data.choices) || data.choices.length === 0) {
+    throw new ProviderProtocolError(`${providerName} returned a chat completion without choices.`);
+  }
+  data.choices = data.choices.map((choice: any, index: number) => {
+    if (!choice || typeof choice !== 'object' || !choice.message || typeof choice.message !== 'object') {
+      throw new ProviderProtocolError(`${providerName} returned a malformed choice at index ${index}.`);
+    }
+    const message = choice.message;
+    if (message.content !== null && typeof message.content !== 'string' && !Array.isArray(message.content)) {
+      throw new ProviderProtocolError(`${providerName} returned an invalid assistant message content value.`);
+    }
+    if (message.refusal !== undefined && message.refusal !== null && typeof message.refusal !== 'string') {
+      throw new ProviderProtocolError(`${providerName} returned an invalid assistant refusal value.`);
+    }
+    if (message.tool_calls !== undefined && !Array.isArray(message.tool_calls)) {
+      throw new ProviderProtocolError(`${providerName} returned malformed tool_calls.`);
+    }
+    const toolCalls = message.tool_calls?.map((call: any, callIndex: number) => {
+      if (
+        !call || typeof call !== 'object'
+        || typeof call.id !== 'string' || !call.id
+        || call.type !== 'function'
+        || !call.function || typeof call.function !== 'object'
+        || typeof call.function.name !== 'string' || !call.function.name
+        || typeof call.function.arguments !== 'string'
+      ) {
+        throw new ProviderProtocolError(`${providerName} returned a malformed tool call at index ${callIndex}.`);
+      }
+      return {
+        ...call,
+        id: call.id,
+        type: 'function' as const,
+        function: {
+          ...call.function,
+          name: call.function.name,
+          arguments: call.function.arguments,
+        },
+      };
+    });
+    return {
+      ...choice,
+      index: Number.isInteger(choice.index) && choice.index >= 0 ? choice.index : index,
+      message: { ...message, role: 'assistant', ...(toolCalls ? { tool_calls: toolCalls } : {}) },
+      finish_reason: typeof choice.finish_reason === 'string' || choice.finish_reason === null
+        ? choice.finish_reason
+        : null,
+    };
+  });
+  const usage = data.usage && typeof data.usage === 'object' ? data.usage : {};
+  const promptTokens = finiteNonNegative(usage.prompt_tokens);
+  const completionTokens = finiteNonNegative(usage.completion_tokens);
+  return {
+    ...data,
+    id: typeof data.id === 'string' && data.id ? data.id : makeId(),
+    object: 'chat.completion',
+    created: finiteNonNegative(data.created) || Math.floor(Date.now() / 1000),
+    model: typeof data.model === 'string' && data.model ? data.model : requestedModel,
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: finiteNonNegative(usage.total_tokens) || promptTokens + completionTokens,
+    },
+  } as ChatCompletionResponse;
+}
+
+export function normalizeOpenAICompatibleResponse(
+  raw: unknown,
+  providerName: string,
+  requestedModel: string,
+  makeId: () => string,
+): ChatCompletionResponse {
+  const data = normalizeChatCompletionResponse(raw, providerName, requestedModel, makeId);
+  normalizeChoices(data);
+  return data;
 }
 
 /**

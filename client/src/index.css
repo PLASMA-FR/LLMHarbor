@@ -1,10 +1,31 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
 @import "@fontsource-variable/geist-mono";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant data-open {
+  &:where([data-state="open"]),
+  &:where([data-open]:not([data-open="false"])) { @slot; }
+}
+@custom-variant data-closed {
+  &:where([data-state="closed"]),
+  &:where([data-closed]:not([data-closed="false"])) { @slot; }
+}
+@custom-variant data-checked {
+  &:where([data-state="checked"]),
+  &:where([data-checked]:not([data-checked="false"])) { @slot; }
+}
+@custom-variant data-unchecked {
+  &:where([data-state="unchecked"]),
+  &:where([data-unchecked]:not([data-unchecked="false"])) { @slot; }
+}
+@custom-variant data-disabled {
+  &:where([data-disabled="true"]),
+  &:where([data-disabled]:not([data-disabled="false"])) { @slot; }
+}
+@custom-variant data-horizontal (&:where([data-orientation="horizontal"]));
+@custom-variant data-vertical (&:where([data-orientation="vertical"]));
 
 @theme inline {
   --font-heading: var(--font-sans);
@@ -48,82 +69,82 @@
   --radius-2xl: calc(var(--radius) * 1.9);
   --radius-3xl: calc(var(--radius) * 2.35);
   --radius-4xl: calc(var(--radius) * 2.8);
-  --radius-badge: 10px;
-  --radius-input: 14px;
-  --radius-button: 14px;
-  --radius-panel: 20px;
-  --radius-shell: 24px;
+  --radius-badge: 999px;
+  --radius-input: 8px;
+  --radius-button: 8px;
+  --radius-panel: 12px;
+  --radius-shell: 14px;
 }
 
 :root {
   color-scheme: light;
-  --background: #F7F4EF;
-  --foreground: #1F2933;
-  --card: #FFFDF8;
-  --card-foreground: #1F2933;
-  --popover: #FFFDF8;
-  --popover-foreground: #1F2933;
-  --primary: #2A9D8F;
-  --primary-foreground: #FFFDF8;
-  --secondary: #4A90E2;
-  --secondary-foreground: #FFFDF8;
-  --muted: #E6E1D8;
-  --muted-foreground: #667085;
-  --accent: #F4A261;
-  --accent-foreground: #1F2933;
-  --destructive: #D66A6A;
-  --border: #E6E1D8;
-  --input: #E6E1D8;
-  --ring: #2A9D8F;
-  --chart-1: #2A9D8F;
-  --chart-2: #4A90E2;
-  --chart-3: #F4A261;
-  --chart-4: #6BAA75;
-  --chart-5: #E9B44C;
-  --radius: 0.82rem;
-  --sidebar: #F7F4EF;
-  --sidebar-foreground: #1F2933;
-  --sidebar-primary: #2A9D8F;
-  --sidebar-primary-foreground: #FFFDF8;
-  --sidebar-accent: #E6E1D8;
-  --sidebar-accent-foreground: #1F2933;
-  --sidebar-border: #E6E1D8;
-  --sidebar-ring: #2A9D8F;
+  --background: #f6f7f9;
+  --foreground: #20242c;
+  --card: #ffffff;
+  --card-foreground: #20242c;
+  --popover: #ffffff;
+  --popover-foreground: #20242c;
+  --primary: #2563eb;
+  --primary-foreground: #ffffff;
+  --secondary: #e8eefc;
+  --secondary-foreground: #1d4ed8;
+  --muted: #eceef1;
+  --muted-foreground: #657080;
+  --accent: #e9edf3;
+  --accent-foreground: #20242c;
+  --destructive: #c8323d;
+  --border: #dfe3e8;
+  --input: #d5dae1;
+  --ring: #2563eb;
+  --chart-1: #2563eb;
+  --chart-2: #0891b2;
+  --chart-3: #d97706;
+  --chart-4: #059669;
+  --chart-5: #7c3aed;
+  --radius: 0.55rem;
+  --sidebar: #f9fafb;
+  --sidebar-foreground: #20242c;
+  --sidebar-primary: #2563eb;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e9edf3;
+  --sidebar-accent-foreground: #20242c;
+  --sidebar-border: #dfe3e8;
+  --sidebar-ring: #2563eb;
 }
 
 .dark {
   color-scheme: dark;
-  --background: #101418;
-  --foreground: #F2F4F5;
-  --card: #171D22;
-  --card-foreground: #F2F4F5;
-  --popover: #171D22;
-  --popover-foreground: #F2F4F5;
-  --primary: #3DBDAA;
-  --primary-foreground: #101418;
-  --secondary: #6AA9F0;
-  --secondary-foreground: #101418;
-  --muted: #2A3238;
-  --muted-foreground: #A0A8B0;
-  --accent: #F2B66D;
-  --accent-foreground: #101418;
-  --destructive: #E07A7A;
-  --border: #2A3238;
-  --input: #2A3238;
-  --ring: #3DBDAA;
-  --chart-1: #3DBDAA;
-  --chart-2: #6AA9F0;
-  --chart-3: #F2B66D;
-  --chart-4: #7CCB8A;
-  --chart-5: #EBCB6B;
-  --sidebar: #101418;
-  --sidebar-foreground: #F2F4F5;
-  --sidebar-primary: #3DBDAA;
-  --sidebar-primary-foreground: #101418;
-  --sidebar-accent: #2A3238;
-  --sidebar-accent-foreground: #F2F4F5;
-  --sidebar-border: #2A3238;
-  --sidebar-ring: #3DBDAA;
+  --background: #111317;
+  --foreground: #f1f3f5;
+  --card: #181b20;
+  --card-foreground: #f1f3f5;
+  --popover: #1b1f24;
+  --popover-foreground: #f1f3f5;
+  --primary: #60a5fa;
+  --primary-foreground: #0b1220;
+  --secondary: #202d45;
+  --secondary-foreground: #bfdbfe;
+  --muted: #262a31;
+  --muted-foreground: #9ca6b3;
+  --accent: #2b3038;
+  --accent-foreground: #f1f3f5;
+  --destructive: #f07178;
+  --border: #30353d;
+  --input: #3a4049;
+  --ring: #60a5fa;
+  --chart-1: #60a5fa;
+  --chart-2: #22d3ee;
+  --chart-3: #fbbf24;
+  --chart-4: #34d399;
+  --chart-5: #a78bfa;
+  --sidebar: #15181d;
+  --sidebar-foreground: #f1f3f5;
+  --sidebar-primary: #60a5fa;
+  --sidebar-primary-foreground: #0b1220;
+  --sidebar-accent: #292e36;
+  --sidebar-accent-foreground: #f1f3f5;
+  --sidebar-border: #30353d;
+  --sidebar-ring: #60a5fa;
 }
 
 @layer base {
@@ -152,6 +173,7 @@
     min-width: 320px;
     font-feature-settings: 'ss01', 'cv11', 'tnum';
     overflow-x: hidden;
+    min-height: 100vh;
   }
   #root {
     width: 100%;
@@ -163,7 +185,7 @@
     font-feature-settings: 'ss02', 'ss03';
   }
   ::selection {
-    background: #2A9D8F4D;
+    background: color-mix(in srgb, var(--primary) 24%, transparent);
   }
   :focus-visible {
     outline: 2px solid color-mix(in srgb, var(--ring) 70%, transparent);
@@ -175,7 +197,7 @@
   .tabular-nums { font-variant-numeric: tabular-nums; }
   .text-balance { text-wrap: balance; }
   .panel-card {
-    @apply border border-border bg-card;
+    @apply border border-border bg-card shadow-[0_1px_2px_rgba(16,24,40,0.035)];
   }
   .harbor-grid {
     background: transparent;
@@ -192,5 +214,16 @@
   .nav-scroll::-webkit-scrollbar-thumb {
     background: color-mix(in srgb, var(--muted-foreground) 35%, transparent);
     border-radius: 999px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

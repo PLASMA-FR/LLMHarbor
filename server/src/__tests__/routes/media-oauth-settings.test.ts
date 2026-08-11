@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vite
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { encrypt } from '../../lib/crypto.js';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
   const server = app.listen(0);
@@ -96,6 +97,34 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(upstreamCalled).toBe(false);
   });
 
+  it('keeps OAuth inventory GET read-only and reserves network discovery for POST refresh', async () => {
+    const token = encrypt('cached-inventory-token');
+    const account = getDb().prepare(`
+      INSERT INTO oauth_accounts (
+        provider, label, encrypted_access_token, access_iv, access_auth_tag,
+        metadata_json, enabled
+      ) VALUES ('freebuff', 'Cached inventory', ?, ?, ?, ?, 1)
+    `).run(token.encrypted, token.iv, token.authTag, JSON.stringify({
+      oauthLimits: [{ label: 'Cached quota', usedPercent: null }],
+    }));
+    getDb().prepare(`
+      INSERT INTO oauth_account_models (oauth_account_id, platform, model_id, supported)
+      VALUES (?, 'freebuff', 'moonshotai/kimi-k2.6', 1)
+    `).run(Number(account.lastInsertRowid));
+    let upstreamCalled = false;
+    const originalFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      if (String(url).startsWith('https://')) upstreamCalled = true;
+      return originalFetch(url, init);
+    });
+
+    const cached = await request(app, 'GET', `/api/oauth/accounts/${account.lastInsertRowid}/models`);
+    expect(cached.status).toBe(200);
+    expect(cached.body.models).toContainEqual(expect.objectContaining({ id: 'moonshotai/kimi-k2.6' }));
+    expect(cached.body.limits).toEqual([{ label: 'Cached quota', usedPercent: null }]);
+    expect(upstreamCalled).toBe(false);
+  });
+
   it('starts browser OAuth directly, exchanges callback codes, and stores encrypted account tokens', async () => {
     const catalog = await request(app, 'GET', '/api/oauth/providers');
     expect(catalog.status).toBe(200);
@@ -141,9 +170,11 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(state).toBeTruthy();
 
     const origFetch = global.fetch;
+    let tokenExchangeCalls = 0;
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
       if (urlStr === 'https://auth.openai.com/oauth/token') {
+        tokenExchangeCalls++;
         const body = new URLSearchParams(String((init as any).body));
         expect(body.get('grant_type')).toBe('authorization_code');
         expect(body.get('code')).toBe('browser-code');
@@ -166,9 +197,15 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
       return origFetch(url, init);
     });
 
-    const callback = await request(app, 'GET', `/api/oauth/callback/openai?state=${state}&code=browser-code`);
-    expect(callback.status).toBe(302);
+    const callbacks = await Promise.all([
+      request(app, 'GET', `/api/oauth/callback/openai?state=${state}&code=browser-code`),
+      request(app, 'GET', `/api/oauth/callback/openai?state=${state}&code=browser-code`),
+    ]);
+    const callback = callbacks.find(result => result.status === 302)!;
+    const replay = callbacks.find(result => result.status === 400)!;
     expect(callback.headers.get('location')).toBe('/oauth?connected=1');
+    expect(replay.raw).toContain('OAuth login state expired');
+    expect(tokenExchangeCalls).toBe(1);
 
     const accounts = await request(app, 'GET', '/api/oauth/accounts');
     expect(accounts.status).toBe(200);
@@ -197,6 +234,75 @@ describe('media, OAuth, and local endpoint control-plane support', () => {
     expect(models.status).toBe(200);
     expect(models.body.models.map((m: any) => m.id).sort()).toEqual(['gpt-5', 'gpt-5.4-mini', 'gpt-5.5']);
     expect(models.body.limits[0].usedPercent).toBe(12);
+  });
+
+  it('completes remote loopback callbacks without weakening state or PKCE validation', async () => {
+    const start = await request(app, 'POST', '/api/oauth/connect/openai/start');
+    expect(start.status).toBe(200);
+    const state = new URL(start.body.authUrl).searchParams.get('state');
+    expect(state).toBeTruthy();
+
+    const originalFetch = global.fetch;
+    const exchangedCodes: string[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlString = String(url);
+      if (urlString === 'https://auth.openai.com/oauth/token') {
+        const body = new URLSearchParams(String(init?.body));
+        exchangedCodes.push(String(body.get('code')));
+        expect(body.get('redirect_uri')).toBe('http://localhost:1455/auth/callback');
+        expect(body.get('code_verifier')).toMatch(/^[A-Za-z0-9_-]{43,}$/);
+        return Response.json({
+          access_token: `access-${body.get('code')}`,
+          refresh_token: `refresh-${body.get('code')}`,
+          expires_in: 3600,
+          token_type: 'Bearer',
+          email: 'remote@example.com',
+        });
+      }
+      if (urlString === 'https://chatgpt.com/backend-api/codex/models?client_version=999.0.0') {
+        return Response.json({ models: [] });
+      }
+      if (urlString === 'https://chatgpt.com/backend-api/codex/usage') {
+        return Response.json({});
+      }
+      return originalFetch(url, init);
+    });
+
+    const foreignCallback = await request(app, 'POST', '/api/oauth/connect/openai/callback', {
+      callbackUrl: `https://example.invalid/callback?code=stolen&state=${encodeURIComponent(state)}`,
+    });
+    expect(foreignCallback.status).toBe(400);
+    expect(foreignCallback.body.error.code).toBe('invalid_oauth_callback');
+    expect(exchangedCodes).toEqual([]);
+    const pendingState = getDb().prepare('SELECT consumed_at FROM oauth_login_states WHERE state = ?').get(state) as { consumed_at: string | null };
+    expect(pendingState.consumed_at).toBeNull();
+
+    const callbackUrl = new URL(start.body.callbackUrl);
+    callbackUrl.searchParams.set('code', 'remote-browser-code');
+    callbackUrl.searchParams.set('state', state);
+    const simultaneous = await Promise.all([
+      request(app, 'POST', '/api/oauth/connect/openai/callback', { callbackUrl: callbackUrl.toString() }),
+      request(app, 'POST', '/api/oauth/connect/openai/callback', { callbackUrl: callbackUrl.toString() }),
+    ]);
+    expect(simultaneous.map(result => result.status).sort()).toEqual([200, 400]);
+    const connected = simultaneous.find(result => result.status === 200)!;
+    const replay = simultaneous.find(result => result.status === 400)!;
+    expect(connected.body).toEqual({ connected: true });
+    expect(connected.raw).not.toContain('access-remote-browser-code');
+    expect(connected.raw).not.toContain('refresh-remote-browser-code');
+    expect(replay.body.error.code).toBe('invalid_oauth_state');
+    expect(exchangedCodes).toEqual(['remote-browser-code']);
+
+    const directStart = await request(app, 'POST', '/api/oauth/connect/openai/start');
+    const directState = new URL(directStart.body.authUrl).searchParams.get('state');
+    const direct = await request(app, 'POST', '/api/oauth/connect/openai/callback', {
+      state: directState,
+      code: 'remote-direct-code',
+    });
+    expect(direct.status).toBe(200);
+    expect(direct.body).toEqual({ connected: true });
+    expect(exchangedCodes).toEqual(['remote-browser-code', 'remote-direct-code']);
+    expect(getDb().prepare('SELECT COUNT(*) AS count FROM oauth_accounts').get()).toEqual({ count: 2 });
   });
 
   it('connects Freebuff with device OAuth and projects it as an encrypted provider key', async () => {

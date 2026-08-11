@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt, decrypt } from '../../lib/crypto.js';
-import { routeRequest, routeRequestAsync } from '../../services/router.js';
+import { getRouteFailureCircuit, recordRouteFailure, recordSuccess, routeRequest, routeRequestAsync } from '../../services/router.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -25,7 +25,11 @@ describe('Router', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('should throw when no keys are configured', () => {
-    expect(() => routeRequest()).toThrow(/exhausted/i);
+    expect(() => routeRequest()).toThrow(/No eligible route/i);
+    try { routeRequest(); } catch (error: any) {
+      expect(error.status).toBe(503);
+      expect(error.code).toBe('no_eligible_route');
+    }
   });
 
   it('should route to highest priority model with available key', () => {
@@ -132,7 +136,7 @@ describe('Router', () => {
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run('groq', 'fallback-key', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
 
-    expect(() => routeRequest(1000, undefined, googleModel.id, true)).toThrow(/exhausted/i);
+    expect(() => routeRequest(1000, undefined, googleModel.id, true)).toThrow(/No eligible route/i);
   });
 
   it('marks expired OAuth accounts reconnect-required instead of returning stale credentials when refresh fails', async () => {
@@ -170,7 +174,97 @@ describe('Router', () => {
     expect(updatedKey).toEqual({ enabled: 0, status: 'invalid' });
     const metadata = JSON.parse((db.prepare('SELECT metadata_json FROM oauth_accounts WHERE id = ?').get(Number(account.lastInsertRowid)) as any).metadata_json);
     expect(metadata.oauthNeedsReconnect).toBe(true);
-    expect(metadata.oauthDiscoveryError).toContain('unauthorized_client');
+    expect(metadata.oauthDiscoveryError).toBe('Antigravity OAuth authorization expired. Reconnect the browser account.');
+  });
+
+  it('isolates a failed OAuth refresh and selects a healthy fallback route', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('google-oauth', 'router-refresh-fallback-model', 'Refresh Fallback (Antigravity browser account)', 1, 1, 'Frontier', 1)
+    `).run();
+    const oauthModel = db.prepare("SELECT id FROM models WHERE platform = 'google-oauth' AND model_id = 'router-refresh-fallback-model'").get() as { id: number };
+    db.prepare('INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1)').run(oauthModel.id);
+    db.prepare('UPDATE fallback_config SET priority = 1, enabled = 1 WHERE model_db_id = ?').run(oauthModel.id);
+
+    const stale = encrypt('stale-fallback-token');
+    const refresh = encrypt('refresh-fallback-token');
+    const account = db.prepare(`
+      INSERT INTO oauth_accounts (provider, label, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, enabled)
+      VALUES ('antigravity', 'Broken transient account', ?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(stale.encrypted, stale.iv, stale.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString());
+    const oauthKey = db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('google-oauth', 'Broken transient account', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(stale.encrypted, stale.iv, stale.authTag, Number(account.lastInsertRowid));
+
+    const fallbackKey = encrypt('healthy-groq-fallback-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ('groq', 'Healthy fallback', ?, ?, ?, 'healthy', 1)
+    `).run(fallbackKey.encrypted, fallbackKey.iv, fallbackKey.authTag);
+
+    vi.spyOn(global, 'fetch').mockResolvedValue(Response.json(
+      { error: 'temporarily_unavailable' },
+      { status: 503 },
+    ));
+
+    const skips = new Set<string>();
+    const selected = await routeRequestAsync(1000, skips);
+    expect(selected.platform).toBe('groq');
+    expect(selected.apiKey).toBe('healthy-groq-fallback-key');
+    expect(skips).toContain(`google-oauth:*:${Number(oauthKey.lastInsertRowid)}`);
+    expect(db.prepare('SELECT enabled, status FROM api_keys WHERE id = ?').get(Number(oauthKey.lastInsertRowid)))
+      .toEqual({ enabled: 1, status: 'healthy' });
+  });
+
+  it('single-flights concurrent refreshes for the same OAuth account', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('google-oauth', 'router-concurrent-refresh-model', 'Concurrent Refresh (Antigravity browser account)', 1, 1, 'Frontier', 1)
+    `).run();
+    const model = db.prepare("SELECT id FROM models WHERE platform = 'google-oauth' AND model_id = 'router-concurrent-refresh-model'").get() as { id: number };
+    db.prepare('INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1)').run(model.id);
+    db.prepare('UPDATE fallback_config SET priority = 1, enabled = 1 WHERE model_db_id = ?').run(model.id);
+
+    const stale = encrypt('stale-concurrent-token');
+    const refresh = encrypt('concurrent-refresh-token');
+    const account = db.prepare(`
+      INSERT INTO oauth_accounts (provider, label, encrypted_access_token, access_iv, access_auth_tag, encrypted_refresh_token, refresh_iv, refresh_auth_tag, expires_at, enabled)
+      VALUES ('antigravity', 'Concurrent account', ?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(stale.encrypted, stale.iv, stale.authTag, refresh.encrypted, refresh.iv, refresh.authTag, new Date(Date.now() - 60_000).toISOString());
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
+      VALUES ('google-oauth', 'Concurrent account', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(stale.encrypted, stale.iv, stale.authTag, Number(account.lastInsertRowid));
+
+    let refreshCalls = 0;
+    vi.spyOn(global, 'fetch').mockImplementation(async () => {
+      refreshCalls++;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return Response.json({ access_token: 'fresh-concurrent-token', expires_in: 3600 });
+    });
+
+    const [first, second] = await Promise.all([
+      routeRequestAsync(10, undefined, model.id, true),
+      routeRequestAsync(10, undefined, model.id, true),
+    ]);
+    expect(refreshCalls).toBe(1);
+    expect(first.apiKey).toBe('fresh-concurrent-token');
+    expect(second.apiKey).toBe('fresh-concurrent-token');
+  });
+
+  it('opens a short non-rate-limit circuit only after repeated route failures and clears it on success', () => {
+    const modelId = 987_654;
+    recordRouteFailure(modelId);
+    expect(getRouteFailureCircuit(modelId)).toMatchObject({ count: 1, until: expect.any(Number) });
+    expect(getRouteFailureCircuit(modelId)!.until).toBeLessThanOrEqual(Date.now());
+    recordRouteFailure(modelId);
+    expect(getRouteFailureCircuit(modelId)).toMatchObject({ count: 2, until: expect.any(Number) });
+    expect(getRouteFailureCircuit(modelId)!.until).toBeGreaterThan(Date.now());
+    recordSuccess(modelId);
+    expect(getRouteFailureCircuit(modelId)).toBeNull();
   });
 
 });

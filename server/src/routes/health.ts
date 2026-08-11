@@ -3,6 +3,8 @@ import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
+import { parsePositiveResourceId } from '../lib/resourceId.js';
+import { toUtcTimestamp } from '../lib/time.js';
 
 export const healthRouter = Router();
 
@@ -48,17 +50,23 @@ healthRouter.get('/', (_req: Request, res: Response) => {
       label: k.label,
       status: k.status,
       enabled: k.enabled === 1,
-      createdAt: k.created_at,
-      lastCheckedAt: k.last_checked_at,
+      createdAt: toUtcTimestamp(k.created_at),
+      lastCheckedAt: toUtcTimestamp(k.last_checked_at),
     })),
   });
 });
 
 // Check a specific key
 healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
-  const keyId = parseInt(req.params.keyId as string, 10);
-  if (isNaN(keyId)) {
+  const keyId = parsePositiveResourceId(req.params.keyId);
+  if (keyId === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
+    return;
+  }
+
+  const exists = getDb().prepare('SELECT 1 FROM api_keys WHERE id = ?').get(keyId);
+  if (!exists) {
+    res.status(404).json({ error: { message: 'Key not found' } });
     return;
   }
 

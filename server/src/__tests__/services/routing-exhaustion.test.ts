@@ -96,7 +96,7 @@ describe('Routing Key Exhaustion', () => {
 
   it('should throw 429 when every key on every model is exhausted', () => {
     (ratelimit.canMakeRequest as any).mockReturnValue(false);
-    expect(() => routeRequest(100)).toThrow(/All models exhausted/);
+    expect(() => routeRequest(100)).toThrow(/temporarily unavailable.*limits or cooldowns/i);
   });
 
   it('should fall back to Flash when Pro is exhausted but Flash has quota', () => {

@@ -36,6 +36,8 @@ describe('analytics ranges', () => {
     const recent = await request(app, '/api/analytics/summary?range=30d');
     expect(recent.status).toBe(200);
     expect(recent.body.totalRequests).toBe(1);
+    expect(recent.body.successfulRequests).toBe(1);
+    expect(recent.body.failedRequests).toBe(0);
     expect(recent.body.totalInputTokens).toBe(10);
 
     const all = await request(app, '/api/analytics/summary?range=alltime');
@@ -46,5 +48,51 @@ describe('analytics ranges', () => {
     const allAlias = await request(app, '/api/analytics/by-model?range=all');
     expect(allAlias.status).toBe(200);
     expect(allAlias.body.map((row: any) => row.modelId).sort()).toEqual(['gpt-legacy', 'gpt-old', 'gpt-recent']);
+  });
+
+  it('returns recent request records with camelCase fields and explicit UTC timestamps', async () => {
+    const recent = await request(app, '/api/analytics/recent?range=all&limit=2');
+    expect(recent.status).toBe(200);
+    expect(recent.body).toHaveLength(2);
+    expect(recent.body[0]).toEqual(expect.objectContaining({
+      id: expect.any(Number),
+      platform: 'openai',
+      modelId: expect.any(String),
+      status: 'success',
+      inputTokens: expect.any(Number),
+      outputTokens: expect.any(Number),
+      latencyMs: expect.any(Number),
+    }));
+    expect(recent.body[0].createdAt).toMatch(/Z$/);
+  });
+
+  it('rejects invalid ranges, intervals, and recent limits', async () => {
+    expect((await request(app, '/api/analytics/summary?range=yesterday')).status).toBe(400);
+    expect((await request(app, '/api/analytics/timeline?interval=minute')).status).toBe(400);
+    expect((await request(app, '/api/analytics/recent?limit=1000')).status).toBe(400);
+  });
+
+  it('counts failed upstream attempts in error distribution without double-counting request summaries', async () => {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO requests (
+        request_id, attempt, is_final, platform, model_id, key_id, status,
+        input_tokens, output_tokens, latency_ms, error, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run('fallback-request', 1, 0, 'groq', 'failed-model', 1, 'error', 4, 0, 20, 'Upstream provider returned HTTP 500.');
+    db.prepare(`
+      INSERT INTO requests (
+        request_id, attempt, is_final, platform, model_id, key_id, status,
+        input_tokens, output_tokens, latency_ms, error, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    `).run('fallback-request', 2, 1, 'cohere', 'healthy-model', 2, 'success', 4, 2, 40, null);
+
+    const summary = await request(app, '/api/analytics/summary?range=24h');
+    expect(summary.body.totalRequests).toBe(1); // only the final fallback success; the attempt is diagnostic
+    expect(summary.body.failedRequests).toBe(0);
+
+    const distribution = await request(app, '/api/analytics/error-distribution?range=24h');
+    expect(distribution.body.byCategory).toContainEqual({ category: 'Server Error (500)', count: 1 });
+    expect(distribution.body.byPlatform).toContainEqual({ platform: 'groq', count: 1 });
   });
 });

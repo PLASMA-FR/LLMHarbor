@@ -1,26 +1,13 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import {
-  DndContext,
-  closestCenter,
-  KeyboardSensor,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from '@dnd-kit/core'
-import {
-  arrayMove,
-  SortableContext,
-  sortableKeyboardCoordinates,
-  useSortable,
-  verticalListSortingStrategy,
-} from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
+import { ArrowDown, ArrowUp } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
+import { formatCompactNumber, formatPercent } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader, EmptyState, ErrorState, LoadingState } from '@/components/page-header'
+import { MetricCard } from '@/components/metric-card'
+import { InlineNotice, StatusIndicator } from '@/components/status-indicator'
 import { cn } from '@/lib/utils'
 
 interface FallbackEntry {
@@ -30,6 +17,9 @@ interface FallbackEntry {
   penalty: number
   rateLimitHits: number
   enabled: boolean
+  modelEnabled: boolean
+  eligible: boolean
+  skipReason: string | null
   platform: string
   modelId: string
   displayName: string
@@ -40,13 +30,11 @@ interface FallbackEntry {
   rpdLimit: number | null
   monthlyTokenBudget: string
   keyCount: number
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
+  configuredKeyCount: number
+  enabledKeyCount: number
+  routeableKeyCount: number
+  availableKeyCount: number
+  activeCooldowns: number
 }
 
 interface TokenUsageData {
@@ -55,69 +43,70 @@ interface TokenUsageData {
   models: { displayName: string; platform: string; budget: number }[]
 }
 
-const platformColors: Record<string, string> = {
-  google: '#4285f4', groq: '#f55036', cerebras: '#8b5cf6', sambanova: '#14b8a6', nvidia: '#76b900',
-  mistral: '#f59e0b', openrouter: '#ec4899', github: '#6e7b8b', cohere: '#d946ef', cloudflare: '#f38020',
-  zhipu: '#06b6d4', ollama: '#0f766e', kilo: '#7c3aed', pollinations: '#a855f7', llm7: '#0ea5e9', huggingface: '#ff9d00',
-}
-
 function TokenUsageBar({ data }: { data: TokenUsageData }) {
   const { totalBudget, totalUsed, models } = data
   const remaining = Math.max(0, totalBudget - totalUsed)
   const remainingPct = totalBudget > 0 ? Math.round((remaining / totalBudget) * 100) : 0
-  const modelsWithWidth = models.map(m => ({
-    ...m,
-    remainingTokens: totalBudget > 0 ? (m.budget / totalBudget) * remaining : 0,
-    widthPct: totalBudget > 0 ? (m.budget / totalBudget) * (remaining / totalBudget) * 100 : 0,
-  }))
-  const usedPct = totalBudget > 0 ? (totalUsed / totalBudget) * 100 : 0
+  const usedPct = totalBudget > 0 ? Math.min(100, (totalUsed / totalBudget) * 100) : 0
 
   return (
-    <section className="panel-card rounded-2xl p-5 sm:p-6">
+    <section className="panel-card rounded-[var(--radius-panel)] p-4 sm:p-5" aria-labelledby="token-budget-title">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-primary/80">Budget remaining</p>
-          <h2 className="mt-1 text-lg font-semibold tracking-[-0.03em]">Monthly token budget</h2>
+          <p className="text-xs font-medium text-muted-foreground">Quota estimate</p>
+          <h2 id="token-budget-title" className="mt-1 text-base font-semibold">Monthly token budget</h2>
         </div>
-        <span className="text-sm text-muted-foreground tabular-nums"><span className="font-semibold text-foreground">{formatTokens(remaining)}</span> remaining, {remainingPct}% of {formatTokens(totalBudget)}</span>
+        <span className="text-sm text-muted-foreground tabular-nums"><span className="font-semibold text-foreground">{formatCompactNumber(remaining)}</span> remaining · {remainingPct}% of {formatCompactNumber(totalBudget)}</span>
       </div>
-      <div className="mt-5 flex h-3 overflow-hidden rounded-lg bg-muted ">
-        {modelsWithWidth.map((m, i) => <div key={i} title={`${m.displayName} (${m.platform}) - ${formatTokens(m.remainingTokens)} remaining`} style={{ width: `${m.widthPct}%`, backgroundColor: platformColors[m.platform] ?? '#94a3b8' }} />)}
-        {totalUsed > 0 && <div title={`Used - ${formatTokens(totalUsed)}`} className="bg-muted-foreground/30" style={{ width: `${usedPct}%` }} />}
+      <div className="mt-4 h-2 overflow-hidden rounded-full bg-muted" role="progressbar" aria-label="Estimated monthly token budget used" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(usedPct)}>
+        <div className={cn('h-full rounded-full', usedPct >= 90 ? 'bg-destructive' : usedPct >= 70 ? 'bg-amber-500' : 'bg-primary')} style={{ width: `${usedPct}%` }} />
       </div>
-      <div className="mt-5 grid grid-cols-1 gap-x-5 gap-y-2 text-xs tabular-nums sm:grid-cols-2 lg:grid-cols-3">
-        {modelsWithWidth.map((m, i) => (
-          <div key={i} className="flex min-w-0 items-center gap-2">
-            <span className="size-2 rounded-lg" style={{ backgroundColor: platformColors[m.platform] ?? '#94a3b8' }} />
-            <span className="truncate">{m.displayName}</span>
+      <div className="mt-4 grid grid-cols-1 gap-x-5 gap-y-2 text-xs tabular-nums sm:grid-cols-2 lg:grid-cols-3">
+        {models.map(model => (
+          <div key={`${model.platform}/${model.displayName}`} className="flex min-w-0 items-center gap-2">
+            <span className="size-1.5 rounded-full bg-primary/70" aria-hidden="true" />
+            <span className="truncate">{model.displayName}</span>
             <span className="flex-1" />
-            <span className="font-mono text-muted-foreground">{formatTokens(m.remainingTokens)}</span>
+            <span className="font-mono text-muted-foreground">{formatCompactNumber(model.budget)} budget</span>
           </div>
         ))}
       </div>
+      <p className="mt-3 text-[11px] leading-5 text-muted-foreground">Usage is aggregated across routes; per-model values are configured budgets, not measured balances.</p>
     </section>
   )
 }
 
-function SortableModelRow({ entry, index, onToggle }: { entry: FallbackEntry; index: number; onToggle: (modelDbId: number, enabled: boolean) => void }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: entry.modelDbId })
-  const style = { transform: CSS.Transform.toString(transform), transition }
-  const color = platformColors[entry.platform] ?? '#94a3b8'
+function ModelRow({ entry, index, count, busy, onToggle, onMove }: { entry: FallbackEntry; index: number; count: number; busy: boolean; onToggle: (modelDbId: number, enabled: boolean) => void; onMove: (index: number, direction: -1 | 1) => void }) {
+  const status = !entry.enabled
+    ? { label: 'Disabled', tone: 'neutral' as const, reason: 'Skipped by configuration' }
+    : !entry.modelEnabled
+      ? { label: 'Disabled', tone: 'neutral' as const, reason: entry.skipReason ?? 'Model is disabled' }
+      : !entry.eligible
+        ? {
+            label: entry.activeCooldowns > 0 ? 'Cooling down' : 'Unavailable',
+            tone: entry.activeCooldowns > 0 ? 'warning' as const : 'critical' as const,
+            reason: entry.skipReason ?? 'Not currently eligible for routing',
+          }
+    : entry.penalty > 0
+      ? { label: 'Degraded', tone: 'warning' as const, reason: `Recent rate-limit pressure adds ${entry.penalty} priority points` }
+      : { label: 'Ready', tone: 'positive' as const, reason: 'Eligible for routing' }
 
   return (
-    <div ref={setNodeRef} style={style} className={cn('group grid gap-3 bg-card px-4 py-4 transition-colors hover:bg-muted/35 sm:grid-cols-[auto_auto_minmax(0,1fr)_auto] sm:items-center', isDragging && 'opacity-50', !entry.enabled && 'opacity-55')}>
-      <button {...attributes} {...listeners} className="cursor-grab rounded-xl p-1 text-muted-foreground/50 transition-colors hover:bg-muted hover:text-foreground active:cursor-grabbing" aria-label={`Reorder ${entry.displayName}, currently position ${index + 1}`}>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" /><circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" /><circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" /></svg>
-      </button>
-      <div className="flex size-9 items-center justify-center rounded-2xl border border-border bg-background font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</div>
+    <div className={cn('group grid gap-3 bg-card px-4 py-3.5 transition-colors hover:bg-muted/30 sm:grid-cols-[auto_minmax(0,1fr)_auto_auto] sm:items-center', !entry.enabled && 'bg-muted/15')}>
+      <div className="flex size-8 items-center justify-center rounded-[var(--radius-button)] border border-border bg-background font-mono text-xs tabular-nums text-muted-foreground">{index + 1}</div>
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="size-2 rounded-lg" style={{ backgroundColor: color }} />
           <span className="truncate text-sm font-semibold">{entry.displayName}</span>
-          <span className="rounded-lg bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{entry.platform}</span>
-          {entry.penalty > 0 && <span className="rounded-lg bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-600 dark:text-amber-300">-{entry.penalty} penalty</span>}
+          <span className="rounded-[var(--radius-badge)] bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">{entry.platform}</span>
+          <StatusIndicator label={status.label} tone={status.tone} />
         </div>
-        <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted-foreground tabular-nums">
+        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground tabular-nums">
+          <span>{status.reason}</span>
+          <span className="font-mono">{entry.platform}/{entry.modelId}</span>
+          <span>{entry.availableKeyCount}/{entry.configuredKeyCount} credentials available</span>
+          <span>Base priority {entry.priority}</span>
+          <span>Effective priority {entry.effectivePriority}</span>
+          {entry.activeCooldowns > 0 && <span>{entry.activeCooldowns} cooling down</span>}
           <span>Intel #{entry.intelligenceRank}</span>
           <span>Speed #{entry.speedRank}</span>
           {entry.rpmLimit && <span>{entry.rpmLimit} rpm</span>}
@@ -125,7 +114,11 @@ function SortableModelRow({ entry, index, onToggle }: { entry: FallbackEntry; in
           <span>{entry.monthlyTokenBudget} tok/mo</span>
         </div>
       </div>
-      <Switch checked={entry.enabled} onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)} aria-label={`${entry.enabled ? 'Disable' : 'Enable'} ${entry.displayName} in routing`} />
+      <div className="flex items-center gap-1">
+        <Button variant="ghost" size="icon-xs" onClick={() => onMove(index, -1)} disabled={busy || index === 0} aria-label={`Move ${entry.displayName} up`}><ArrowUp aria-hidden="true" /></Button>
+        <Button variant="ghost" size="icon-xs" onClick={() => onMove(index, 1)} disabled={busy || index === count - 1} aria-label={`Move ${entry.displayName} down`}><ArrowDown aria-hidden="true" /></Button>
+      </div>
+      <Switch checked={entry.enabled} disabled={busy} onCheckedChange={(checked) => onToggle(entry.modelDbId, checked)} aria-label={`${entry.enabled ? 'Disable' : 'Enable'} ${entry.displayName} in routing`} />
     </div>
   )
 }
@@ -134,8 +127,8 @@ export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
 
-  const { data: entries = [], isLoading, isError, error, refetch } = useQuery<FallbackEntry[]>({ queryKey: ['fallback'], queryFn: () => apiFetch('/api/fallback') })
-  const { data: tokenUsage } = useQuery<TokenUsageData>({ queryKey: ['fallback', 'token-usage'], queryFn: () => apiFetch('/api/fallback/token-usage') })
+  const { data: entries = [], isLoading, isError, error, refetch } = useQuery<FallbackEntry[]>({ queryKey: ['fallback'], queryFn: ({ signal }) => apiFetch('/api/fallback', { signal }) })
+  const { data: tokenUsage } = useQuery<TokenUsageData>({ queryKey: ['fallback', 'token-usage'], queryFn: ({ signal }) => apiFetch('/api/fallback/token-usage', { signal }) })
 
   const saveMutation = useMutation({
     mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean }[]) => apiFetch('/api/fallback', { method: 'PUT', body: JSON.stringify(data) }),
@@ -147,20 +140,25 @@ export default function FallbackPage() {
   })
 
   const allEntries = localEntries ?? entries
-  const displayEntries = allEntries.filter(e => e.keyCount > 0)
-  const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
+  const displayEntries = allEntries.filter(e => e.configuredKeyCount > 0)
+  const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.configuredKeyCount === 0).map(e => e.platform))]
   const enabledCount = displayEntries.filter(e => e.enabled).length
 
-  const sensors = useSensors(useSensor(PointerSensor), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }))
+  function reorderVisible(reorderedVisible: FallbackEntry[]) {
+    let visibleIndex = 0
+    setLocalEntries(allEntries
+      .map(entry => entry.configuredKeyCount > 0 ? (reorderedVisible[visibleIndex++] ?? entry) : entry)
+      .map((entry, index) => ({ ...entry, priority: index + 1, effectivePriority: index + 1 + entry.penalty })))
+  }
 
-  function handleDragEnd(event: DragEndEvent) {
-    const { active, over } = event
-    if (!over || active.id === over.id) return
-    const oldIndex = displayEntries.findIndex(e => e.modelDbId === active.id)
-    const newIndex = displayEntries.findIndex(e => e.modelDbId === over.id)
-    const reorderedVisible = arrayMove(displayEntries, oldIndex, newIndex)
-    const unconfigured = allEntries.filter(e => e.keyCount === 0)
-    setLocalEntries([...reorderedVisible.map((e, i) => ({ ...e, priority: i + 1 })), ...unconfigured.map((e, i) => ({ ...e, priority: reorderedVisible.length + i + 1 }))])
+  function handleMove(index: number, direction: -1 | 1) {
+    const nextIndex = index + direction
+    if (nextIndex < 0 || nextIndex >= displayEntries.length) return
+    const reordered = [...displayEntries]
+    const [entry] = reordered.splice(index, 1)
+    if (!entry) return
+    reordered.splice(nextIndex, 0, entry)
+    reorderVisible(reordered)
   }
 
   function handleToggle(modelDbId: number, enabled: boolean) {
@@ -172,34 +170,39 @@ export default function FallbackPage() {
     saveMutation.mutate(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
   }
 
+  function applyPreset(preset: string) {
+    if (localEntries && !window.confirm('Discard the unsaved routing edits and apply this preset?')) return
+    sortMutation.mutate(preset)
+  }
+
   const hasChanges = localEntries !== null
 
   return (
     <div>
       <PageHeader
-        eyebrow="Routing order"
-        title="Routing order"
-        description="Put the models in the order LLMHarbor should try them. Disabled or exhausted models are skipped."
+        eyebrow="Automatic routing"
+        title="Routing"
+        description="Set deterministic fallback priority and see why a route is ready, degraded, or skipped."
         actions={<>
-          <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('intelligence')} disabled={sortMutation.isPending}>Best answers</Button>
-          <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('speed')} disabled={sortMutation.isPending}>Fastest</Button>
-          <Button variant="outline" size="sm" onClick={() => sortMutation.mutate('budget')} disabled={sortMutation.isPending}>Most budget left</Button>
+          <Button variant="outline" size="sm" onClick={() => applyPreset('intelligence')} disabled={sortMutation.isPending || saveMutation.isPending}>Prioritize quality</Button>
+          <Button variant="outline" size="sm" onClick={() => applyPreset('speed')} disabled={sortMutation.isPending || saveMutation.isPending}>Prioritize speed</Button>
+          <Button variant="outline" size="sm" onClick={() => applyPreset('budget')} disabled={sortMutation.isPending || saveMutation.isPending}>Prioritize budget</Button>
         </>}
       />
 
       <div className="space-y-6">
         <div className="grid gap-3 sm:grid-cols-3">
-          <div className="rounded-[var(--radius-panel)] border border-border bg-card p-4 "><p className="text-xs font-medium text-muted-foreground">Configured models</p><p className="mt-2 text-2xl font-semibold tabular-nums">{displayEntries.length}</p></div>
-          <div className="rounded-[var(--radius-panel)] border border-border bg-card p-4 "><p className="text-xs font-medium text-muted-foreground">Enabled</p><p className="mt-2 text-2xl font-semibold tabular-nums text-emerald-600 dark:text-emerald-300">{enabledCount}</p></div>
-          <div className="rounded-[var(--radius-panel)] border border-border bg-card p-4 "><p className="text-xs font-medium text-muted-foreground">Hidden providers</p><p className="mt-2 text-2xl font-semibold tabular-nums">{unconfiguredPlatforms.length}</p></div>
+          <MetricCard label="Configured routes" value={displayEntries.length} detail="Routes with credentials" />
+          <MetricCard label="Enabled" value={enabledCount} detail={`${displayEntries.filter(entry => entry.enabled && entry.penalty > 0).length} degraded`} tone={enabledCount > 0 ? 'positive' : 'warning'} />
+          <MetricCard label="Catalog only" value={unconfiguredPlatforms.length} detail="Providers without credentials" />
         </div>
 
         {tokenUsage && tokenUsage.totalBudget > 0 && <TokenUsageBar data={tokenUsage} />}
 
         {(saveMutation.isError || sortMutation.isError) && (
-          <div className="rounded-[var(--radius-panel)] border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive" role="alert">
+          <InlineNotice tone="critical">
             {(saveMutation.error ?? sortMutation.error)?.message ?? 'Could not update routing order.'}
-          </div>
+          </InlineNotice>
         )}
 
         {isLoading ? (
@@ -211,24 +214,26 @@ export default function FallbackPage() {
         ) : (
           <>
             <div className="panel-card overflow-hidden rounded-[var(--radius-panel)]">
-              <div className="border-b border-border bg-card px-4 py-3 text-xs font-medium text-muted-foreground">Drag rows, or focus a handle and use Space plus arrow keys to reorder.</div>
-              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-                <SortableContext items={displayEntries.map(e => e.modelDbId)} strategy={verticalListSortingStrategy}>
-                  <div className="divide-y divide-border">
-                    {displayEntries.map((entry, index) => <SortableModelRow key={entry.modelDbId} entry={entry} index={index} onToggle={handleToggle} />)}
-                  </div>
-                </SortableContext>
-              </DndContext>
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-muted/20 px-4 py-3 text-xs text-muted-foreground">
+                <span>Arrows set the stable base order. During rate-limit pressure, the router tries the lowest effective priority first.</span>
+                <span>{formatPercent(displayEntries.length ? (enabledCount / displayEntries.length) * 100 : 0, 0)} enabled</span>
+              </div>
+              <div className="divide-y divide-border">
+                {displayEntries.map((entry, index) => <ModelRow key={entry.modelDbId} entry={entry} index={index} count={displayEntries.length} busy={saveMutation.isPending || sortMutation.isPending} onToggle={handleToggle} onMove={handleMove} />)}
+              </div>
             </div>
 
             {hasChanges && (
-              <div className="sticky bottom-4 z-10 flex justify-end gap-2 rounded-[var(--radius-panel)] border border-border bg-background p-3 ">
+              <div className="sticky bottom-4 z-10 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-panel)] border border-border bg-background/95 p-3 shadow-lg">
+                <p className="text-xs text-muted-foreground">Unsaved routing changes</p>
+                <div className="flex gap-2">
                 <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>Discard</Button>
                 <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>{saveMutation.isPending ? 'Saving...' : 'Save chain'}</Button>
+                </div>
               </div>
             )}
 
-            {unconfiguredPlatforms.length > 0 && <p className="text-xs leading-5 text-muted-foreground">Hidden until you add keys: {unconfiguredPlatforms.join(', ')}</p>}
+            {unconfiguredPlatforms.length > 0 ? <InlineNotice>Catalog providers without enabled credentials are excluded from this routing list: {unconfiguredPlatforms.join(', ')}.</InlineNotice> : null}
           </>
         )}
       </div>

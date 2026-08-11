@@ -21,11 +21,19 @@ describe('Crypto', () => {
     const b = encrypt(original);
     expect(a.encrypted).not.toBe(b.encrypted);
     expect(a.iv).not.toBe(b.iv);
+    expect(a.iv).toHaveLength(24);
   });
 
   it('should fail to decrypt with wrong auth tag', () => {
     const { encrypted, iv } = encrypt('test-key');
     expect(() => decrypt(encrypted, iv, 'a'.repeat(32))).toThrow();
+  });
+
+  it('rejects malformed IV, tag, and ciphertext encodings before decryption', () => {
+    const value = encrypt('test-key');
+    expect(() => decrypt(value.encrypted, 'not-hex', value.authTag)).toThrow(/IV/);
+    expect(() => decrypt(value.encrypted, value.iv, 'xyz')).toThrow(/authentication tag/);
+    expect(() => decrypt('0xz', value.iv, value.authTag)).toThrow(/ciphertext/);
   });
 
   describe('maskKey', () => {
@@ -34,7 +42,7 @@ describe('Crypto', () => {
     });
 
     it('should mask short keys', () => {
-      expect(maskKey('abcd')).toBe('****abcd');
+      expect(maskKey('abcd')).toBe('********');
     });
   });
 });

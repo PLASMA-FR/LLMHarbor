@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { createServer } from 'node:http';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 
 describe('OpenAICompatProvider', () => {
@@ -105,6 +106,37 @@ describe('OpenAICompatProvider', () => {
     ).rejects.toThrow(/Too many requests/);
   });
 
+  it('rejects malformed successful responses instead of forwarding provider-specific garbage', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.reject(new SyntaxError('bad json')),
+    } as any);
+    await expect(provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model'))
+      .rejects.toMatchObject({ code: 'malformed_provider_response', retryable: true });
+
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ object: 'unexpected', choices: [] }) as any);
+    await expect(provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model'))
+      .rejects.toThrow(/without choices/i);
+  });
+
+  it('rejects malformed tool calls and normalizes negative choice indices', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: null, tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup' } }] },
+        finish_reason: 'tool_calls',
+      }],
+    }) as any);
+    await expect(provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model'))
+      .rejects.toThrow(/malformed tool call/i);
+
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
+      choices: [{ index: -3, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    }) as any);
+    const response = await provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model');
+    expect(response.choices[0].index).toBe(0);
+  });
+
   it('should validate key using models endpoint', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, status: 200 } as any);
     expect(await provider.validateKey('valid')).toBe(true);
@@ -188,13 +220,185 @@ describe('OpenAICompatProvider', () => {
   });
 
   it('validateKey returns false on confirmed 401', async () => {
-    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: false, status: 401 } as any);
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ cancel: () => { cancelled = true; } });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(body, { status: 401 }) as any);
     expect(await provider.validateKey('bad')).toBe(false);
+    expect(cancelled).toBe(true);
+  });
+
+  it('validateKey reports transient HTTP failures as provider errors', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response('unavailable', { status: 503 }) as any);
+    await expect(provider.validateKey('temporarily-unavailable'))
+      .rejects.toMatchObject({ statusCode: 503, retryable: true });
   });
 
   it('validateKey propagates transport errors instead of swallowing', async () => {
     vi.spyOn(global, 'fetch').mockRejectedValueOnce(new Error('ECONNREFUSED'));
     await expect(provider.validateKey('any')).rejects.toThrow(/ECONNREFUSED/);
+  });
+
+  it('blocks redirects for user-configured endpoints', async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data' });
+      response.end();
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Expected an IP listener');
+    const custom = new OpenAICompatProvider({
+      platform: 'custom-local',
+      name: 'Custom local',
+      baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      allowRedirects: false,
+    });
+    try {
+      await expect(custom.listModels('key')).rejects.toMatchObject({ statusCode: 302 });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('rejects an empty or wholly malformed upstream stream', async () => {
+    const empty = new ReadableStream({ start(controller) { controller.close(); } });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: empty } as any);
+    await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
+      .rejects.toThrow(/empty stream/i);
+
+    const encoder = new TextEncoder();
+    const malformed = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {not-json}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: malformed } as any);
+    await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
+      .rejects.toThrow(/only malformed frames/i);
+  });
+
+  it('forwards stream_options and accepts a valid usage-only trailer after a completion choice', async () => {
+    let requestBody: any;
+    const encoder = new TextEncoder();
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n'));
+          controller.enqueue(encoder.encode('data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      }));
+    });
+    const chunks = await collectStream(provider.streamChatCompletion(
+      'key', [{ role: 'user', content: 'hi' }], 'model', { stream_options: { include_usage: true } },
+    ));
+    expect(requestBody.stream_options).toEqual({ include_usage: true });
+    expect(chunks).toHaveLength(3);
+    expect((chunks[1] as any).usage.total_tokens).toBe(3);
+    expect((chunks[2] as any).choices[0].finish_reason).toBe('stop');
+  });
+
+  it('normalizes sparse stream metadata and choice indices consistently', async () => {
+    const encoder = new TextEncoder();
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"index":-1,"delta":{"content":"a"}}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"changes-must-not-leak","choices":[{"delta":{"content":"b"},"finish_reason":"stop"}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    })));
+    const chunks = await collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'requested-model')) as any[];
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toMatchObject({ object: 'chat.completion.chunk', model: 'requested-model', choices: [{ index: 0 }] });
+    expect(chunks[0].id).toMatch(/^chatcmpl-/);
+    expect(chunks[1].id).toBe(chunks[0].id);
+    expect(chunks[1].created).toBe(chunks[0].created);
+    expect(chunks[1].choices[0].index).toBe(0);
+  });
+
+  it('rejects a stream delta with non-string content', async () => {
+    const encoder = new TextEncoder();
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"content":{"text":"bad"}}}]}\n\ndata: [DONE]\n\n'));
+        controller.close();
+      },
+    })));
+    await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
+      .rejects.toThrow(/malformed frames/i);
+  });
+
+  it('preserves a terminal safety refusal without falling back as an empty stream', async () => {
+    const encoder = new TextEncoder();
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"refusal":"I cannot help with that."},"finish_reason":"content_filter"}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    })));
+    const chunks = await collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'unsafe' }], 'model')) as any[];
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].choices[0]).toMatchObject({
+      delta: { refusal: 'I cannot help with that.' },
+      finish_reason: 'content_filter',
+    });
+  });
+
+  it('rejects usage-only streams and choices:[] frames without valid usage', async () => {
+    const encoder = new TextEncoder();
+    const stream = (frame: string) => new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(`data: ${frame}\n\ndata: [DONE]\n\n`));
+        controller.close();
+      },
+    });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(stream('{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}')));
+    await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
+      .rejects.toThrow(/usage without any completion choices/i);
+
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(stream('{"choices":[]}')));
+    await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
+      .rejects.toThrow(/only malformed frames/i);
+  });
+
+  it('keeps the timeout active while a non-streaming response body is consumed', async () => {
+    class ShortBodyTimeoutProvider extends OpenAICompatProvider {
+      protected override fetchWithTimeout(url: string, init: RequestInit, headersTimeoutMs?: number) {
+        return super.fetchWithTimeout(url, init, headersTimeoutMs, 20);
+      }
+    }
+    const shortTimeout = new ShortBodyTimeoutProvider({
+      platform: 'custom-timeout', name: 'Slow body', baseUrl: 'http://127.0.0.1:8080/v1', timeoutMs: 20,
+    });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(new ReadableStream({
+      start() { /* headers arrive, but the body never makes progress */ },
+    }), { status: 200 }));
+    await expect(shortTimeout.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model'))
+      .rejects.toThrow(/body timed out/i);
+  });
+
+  it('propagates caller cancellation into response body consumption', async () => {
+    const controller = new AbortController();
+    let upstreamSignal: AbortSignal | null = null;
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (_url, init) => {
+      upstreamSignal = init?.signal as AbortSignal;
+      return {
+        ok: true,
+        json: () => init?.signal?.aborted
+          ? Promise.reject(init.signal.reason)
+          : new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+          }),
+      } as any;
+    });
+    const completion = provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model', { signal: controller.signal });
+    controller.abort();
+    await expect(completion).rejects.toThrow();
+    expect(upstreamSignal?.aborted).toBe(true);
   });
 
   it('folds reasoning_content into content when content is empty (Z.ai glm-4.5-flash style)', async () => {
@@ -330,6 +534,21 @@ describe('OpenAICompatProvider', () => {
     expect(result.choices[0].message.content).toBe('Hello!');
   });
 
+  it('maps max_tokens to max_output_tokens for the ChatGPT Responses adapter', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    let requestBody: any;
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return { ok: true, body: sseStream([{ delta: 'ok' }]) } as any;
+    });
+    await openai.chatCompletion(
+      'token', [{ role: 'system', content: 'Be concise.' }, { role: 'user', content: 'hello' }], 'gpt-5.5',
+      { max_tokens: 321, oauth: { accountId: 1, provider: 'openai' } },
+    );
+    expect(requestBody.max_output_tokens).toBe(321);
+    expect(requestBody.instructions).toBe('Be concise.');
+  });
+
   it('streams only suffixes for cumulative ChatGPT Codex OAuth events', async () => {
     const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
     const stream = sseStream([
@@ -340,6 +559,7 @@ describe('OpenAICompatProvider', () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: stream } as any);
 
     const chunks: string[] = [];
+    let finishReason: string | null = null;
     for await (const chunk of openai.streamChatCompletion(
       'token',
       [{ role: 'user', content: 'how are you' }],
@@ -348,9 +568,76 @@ describe('OpenAICompatProvider', () => {
     )) {
       const content = chunk.choices[0]?.delta?.content;
       if (content) chunks.push(content);
+      if (chunk.choices[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
     }
 
     expect(chunks.join('')).toBe('I’m doing well, thanks!');
+    expect(finishReason).toBe('stop');
+  });
+
+  it('does not expose reasoning or function-argument deltas as assistant text', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      body: sseStream([
+        { type: 'response.reasoning_text.delta', delta: 'private reasoning' },
+        { type: 'response.function_call_arguments.delta', delta: '{"secret":true}' },
+        { type: 'response.output_text.delta', delta: 'public answer' },
+      ]),
+    } as any);
+
+    const result = await openai.chatCompletion(
+      'token', [{ role: 'user', content: 'hello' }], 'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    );
+    expect(result.choices[0].message.content).toBe('public answer');
+  });
+
+  it('normalizes ChatGPT Responses refusals without routing around them', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      body: sseStream([
+        { type: 'response.refusal.delta', delta: 'I cannot help with that.' },
+      ]),
+    } as any);
+
+    const chunks = await collectStream(openai.streamChatCompletion(
+      'token', [{ role: 'user', content: 'hello' }], 'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    )) as any[];
+    expect(chunks.map(chunk => chunk.choices[0]?.delta?.refusal ?? '').join('')).toBe('I cannot help with that.');
+    expect(chunks.at(-1)?.choices[0]?.finish_reason).toBe('content_filter');
+  });
+
+  it('rejects an empty ChatGPT Codex OAuth stream', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: sseStream([]) } as any);
+    await expect(openai.chatCompletion(
+      'token', [{ role: 'user', content: 'hello' }], 'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    )).rejects.toMatchObject({ code: 'malformed_provider_response' });
+  });
+
+  it('rejects truncated ChatGPT Codex OAuth streams after partial output', async () => {
+    const openai = new OpenAICompatProvider({ platform: 'openai', name: 'OpenAI', baseUrl: 'https://api.openai.com/v1' });
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      body: truncatedSseStream([{ type: 'response.output_text.delta', delta: 'partial' }]),
+    } as any);
+    await expect(openai.chatCompletion(
+      'token', [{ role: 'user', content: 'hello' }], 'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    )).rejects.toThrow(/truncated/i);
+
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      body: truncatedSseStream([{ type: 'response.output_text.delta', delta: 'partial' }]),
+    } as any);
+    await expect(collectStream(openai.streamChatCompletion(
+      'token', [{ role: 'user', content: 'hello' }], 'gpt-5.5',
+      { oauth: { accountId: 1, provider: 'openai' } },
+    ))).rejects.toThrow(/truncated/i);
   });
 });
 
@@ -363,6 +650,22 @@ function sseStream(events: unknown[]) {
       controller.close();
     },
   });
+}
+
+function truncatedSseStream(events: unknown[]) {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const event of events) controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      controller.close();
+    },
+  });
+}
+
+async function collectStream(stream: AsyncIterable<unknown>): Promise<unknown[]> {
+  const values: unknown[] = [];
+  for await (const value of stream) values.push(value);
+  return values;
 }
 
 describe('OpenAICompatProvider - platform instances', () => {

@@ -3,7 +3,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { initEncryptionKey } from '../lib/crypto.js';
+import { assertEncryptionKeyDecryptsDatabase, clearEncryptionKey, initEncryptionKey } from '../lib/crypto.js';
+import { toUtcTimestamp } from '../lib/time.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/llmharbor.db');
@@ -11,6 +12,43 @@ const LEGACY_DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
 
 let db: Database.Database;
 let activeDbPath = DB_PATH;
+let ephemeralPrimaryClientSecret: string | null = null;
+let lastClientUsageCleanupAt = 0;
+const clientCapacityReservations = new Map<string, { clientId: number; tokens: number; requestReserved: boolean }>();
+const clientReservedCapacity = new Map<number, { requests: number; tokens: number }>();
+const clientRequestMemory = new Map<number, number[]>();
+const clientTokenMemory = new Map<number, Array<{ timestamp: number; tokens: number }>>();
+const clientUsageOverflowUntil = new Map<string, number>();
+let lastClientUsageWarningAt = 0;
+const MAX_UNPERSISTED_CLIENT_USAGE_EVENTS = 10_000;
+let nextClientReservationId = 1;
+const activeDatabaseOperations = new Set<Promise<unknown>>();
+let acceptingDatabaseOperations = true;
+
+function trackDatabaseOperation<T>(operation: () => Promise<T>): Promise<T> {
+  if (!acceptingDatabaseOperations) return Promise.reject(new Error('Database operations are shutting down.'));
+  const promise = operation();
+  activeDatabaseOperations.add(promise);
+  void promise.finally(() => activeDatabaseOperations.delete(promise)).catch(() => {});
+  return promise;
+}
+
+export async function stopDatabaseOperations(): Promise<void> {
+  acceptingDatabaseOperations = false;
+  await Promise.allSettled(Array.from(activeDatabaseOperations));
+}
+
+function hardenDataDirectory(databasePath: string): void {
+  if (databasePath === ':memory:' || process.platform === 'win32') return;
+  try { fs.chmodSync(path.dirname(databasePath), 0o700); } catch { /* best effort on unsupported filesystems */ }
+}
+
+function hardenDatabaseFiles(databasePath: string): void {
+  if (databasePath === ':memory:' || process.platform === 'win32') return;
+  for (const suffix of ['', '-wal', '-shm', '.key']) {
+    try { fs.chmodSync(`${databasePath}${suffix}`, 0o600); } catch { /* file may be lazy/nonexistent */ }
+  }
+}
 
 export function getDb(): Database.Database {
   if (!db) {
@@ -19,16 +57,46 @@ export function getDb(): Database.Database {
   return db;
 }
 
+export function closeDb(): void {
+  if (db?.open) {
+    if (activeDbPath !== ':memory:') {
+      try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* shutdown remains best effort */ }
+      hardenDatabaseFiles(activeDbPath);
+    }
+    db.close();
+  }
+  ephemeralPrimaryClientSecret = null;
+  lastClientUsageCleanupAt = 0;
+  clientCapacityReservations.clear();
+  clientReservedCapacity.clear();
+  clientRequestMemory.clear();
+  clientTokenMemory.clear();
+  clientUsageOverflowUntil.clear();
+  clearEncryptionKey();
+}
+
 export function initDb(dbPath?: string): Database.Database {
   const resolvedPath = dbPath ?? DB_PATH;
   activeDbPath = resolvedPath;
   const isMemory = resolvedPath === ':memory:';
 
+  // Tests, restores, and embedders can initialize more than one database in a
+  // process. Do not leak the previous connection or accidentally reveal a
+  // primary client secret that belongs to a different database.
+  if (db?.open) db.close();
+  ephemeralPrimaryClientSecret = null;
+  clientCapacityReservations.clear();
+  clientReservedCapacity.clear();
+  clientRequestMemory.clear();
+  clientTokenMemory.clear();
+  clientUsageOverflowUntil.clear();
+
   if (!isMemory) {
     const dataDir = path.dirname(resolvedPath);
     if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
+      fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     }
+    hardenDataDirectory(resolvedPath);
 
     if (!dbPath && resolvedPath === DB_PATH && !fs.existsSync(DB_PATH) && fs.existsSync(LEGACY_DB_PATH)) {
       fs.copyFileSync(LEGACY_DB_PATH, DB_PATH);
@@ -37,32 +105,24 @@ export function initDb(dbPath?: string): Database.Database {
         if (fs.existsSync(legacySidecar)) fs.copyFileSync(legacySidecar, `${DB_PATH}${suffix}`);
       }
     }
+    activatePendingRestore(resolvedPath);
   }
 
   db = new Database(resolvedPath);
-  if (!isMemory) db.pragma('journal_mode = WAL');
+  if (!isMemory) {
+    db.pragma('journal_mode = WAL');
+    hardenDatabaseFiles(resolvedPath);
+  }
+  db.pragma('busy_timeout = 5000');
+  db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
 
   createTables(db);
-  initEncryptionKey(db);
+  initEncryptionKey(db, isMemory ? undefined : `${resolvedPath}.key`);
   seedModels(db);
-  migrateModels(db);
-  migrateModelsV2(db);
-  migrateModelsV3Ranks(db);
-  migrateModelsV4(db);
-  migrateModelsV5(db);
-  migrateModelsV6(db);
-  migrateModelsV7(db);
-  migrateModelsV8(db);
-  migrateModelsV9(db);
-  migrateModelsV10(db);
-  migrateModelsV11(db);
-  migrateModelsV12(db);
-  migrateModelsV13(db);
-  migrateModelsV14(db);
-  migrateModelsV15(db);
-  ensureBrowserAccountModels(db);
+  applyCatalogMigrations(db);
   ensureUnifiedKey(db);
+  if (!isMemory) hardenDatabaseFiles(resolvedPath);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
@@ -73,7 +133,7 @@ export function getDbPath(): string {
 }
 
 export async function backupDbToFile(destinationPath: string): Promise<void> {
-  await getDb().backup(destinationPath);
+  await trackDatabaseOperation(() => getDb().backup(destinationPath));
 }
 
 function validateBackupDatabase(sourcePath: string) {
@@ -95,27 +155,317 @@ function validateBackupDatabase(sourcePath: string) {
     ];
     const missing = requiredTables.filter(table => !candidate.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
     if (missing.length > 0) throw new Error(`Backup is missing required table(s): ${missing.join(', ')}`);
+    const requiredColumns: Record<string, string[]> = {
+      models: ['id', 'platform', 'model_id', 'display_name', 'enabled'],
+      api_keys: ['id', 'platform', 'encrypted_key', 'iv', 'auth_tag', 'enabled', 'status'],
+      settings: ['key', 'value'],
+      client_api_keys: ['id', 'key_hash', 'enabled'],
+      oauth_accounts: ['id', 'provider', 'encrypted_access_token', 'access_iv', 'access_auth_tag', 'enabled'],
+    };
+    for (const [table, columns] of Object.entries(requiredColumns)) {
+      const present = new Set((candidate.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>).map(column => column.name));
+      const absent = columns.filter(column => !present.has(column));
+      if (absent.length > 0) throw new Error(`Backup table ${table} is missing required column(s): ${absent.join(', ')}`);
+    }
+  } finally {
+    candidate.close();
+  }
+  validateBackupStartupCompatibility(sourcePath);
+}
+
+function validateBackupStartupCompatibility(sourcePath: string): void {
+  const temporaryPath = `${sourcePath}.startup-preflight-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  let candidate: Database.Database | null = null;
+  try {
+    fs.copyFileSync(sourcePath, temporaryPath);
+    candidate = new Database(temporaryPath);
+    candidate.pragma('foreign_keys = ON');
+    candidate.pragma('busy_timeout = 5000');
+    // Exercise the same schema repair, seed, and one-time migration path used
+    // at startup against an isolated clone. Table-name-only validation cannot
+    // catch missing columns referenced by indexes or migration statements.
+    createTables(candidate);
+    seedModels(candidate);
+    applyCatalogMigrations(candidate);
+    const foreignKeyErrors = candidate.pragma('foreign_key_check') as unknown[];
+    if (foreignKeyErrors.length > 0) {
+      throw new Error(`Backup fails foreign_key_check (${foreignKeyErrors.length} violation(s)).`);
+    }
+  } finally {
+    try { candidate?.close(); } catch {}
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { fs.rmSync(`${temporaryPath}${suffix}`, { force: true }); } catch {}
+    }
+  }
+}
+
+function validateBackupCredentialKey(sourcePath: string, credentialKeyHex: string): void {
+  const candidate = new Database(sourcePath, { readonly: true, fileMustExist: true });
+  try {
+    assertEncryptionKeyDecryptsDatabase(candidate, credentialKeyHex);
+    const legacy = candidate.prepare("SELECT value FROM settings WHERE key = 'encryption_key'").get() as { value: string } | undefined;
+    if (legacy) {
+      const normalizedLegacy = legacy.value.trim().toLowerCase();
+      const normalizedSelected = credentialKeyHex.trim().toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(normalizedLegacy)
+        || !/^[a-f0-9]{64}$/.test(normalizedSelected)
+        || !crypto.timingSafeEqual(Buffer.from(normalizedLegacy, 'hex'), Buffer.from(normalizedSelected, 'hex'))) {
+        throw new Error('Backup database-held legacy encryption key conflicts with the supplied credential key.');
+      }
+    }
   } finally {
     candidate.close();
   }
 }
 
-export function restoreDbFromBackupFile(sourcePath: string): { restoredPath: string; previousBackupPath: string | null } {
+function atomicCopyFile(sourcePath: string, destinationPath: string, mode = 0o600): void {
+  const temporaryPath = `${destinationPath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  let promoted = false;
+  try {
+    fs.copyFileSync(sourcePath, temporaryPath);
+    try { fs.chmodSync(temporaryPath, mode); } catch {}
+    const descriptor = fs.openSync(temporaryPath, 'r');
+    try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+    fs.renameSync(temporaryPath, destinationPath);
+    promoted = true;
+    fsyncParentDirectory(destinationPath);
+  } catch (error) {
+    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+    if (promoted) {
+      try { fs.rmSync(destinationPath, { force: true }); } catch {}
+    }
+    throw error;
+  }
+}
+
+function fsyncParentDirectory(filePath: string): void {
+  if (process.platform === 'win32') return;
+  const descriptor = fs.openSync(path.dirname(filePath), 'r');
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+}
+
+function atomicWritePrivateFile(destinationPath: string, value: string): void {
+  const temporaryPath = `${destinationPath}.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(temporaryPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, value, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = null;
+    fs.renameSync(temporaryPath, destinationPath);
+    try { fs.chmodSync(destinationPath, 0o600); } catch {}
+    fsyncParentDirectory(destinationPath);
+  } catch (error) {
+    if (descriptor !== null) try { fs.closeSync(descriptor); } catch {}
+    try { fs.rmSync(temporaryPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
+function configuredEncryptionKey(): string | null {
+  const value = process.env.ENCRYPTION_KEY;
+  return value && value !== 'your-64-char-hex-key-here' ? value : null;
+}
+
+function quarantinePendingRestore(databasePath: string, reason: unknown): void {
+  const pendingPath = `${databasePath}.pending-restore`;
+  const suffix = `.rejected-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  for (const source of [pendingPath, `${pendingPath}.key`, `${pendingPath}.ready`]) {
+    if (!fs.existsSync(source)) continue;
+    try { fs.renameSync(source, `${source}${suffix}`); } catch { /* preserve active DB even if quarantine is unavailable */ }
+  }
+  try { fsyncParentDirectory(databasePath); } catch {}
+  console.error(`Ignored an invalid staged database restore; the active database was preserved. ${String((reason as any)?.message ?? reason).slice(0, 240)}`);
+}
+
+function activatePendingRestore(databasePath: string): void {
+  const pendingPath = `${databasePath}.pending-restore`;
+  if (!fs.existsSync(pendingPath)) return;
+  const pendingKeyPath = `${pendingPath}.key`;
+  const readyPath = `${pendingPath}.ready`;
+  const configuredEnvKey = configuredEncryptionKey();
+  let credentialKeyHex: string;
+  try {
+    if (!fs.existsSync(readyPath) || !fs.existsSync(pendingKeyPath)) {
+      throw new Error('Pending restore pair is incomplete or was not atomically committed.');
+    }
+    const stagedKey = fs.readFileSync(pendingKeyPath, 'utf8').trim();
+    if (stagedKey.startsWith('env-sha256:')) {
+      if (!configuredEnvKey) throw new Error('Pending restore requires the configured ENCRYPTION_KEY.');
+      const expectedDigest = stagedKey.slice('env-sha256:'.length);
+      const actualDigest = crypto.createHash('sha256').update(configuredEnvKey).digest('hex');
+      if (!/^[a-f0-9]{64}$/.test(expectedDigest)
+        || !crypto.timingSafeEqual(Buffer.from(expectedDigest, 'hex'), Buffer.from(actualDigest, 'hex'))) {
+        throw new Error('Pending restore ENCRYPTION_KEY marker does not match the configured key.');
+      }
+      credentialKeyHex = configuredEnvKey;
+    } else {
+      credentialKeyHex = stagedKey;
+    }
+    validateBackupDatabase(pendingPath);
+    validateBackupCredentialKey(pendingPath, credentialKeyHex);
+    if (configuredEnvKey && configuredEnvKey.toLowerCase() !== credentialKeyHex.toLowerCase()) {
+      throw new Error('Pending restore credential key conflicts with ENCRYPTION_KEY.');
+    }
+  } catch (error) {
+    quarantinePendingRestore(databasePath, error);
+    return;
+  }
+
+  const swapPath = `${databasePath}.restore-swap-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const swapKeyPath = `${swapPath}.key`;
+  const moved: Array<{ from: string; to: string }> = [];
+  const installed = new Set<string>();
+  let activated = false;
+  try {
+    for (const suffix of ['', '-wal', '-shm']) {
+      const current = `${databasePath}${suffix}`;
+      if (fs.existsSync(current)) {
+        const swap = `${swapPath}${suffix}`;
+        fs.renameSync(current, swap);
+        moved.push({ from: swap, to: current });
+      }
+    }
+    const activeKeyPath = `${databasePath}.key`;
+    if (fs.existsSync(activeKeyPath)) {
+      fs.renameSync(activeKeyPath, swapKeyPath);
+      moved.push({ from: swapKeyPath, to: activeKeyPath });
+    }
+    atomicCopyFile(pendingPath, databasePath);
+    installed.add(databasePath);
+    // Explicit environment-key installations remain environment managed. The
+    // staged key is preflight material only and must not become a stale sidecar.
+    if (!configuredEnvKey) {
+      atomicCopyFile(pendingKeyPath, activeKeyPath);
+      installed.add(activeKeyPath);
+    }
+    hardenDatabaseFiles(databasePath);
+    // Validate the exact files now installed before treating the operation as
+    // committed. Until this succeeds, every original file remains recoverable
+    // from the swap paths below.
+    validateBackupDatabase(databasePath);
+    validateBackupCredentialKey(databasePath, credentialKeyHex);
+    activated = true;
+    console.log(`Activated staged database restore at ${databasePath}.`);
+  } catch (error) {
+    // Remove only files this activation installed. A failure while moving an
+    // original sidecar must never delete that still-active key.
+    for (const installedPath of installed) {
+      try { fs.rmSync(installedPath, { force: true }); } catch {}
+    }
+    let rollbackError: unknown = null;
+    for (const item of moved.reverse()) {
+      try { fs.renameSync(item.from, item.to); } catch (restoreError) { rollbackError ??= restoreError; }
+    }
+    try { fsyncParentDirectory(databasePath); } catch {}
+    if (!rollbackError) {
+      try { validateBackupDatabase(databasePath); } catch (validationError) { rollbackError = validationError; }
+    }
+    if (rollbackError) {
+      throw new Error(`Database restore activation and rollback failed: ${String((rollbackError as any)?.message ?? rollbackError)}`, { cause: error });
+    }
+    quarantinePendingRestore(databasePath, error);
+    return;
+  }
+
+  if (activated) {
+    // Cleanup is post-commit and best effort. A failure deleting a stale swap
+    // must never trigger rollback after some originals were already removed.
+    for (const item of moved) {
+      try { fs.rmSync(item.from, { force: true }); } catch {}
+    }
+    for (const staged of [pendingPath, pendingKeyPath, readyPath]) {
+      try { fs.rmSync(staged, { force: true }); } catch {}
+    }
+    try { fsyncParentDirectory(databasePath); } catch {}
+  }
+}
+
+export function stageDbRestoreFromBackupFile(
+  sourcePath: string,
+  credentialKeyHex: string,
+): Promise<{ restoredPath: string; pendingPath: string; previousBackupPath: string | null; restartRequired: true }> {
+  return trackDatabaseOperation(() => stageDbRestoreFromBackupFileSerialized(sourcePath, credentialKeyHex));
+}
+
+async function stageDbRestoreFromBackupFileSerialized(
+  sourcePath: string,
+  credentialKeyHex: string,
+): Promise<{ restoredPath: string; pendingPath: string; previousBackupPath: string | null; restartRequired: true }> {
+  const previousStage = restoreStageTail;
+  let releaseStage!: () => void;
+  restoreStageTail = new Promise<void>(resolve => { releaseStage = resolve; });
+  await previousStage;
+  try {
+    return await stageDbRestoreFromBackupFileUnlocked(sourcePath, credentialKeyHex);
+  } finally {
+    releaseStage();
+  }
+}
+
+let restoreStageTail: Promise<void> = Promise.resolve();
+
+async function stageDbRestoreFromBackupFileUnlocked(
+  sourcePath: string,
+  credentialKeyHex: string,
+): Promise<{ restoredPath: string; pendingPath: string; previousBackupPath: string | null; restartRequired: true }> {
   if (activeDbPath === ':memory:') throw new Error('Cannot restore a full-instance backup into an in-memory database. Use a file-backed database.');
   validateBackupDatabase(sourcePath);
+  const operatorRestoreKeyPath = `${activeDbPath}.restore-key`;
+  const hasOperatorRestoreKey = fs.existsSync(operatorRestoreKeyPath);
+  const restoreCredentialKeyHex = hasOperatorRestoreKey
+    ? fs.readFileSync(operatorRestoreKeyPath, 'utf8').trim()
+    : credentialKeyHex;
+  const envKey = configuredEncryptionKey();
+  validateBackupCredentialKey(sourcePath, restoreCredentialKeyHex);
 
   const previousBackupPath = fs.existsSync(activeDbPath)
     ? `${activeDbPath}.pre-import-${new Date().toISOString().replace(/[:.]/g, '-')}.bak`
     : null;
-  if (previousBackupPath) fs.copyFileSync(activeDbPath, previousBackupPath);
-
-  db.close();
-  for (const suffix of ['', '-wal', '-shm']) {
-    try { fs.rmSync(`${activeDbPath}${suffix}`, { force: true }); } catch {}
+  if (previousBackupPath) {
+    // The outer staged-restore operation is already registered for graceful
+    // shutdown; nesting through the public tracker would reject after drain starts.
+    await getDb().backup(previousBackupPath);
+    try { fs.chmodSync(previousBackupPath, 0o600); } catch { /* best effort on unsupported filesystems */ }
+    // This server-side rollback artifact is only useful if its encrypted
+    // credentials retain the active key. It is never returned by backup APIs.
+    if (!configuredEncryptionKey()) {
+      atomicWritePrivateFile(`${previousBackupPath}.key`, credentialKeyHex);
+    }
   }
-  fs.copyFileSync(sourcePath, activeDbPath);
-  initDb(activeDbPath);
-  return { restoredPath: activeDbPath, previousBackupPath };
+
+  const pendingPath = `${activeDbPath}.pending-restore`;
+  const pendingKeyPath = `${pendingPath}.key`;
+  const readyPath = `${pendingPath}.ready`;
+  const stageId = `${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const stagedDatabasePath = `${pendingPath}.stage-${stageId}`;
+  const stagedKeyPath = `${pendingKeyPath}.stage-${stageId}`;
+  try {
+    atomicCopyFile(sourcePath, stagedDatabasePath);
+    const stagedKeyMaterial = envKey && envKey.toLowerCase() === restoreCredentialKeyHex.toLowerCase()
+      ? `env-sha256:${crypto.createHash('sha256').update(envKey).digest('hex')}`
+      : restoreCredentialKeyHex;
+    atomicWritePrivateFile(stagedKeyPath, stagedKeyMaterial);
+    // The ready marker is the commit record. Activation ignores/quarantines
+    // incomplete pairs left by a crash before this final atomic write.
+    for (const old of [readyPath, pendingPath, pendingKeyPath]) {
+      try { fs.rmSync(old, { force: true }); } catch {}
+    }
+    fs.renameSync(stagedKeyPath, pendingKeyPath);
+    fsyncParentDirectory(pendingKeyPath);
+    fs.renameSync(stagedDatabasePath, pendingPath);
+    fsyncParentDirectory(pendingPath);
+    atomicWritePrivateFile(readyPath, 'ready\n');
+    if (hasOperatorRestoreKey) {
+      fs.rmSync(operatorRestoreKeyPath, { force: true });
+      fsyncParentDirectory(operatorRestoreKeyPath);
+    }
+  } finally {
+    try { fs.rmSync(stagedDatabasePath, { force: true }); } catch {}
+    try { fs.rmSync(stagedKeyPath, { force: true }); } catch {}
+  }
+  return { restoredPath: activeDbPath, pendingPath, previousBackupPath, restartRequired: true };
 }
 
 function createTables(db: Database.Database) {
@@ -162,8 +512,17 @@ function createTables(db: Database.Database) {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS requests (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT,
+      attempt INTEGER NOT NULL DEFAULT 1,
+      is_final INTEGER NOT NULL DEFAULT 1 CHECK (is_final IN (0, 1)),
       platform TEXT NOT NULL,
       model_id TEXT NOT NULL,
       key_id INTEGER,
@@ -246,6 +605,8 @@ function createTables(db: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       label TEXT NOT NULL DEFAULT 'Default key',
       key TEXT NOT NULL UNIQUE,
+      key_hash TEXT,
+      key_hint TEXT,
       local_endpoint_id INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -305,6 +666,15 @@ function createTables(db: Database.Database) {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS oauth_account_models (
+      oauth_account_id INTEGER NOT NULL REFERENCES oauth_accounts(id) ON DELETE CASCADE,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      supported INTEGER NOT NULL DEFAULT 1 CHECK (supported IN (0, 1)),
+      discovered_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (oauth_account_id, platform, model_id)
+    );
+
     CREATE TABLE IF NOT EXISTS oauth_login_states (
       state TEXT PRIMARY KEY,
       provider TEXT NOT NULL,
@@ -337,12 +707,16 @@ function createTables(db: Database.Database) {
 
     CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests(created_at);
     CREATE INDEX IF NOT EXISTS idx_requests_platform ON requests(platform);
+    CREATE INDEX IF NOT EXISTS idx_requests_status_created_at ON requests(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_requests_platform_model_created_at ON requests(platform, model_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
     CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_created_at_ms ON client_api_key_usage(created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
     CREATE INDEX IF NOT EXISTS idx_model_free_metadata_status ON model_free_metadata(verification_status);
     CREATE INDEX IF NOT EXISTS idx_free_model_updater_provider_preferences_selected ON free_model_updater_provider_preferences(selected);
+    CREATE INDEX IF NOT EXISTS idx_oauth_account_models_route ON oauth_account_models(platform, model_id, oauth_account_id, supported);
   `);
 
   db.prepare(`
@@ -351,7 +725,9 @@ function createTables(db: Database.Database) {
   `).run();
 
   ensureRequestKeyIdColumn(db);
+  ensureRequestAnalyticsColumns(db);
   ensureClientApiKeyEndpointColumn(db);
+  ensureClientApiKeyHashes(db);
   ensureApiKeyOAuthColumns(db);
   ensureOAuthAccountsProjectedAsKeys(db);
   ensureDefaultLocalEndpoint(db);
@@ -363,6 +739,17 @@ function ensureRequestKeyIdColumn(db: Database.Database) {
     db.prepare('ALTER TABLE requests ADD COLUMN key_id INTEGER').run();
   }
   db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_key_id ON requests(key_id)').run();
+}
+
+function ensureRequestAnalyticsColumns(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
+  const names = new Set(columns.map(column => column.name));
+  if (!names.has('request_id')) db.prepare('ALTER TABLE requests ADD COLUMN request_id TEXT').run();
+  if (!names.has('attempt')) db.prepare('ALTER TABLE requests ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1').run();
+  if (!names.has('is_final')) db.prepare('ALTER TABLE requests ADD COLUMN is_final INTEGER NOT NULL DEFAULT 1').run();
+  db.prepare("UPDATE requests SET request_id = 'legacy-' || id WHERE request_id IS NULL OR request_id = ''").run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_final_created_at ON requests(is_final, created_at DESC)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_request_attempt ON requests(request_id, attempt)').run();
 }
 
 function ensureClientApiKeyEndpointColumn(db: Database.Database) {
@@ -381,6 +768,68 @@ function ensureClientApiKeyEndpointColumn(db: Database.Database) {
   db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_platform_policies_lookup ON client_api_key_platform_policies(client_api_key_id, platform)').run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_client_api_key_model_policies_lookup ON client_api_key_model_policies(client_api_key_id, model_db_id)').run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_oauth_accounts_provider ON oauth_accounts(provider)').run();
+}
+
+function clientApiKeyHash(key: string): string {
+  return crypto.createHash('sha256').update(key, 'utf8').digest('hex');
+}
+
+function clientApiKeyHint(key: string): string {
+  if (key.length <= 18) return `${key.slice(0, 8)}••••`;
+  return `${key.slice(0, 13)}${'•'.repeat(8)}${key.slice(-6)}`;
+}
+
+function scrubbedClientKeyValue(): string {
+  // Keep the legacy NOT NULL/UNIQUE column populated until a future table
+  // rebuild can remove it. This value is an unrelated random marker, never an
+  // authentication secret.
+  return `hashed:${crypto.randomBytes(16).toString('hex')}`;
+}
+
+/**
+ * Migrate historical plaintext local API keys to one-way SHA-256 hashes.
+ * llmharbor-* keys contain 192 random bits, so a fast digest is appropriate:
+ * there is no human-password search space to defend with a slow KDF. The raw
+ * key remains valid for callers but cannot be recovered from the database.
+ */
+function ensureClientApiKeyHashes(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(client_api_keys)').all() as { name: string }[];
+  if (!columns.some(column => column.name === 'key_hash')) {
+    db.prepare('ALTER TABLE client_api_keys ADD COLUMN key_hash TEXT').run();
+  }
+  if (!columns.some(column => column.name === 'key_hint')) {
+    db.prepare('ALTER TABLE client_api_keys ADD COLUMN key_hint TEXT').run();
+  }
+
+  const legacyRows = db.prepare(`
+    SELECT id, key
+      FROM client_api_keys
+     WHERE key_hash IS NULL OR key_hash = ''
+  `).all() as Array<{ id: number; key: string }>;
+
+  const migrate = db.prepare(`
+    UPDATE client_api_keys
+       SET key = ?, key_hash = ?, key_hint = ?
+     WHERE id = ?
+  `);
+  const run = db.transaction(() => {
+    for (const row of legacyRows) {
+      migrate.run(scrubbedClientKeyValue(), clientApiKeyHash(row.key), clientApiKeyHint(row.key), row.id);
+    }
+    if (legacyRows.length > 0) {
+      db.prepare('DELETE FROM settings WHERE key = ?').run('unified_api_key');
+    }
+  });
+  run();
+  // A partially upgraded database may already contain hashes without hints.
+  // Never attempt to derive a hint from the scrubbed compatibility column.
+  db.prepare(`
+    UPDATE client_api_keys
+       SET key_hint = 'llmharbor-••••••••'
+     WHERE key_hash IS NOT NULL AND key_hash != ''
+       AND (key_hint IS NULL OR key_hint = '')
+  `).run();
+  db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_client_api_keys_key_hash ON client_api_keys(key_hash)').run();
 }
 
 function ensureApiKeyOAuthColumns(db: Database.Database) {
@@ -498,6 +947,55 @@ function ensureDefaultLocalEndpoint(db: Database.Database) {
     INSERT OR IGNORE INTO local_endpoint_domains (local_endpoint_id, domain)
     VALUES (1, '127.0.0.1:3001')
   `).run();
+}
+
+function applyCatalogMigrations(db: Database.Database) {
+  const migrations: Array<{ version: number; name: string; run: (database: Database.Database) => void }> = [
+    { version: 1, name: 'catalog-v1', run: migrateModels },
+    { version: 2, name: 'catalog-v2', run: migrateModelsV2 },
+    { version: 3, name: 'catalog-v3-ranks', run: migrateModelsV3Ranks },
+    { version: 4, name: 'catalog-v4', run: migrateModelsV4 },
+    { version: 5, name: 'catalog-v5', run: migrateModelsV5 },
+    { version: 6, name: 'catalog-v6', run: migrateModelsV6 },
+    { version: 7, name: 'catalog-v7', run: migrateModelsV7 },
+    { version: 8, name: 'catalog-v8', run: migrateModelsV8 },
+    { version: 9, name: 'catalog-v9', run: migrateModelsV9 },
+    { version: 10, name: 'catalog-v10', run: migrateModelsV10 },
+    { version: 11, name: 'catalog-v11', run: migrateModelsV11 },
+    { version: 12, name: 'catalog-v12', run: migrateModelsV12 },
+    { version: 13, name: 'catalog-v13', run: migrateModelsV13 },
+    { version: 14, name: 'catalog-v14', run: migrateModelsV14 },
+    { version: 15, name: 'catalog-v15', run: migrateModelsV15 },
+    { version: 16, name: 'browser-account-catalog-repair', run: ensureBrowserAccountModels },
+  ];
+  const appliedCount = (db.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get() as { count: number }).count;
+  if (appliedCount === 0) {
+    // Releases before the ledger already reapplied migrations through V15 on
+    // every boot. Detect that catalog marker and record the current baseline
+    // without touching operator-controlled enabled/fallback state again.
+    const currentLegacyCatalog = db.prepare(`
+      SELECT 1 FROM models
+       WHERE platform = 'freebuff' AND model_id = 'moonshotai/kimi-k2.6'
+       LIMIT 1
+    `).get();
+    if (currentLegacyCatalog) {
+      const markCurrent = db.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)');
+      db.transaction(() => {
+        for (const migration of migrations) markCurrent.run(migration.version, migration.name);
+      })();
+      return;
+    }
+  }
+
+  const isApplied = db.prepare('SELECT 1 FROM schema_migrations WHERE version = ?');
+  const markApplied = db.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)');
+  for (const migration of migrations) {
+    if (isApplied.get(migration.version)) continue;
+    db.transaction(() => {
+      migration.run(db);
+      markApplied.run(migration.version, migration.name);
+    })();
+  }
 }
 
 function seedModels(db: Database.Database) {
@@ -1656,31 +2154,30 @@ function createClientApiKey(): string {
   return `llmharbor-${crypto.randomBytes(24).toString('hex')}`;
 }
 
-function maskClientApiKey(key: string): string {
-  if (key.length <= 18) return `${key.slice(0, 8)}••••`;
-  return `${key.slice(0, 13)}${'•'.repeat(26)}${key.slice(-6)}`;
-}
-
 function ensureUnifiedKey(db: Database.Database) {
-  const existingClientKey = db.prepare('SELECT key FROM client_api_keys ORDER BY id ASC LIMIT 1').get() as { key: string } | undefined;
-  if (existingClientKey) return;
-
+  const existingClientKey = db.prepare('SELECT id FROM client_api_keys ORDER BY id ASC LIMIT 1').get() as { id: number } | undefined;
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
+  if (existingClientKey) {
+    // A partially upgraded database may already have a hashed client-key row
+    // while retaining the historical plaintext settings copy.
+    if (existing) db.prepare("DELETE FROM settings WHERE key = 'unified_api_key'").run();
+    return;
+  }
+
   let key = existing?.value ?? createClientApiKey();
 
   if (key.startsWith('freellmapi-')) {
     key = `llmharbor-${key.slice('freellmapi-'.length)}`;
-    db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
-  } else if (!existing) {
-    db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
   }
 
   db.prepare(`
-    INSERT OR IGNORE INTO client_api_keys (label, key, enabled)
-    VALUES ('Default key', ?, 1)
-  `).run(key);
+    INSERT OR IGNORE INTO client_api_keys (label, key, key_hash, key_hint, enabled)
+    VALUES ('Default key', ?, ?, ?, 1)
+  `).run(scrubbedClientKeyValue(), clientApiKeyHash(key), clientApiKeyHint(key));
+  db.prepare("DELETE FROM settings WHERE key = 'unified_api_key'").run();
+  ephemeralPrimaryClientSecret = key;
 
-  console.log('\n  Created a default LLMHarbor client key. Open the dashboard locally to copy it.\n');
+  console.log('\n  Created a default LLMHarbor client key. Regenerate it in the dashboard to reveal a new secret once.\n');
 }
 
 export interface ClientApiKeyLimits {
@@ -1751,13 +2248,14 @@ function rowToClientApiKey(row: any, includeSecret = false): ClientApiKeyRecord 
   return {
     id: row.id,
     label: row.label,
-    ...(includeSecret ? { key: row.key } : {}),
-    maskedKey: maskClientApiKey(row.key),
+    ...(includeSecret && typeof row.revealed_key === 'string' ? { key: row.revealed_key } : {}),
+    maskedKey: row.key_hint || 'llmharbor-••••••••',
     enabled: row.enabled === 1,
     localEndpointId: row.local_endpoint_id ?? null,
     limits: rowToClientApiKeyLimits(row),
-    createdAt: row.created_at,
-    lastUsedAt: row.last_used_at,
+    // created_at is NOT NULL at the schema boundary.
+    createdAt: toUtcTimestamp(row.created_at as string),
+    lastUsedAt: toUtcTimestamp(row.last_used_at),
   };
 }
 
@@ -1768,12 +2266,32 @@ export function listClientApiKeys(): ClientApiKeyRecord[] {
 }
 
 export function getUnifiedApiKey(): string {
-  const db = getDb();
-  const row = db.prepare('SELECT key FROM client_api_keys WHERE enabled = 1 ORDER BY id ASC LIMIT 1').get() as { key: string } | undefined;
-  if (row) return row.key;
-  const fallback = createClientApiKey();
-  db.prepare(`INSERT INTO client_api_keys (label, key, enabled) VALUES ('Default key', ?, 1)`).run(fallback);
-  return fallback;
+  if (ephemeralPrimaryClientSecret) return ephemeralPrimaryClientSecret;
+  throw new Error('The primary client API key is stored as a one-way hash and cannot be revealed. Regenerate it to receive a new secret once.');
+}
+
+export function getDashboardClientApiKey(requestedId?: number): AuthenticatedClientApiKey | null {
+  const row = requestedId === undefined
+    ? getDb().prepare(`
+    SELECT id, label, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit
+      FROM client_api_keys
+     WHERE enabled = 1
+     ORDER BY id ASC
+     LIMIT 1
+  `).get() as any | undefined
+    : getDb().prepare(`
+    SELECT id, label, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit
+      FROM client_api_keys
+     WHERE id = ? AND enabled = 1
+     LIMIT 1
+  `).get(requestedId) as any | undefined;
+  if (!row) return null;
+  return {
+    id: row.id,
+    label: row.label,
+    localEndpointId: row.local_endpoint_id ?? null,
+    limits: rowToClientApiKeyLimits(row),
+  };
 }
 
 export function createNamedClientApiKey(
@@ -1785,11 +2303,13 @@ export function createNamedClientApiKey(
   const key = createClientApiKey();
   const normalizedLimits = normalizeClientApiKeyLimits(limits);
   const result = db.prepare(`
-    INSERT INTO client_api_keys (label, key, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, enabled)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    INSERT INTO client_api_keys (label, key, key_hash, key_hint, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit, enabled)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
   `).run(
     label.trim() || 'Personal key',
-    key,
+    scrubbedClientKeyValue(),
+    clientApiKeyHash(key),
+    clientApiKeyHint(key),
     localEndpointId,
     normalizedLimits.rpm,
     normalizedLimits.rpd,
@@ -1797,7 +2317,7 @@ export function createNamedClientApiKey(
     normalizedLimits.tpd,
   );
   const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(result.lastInsertRowid) as any;
-  return rowToClientApiKey(row, true);
+  return rowToClientApiKey({ ...row, revealed_key: key }, true);
 }
 
 export function updateClientApiKey(
@@ -1830,7 +2350,6 @@ export function updateClientApiKey(
 export function deleteClientApiKey(id: number): boolean {
   const db = getDb();
   const result = db.prepare('DELETE FROM client_api_keys WHERE id = ?').run(id);
-  if (result.changes > 0) ensureUnifiedKey(db);
   return result.changes > 0;
 }
 
@@ -1839,117 +2358,267 @@ export function regenerateUnifiedKey(): string {
   const row = db.prepare('SELECT id FROM client_api_keys ORDER BY id ASC LIMIT 1').get() as { id: number } | undefined;
   const key = createClientApiKey();
   if (row) {
-    db.prepare('UPDATE client_api_keys SET key = ?, enabled = 1 WHERE id = ?').run(key, row.id);
+    db.prepare('UPDATE client_api_keys SET key = ?, key_hash = ?, key_hint = ?, enabled = 1 WHERE id = ?')
+      .run(scrubbedClientKeyValue(), clientApiKeyHash(key), clientApiKeyHint(key), row.id);
   } else {
-    db.prepare(`INSERT INTO client_api_keys (label, key, enabled) VALUES ('Default key', ?, 1)`).run(key);
+    db.prepare(`
+      INSERT INTO client_api_keys (label, key, key_hash, key_hint, enabled)
+      VALUES ('Default key', ?, ?, ?, 1)
+    `).run(scrubbedClientKeyValue(), clientApiKeyHash(key), clientApiKeyHint(key));
   }
-  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
+  db.prepare("DELETE FROM settings WHERE key = 'unified_api_key'").run();
+  ephemeralPrimaryClientSecret = key;
   return key;
 }
 
-export function authenticateClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): AuthenticatedClientApiKey | null {
+export function authenticateClientApiKey(provided: string, _compare?: (provided: string, expected: string) => boolean): AuthenticatedClientApiKey | null {
   const db = getDb();
-  const rows = db.prepare(`
-    SELECT id, label, key, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit
+  const row = db.prepare(`
+    SELECT id, label, local_endpoint_id, rpm_limit, rpd_limit, tpm_limit, tpd_limit
       FROM client_api_keys
-     WHERE enabled = 1
-  `).all() as any[];
-  for (const row of rows) {
-    if (compare(provided, row.key)) {
-      db.prepare("UPDATE client_api_keys SET last_used_at = datetime('now') WHERE id = ?").run(row.id);
-      return {
-        id: row.id,
-        label: row.label,
-        localEndpointId: row.local_endpoint_id ?? null,
-        limits: rowToClientApiKeyLimits(row),
-      };
-    }
-  }
-  return null;
+     WHERE enabled = 1 AND key_hash = ?
+     LIMIT 1
+  `).get(clientApiKeyHash(provided)) as any | undefined;
+  if (!row) return null;
+  // Keep useful recency without turning every proxy request into a SQLite
+  // write. A minute-level timestamp is sufficient for the dashboard.
+  db.prepare(`
+    UPDATE client_api_keys
+       SET last_used_at = datetime('now')
+     WHERE id = ?
+       AND (last_used_at IS NULL OR last_used_at < datetime('now', '-1 minute'))
+  `).run(row.id);
+  return {
+    id: row.id,
+    label: row.label,
+    localEndpointId: row.local_endpoint_id ?? null,
+    limits: rowToClientApiKeyLimits(row),
+  };
 }
 
-export function isValidClientApiKey(provided: string, compare: (provided: string, expected: string) => boolean): boolean {
+export function isValidClientApiKey(provided: string, compare?: (provided: string, expected: string) => boolean): boolean {
   return authenticateClientApiKey(provided, compare) !== null;
 }
 
 const CLIENT_USAGE_MINUTE_MS = 60_000;
 const CLIENT_USAGE_DAY_MS = 24 * 60 * 60 * 1000;
 
+function warnClientUsagePersistenceUnavailable(now = Date.now()): void {
+  if (now - lastClientUsageWarningAt < CLIENT_USAGE_MINUTE_MS) return;
+  lastClientUsageWarningAt = now;
+  console.error('[ClientLimits] SQLite usage persistence is unavailable; configured client-key limits are being enforced conservatively.');
+}
+
+function clientUsageOverflowKey(clientApiKeyId: number, kind: 'request' | 'tokens'): string {
+  return `${clientApiKeyId}:${kind}`;
+}
+
+function hasClientUsageOverflow(clientApiKeyId: number, kind: 'request' | 'tokens', now: number): boolean {
+  const key = clientUsageOverflowKey(clientApiKeyId, kind);
+  const until = clientUsageOverflowUntil.get(key);
+  if (!until) return false;
+  if (until <= now) {
+    clientUsageOverflowUntil.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function noteUnpersistedClientRequest(clientApiKeyId: number, now: number): void {
+  const events = (clientRequestMemory.get(clientApiKeyId) ?? [])
+    .filter(timestamp => timestamp >= now - CLIENT_USAGE_DAY_MS);
+  if (events.length >= MAX_UNPERSISTED_CLIENT_USAGE_EVENTS) {
+    clientUsageOverflowUntil.set(clientUsageOverflowKey(clientApiKeyId, 'request'), now + CLIENT_USAGE_DAY_MS);
+    return;
+  }
+  events.push(now);
+  clientRequestMemory.set(clientApiKeyId, events);
+}
+
+function noteUnpersistedClientTokens(clientApiKeyId: number, tokens: number, now: number): void {
+  const events = (clientTokenMemory.get(clientApiKeyId) ?? [])
+    .filter(event => event.timestamp >= now - CLIENT_USAGE_DAY_MS);
+  if (events.length >= MAX_UNPERSISTED_CLIENT_USAGE_EVENTS) {
+    clientUsageOverflowUntil.set(clientUsageOverflowKey(clientApiKeyId, 'tokens'), now + CLIENT_USAGE_DAY_MS);
+    return;
+  }
+  events.push({ timestamp: now, tokens });
+  clientTokenMemory.set(clientApiKeyId, events);
+}
+
 function clientRequestCount(clientApiKeyId: number, windowMs: number, now = Date.now()): number {
-  const row = getDb().prepare(`
-    SELECT COUNT(*) AS count
-      FROM client_api_key_usage
-     WHERE client_api_key_id = ?
-       AND kind = 'request'
-       AND created_at_ms >= ?
-  `).get(clientApiKeyId, now - windowMs) as { count: number };
-  return row.count ?? 0;
+  let persisted: number;
+  try {
+    const row = getDb().prepare(`
+      SELECT COUNT(*) AS count
+        FROM client_api_key_usage
+       WHERE client_api_key_id = ?
+         AND kind = 'request'
+         AND created_at_ms >= ?
+    `).get(clientApiKeyId, now - windowMs) as { count: number };
+    persisted = row.count ?? 0;
+  } catch {
+    warnClientUsagePersistenceUnavailable(now);
+    return Number.POSITIVE_INFINITY;
+  }
+  if (hasClientUsageOverflow(clientApiKeyId, 'request', now)) return Number.POSITIVE_INFINITY;
+  // Keep the full day of failed writes; derive minute/day counts without
+  // mutating away events needed by the longer RPD window.
+  const recentDay = (clientRequestMemory.get(clientApiKeyId) ?? [])
+    .filter(timestamp => timestamp >= now - CLIENT_USAGE_DAY_MS);
+  if (recentDay.length === 0) clientRequestMemory.delete(clientApiKeyId);
+  else clientRequestMemory.set(clientApiKeyId, recentDay);
+  return persisted + recentDay.filter(timestamp => timestamp >= now - windowMs).length;
 }
 
 function clientTokenCount(clientApiKeyId: number, windowMs: number, now = Date.now()): number {
-  const row = getDb().prepare(`
-    SELECT COALESCE(SUM(tokens), 0) AS tokens
-      FROM client_api_key_usage
-     WHERE client_api_key_id = ?
-       AND kind = 'tokens'
-       AND created_at_ms >= ?
-  `).get(clientApiKeyId, now - windowMs) as { tokens: number };
-  return row.tokens ?? 0;
+  let persisted: number;
+  try {
+    const row = getDb().prepare(`
+      SELECT COALESCE(SUM(tokens), 0) AS tokens
+        FROM client_api_key_usage
+       WHERE client_api_key_id = ?
+         AND kind = 'tokens'
+         AND created_at_ms >= ?
+    `).get(clientApiKeyId, now - windowMs) as { tokens: number };
+    persisted = row.tokens ?? 0;
+  } catch {
+    warnClientUsagePersistenceUnavailable(now);
+    return Number.POSITIVE_INFINITY;
+  }
+  if (hasClientUsageOverflow(clientApiKeyId, 'tokens', now)) return Number.POSITIVE_INFINITY;
+  const recentDay = (clientTokenMemory.get(clientApiKeyId) ?? [])
+    .filter(event => event.timestamp >= now - CLIENT_USAGE_DAY_MS);
+  if (recentDay.length === 0) clientTokenMemory.delete(clientApiKeyId);
+  else clientTokenMemory.set(clientApiKeyId, recentDay);
+  return persisted + recentDay
+    .filter(event => event.timestamp >= now - windowMs)
+    .reduce((total, event) => total + event.tokens, 0);
 }
 
 function retryAfterForClientLimit(clientApiKeyId: number, kind: 'request' | 'tokens', windowMs: number, now = Date.now()): number {
-  const row = getDb().prepare(`
-    SELECT MIN(created_at_ms) AS oldest
-      FROM client_api_key_usage
-     WHERE client_api_key_id = ?
-       AND kind = ?
-       AND created_at_ms >= ?
-  `).get(clientApiKeyId, kind, now - windowMs) as { oldest: number | null };
-  if (!row.oldest) return Math.ceil(windowMs / 1000);
-  return Math.max(1, Math.ceil((row.oldest + windowMs - now) / 1000));
+  try {
+    const row = getDb().prepare(`
+      SELECT MIN(created_at_ms) AS oldest
+        FROM client_api_key_usage
+       WHERE client_api_key_id = ?
+         AND kind = ?
+         AND created_at_ms >= ?
+    `).get(clientApiKeyId, kind, now - windowMs) as { oldest: number | null };
+    if (!row.oldest) return Math.ceil(windowMs / 1000);
+    return Math.max(1, Math.ceil((row.oldest + windowMs - now) / 1000));
+  } catch {
+    return Math.ceil(windowMs / 1000);
+  }
 }
 
 export function checkClientApiKeyLimits(
   clientKey: AuthenticatedClientApiKey,
   requestedTokens = 0,
 ): ClientApiKeyLimitBlock | null {
+  const { rpm, rpd, tpm, tpd } = clientKey.limits;
+  if (rpm === null && rpd === null && tpm === null && tpd === null) return null;
   const now = Date.now();
-  const checks: Array<{ metric: keyof ClientApiKeyLimits; limit: number | null; used: number; requested: number; kind: 'request' | 'tokens'; windowMs: number; label: string }> = [
-    { metric: 'rpm', limit: clientKey.limits.rpm, used: clientRequestCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now), requested: 1, kind: 'request', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'requests per minute' },
-    { metric: 'rpd', limit: clientKey.limits.rpd, used: clientRequestCount(clientKey.id, CLIENT_USAGE_DAY_MS, now), requested: 1, kind: 'request', windowMs: CLIENT_USAGE_DAY_MS, label: 'requests per day' },
-    { metric: 'tpm', limit: clientKey.limits.tpm, used: clientTokenCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now), requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'tokens per minute' },
-    { metric: 'tpd', limit: clientKey.limits.tpd, used: clientTokenCount(clientKey.id, CLIENT_USAGE_DAY_MS, now), requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_DAY_MS, label: 'tokens per day' },
-  ];
+  const reserved = clientReservedCapacity.get(clientKey.id) ?? { requests: 0, tokens: 0 };
+  const checks: Array<{ metric: keyof ClientApiKeyLimits; limit: number; used: number; requested: number; kind: 'request' | 'tokens'; windowMs: number; label: string }> = [];
+  if (rpm !== null) checks.push({ metric: 'rpm', limit: rpm, used: clientRequestCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now) + reserved.requests, requested: 1, kind: 'request', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'requests per minute' });
+  if (rpd !== null) checks.push({ metric: 'rpd', limit: rpd, used: clientRequestCount(clientKey.id, CLIENT_USAGE_DAY_MS, now) + reserved.requests, requested: 1, kind: 'request', windowMs: CLIENT_USAGE_DAY_MS, label: 'requests per day' });
+  if (tpm !== null) checks.push({ metric: 'tpm', limit: tpm, used: clientTokenCount(clientKey.id, CLIENT_USAGE_MINUTE_MS, now) + reserved.tokens, requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_MINUTE_MS, label: 'tokens per minute' });
+  if (tpd !== null) checks.push({ metric: 'tpd', limit: tpd, used: clientTokenCount(clientKey.id, CLIENT_USAGE_DAY_MS, now) + reserved.tokens, requested: Math.max(0, requestedTokens), kind: 'tokens', windowMs: CLIENT_USAGE_DAY_MS, label: 'tokens per day' });
 
   for (const check of checks) {
-    if (check.limit === null) continue;
     if (check.used + check.requested > check.limit) {
+      const reportedUsed = Number.isFinite(check.used) ? check.used : check.limit;
       return {
         blocked: true,
         metric: check.metric,
         limit: check.limit,
-        used: check.used,
+        used: reportedUsed,
         requested: check.requested,
         retryAfterSeconds: retryAfterForClientLimit(clientKey.id, check.kind, check.windowMs, now),
-        message: `Client API key '${clientKey.label}' exceeded its ${check.label} limit (${check.used}/${check.limit} used, ${check.requested} requested).`,
+        message: `Client API key '${clientKey.label}' exceeded its ${check.label} limit (${reportedUsed}/${check.limit} used, ${check.requested} requested).`,
       };
     }
   }
   return null;
 }
 
-export function recordClientApiKeyUsage(clientApiKeyId: number, totalTokens = 0) {
-  const db = getDb();
+export function reserveClientApiKeyCapacity(clientApiKeyId: number, estimatedTokens: number): string {
+  const totals = clientReservedCapacity.get(clientApiKeyId) ?? { requests: 0, tokens: 0 };
+  const tokens = Math.max(0, estimatedTokens);
+  totals.requests++;
+  totals.tokens += tokens;
+  clientReservedCapacity.set(clientApiKeyId, totals);
+  const id = `client-${process.pid}-${nextClientReservationId++}`;
+  clientCapacityReservations.set(id, { clientId: clientApiKeyId, tokens, requestReserved: true });
+  return id;
+}
+
+export function commitClientApiKeyRequestReservation(id: string): void {
+  const reservation = clientCapacityReservations.get(id);
+  if (!reservation?.requestReserved) return;
+  reservation.requestReserved = false;
+  const totals = clientReservedCapacity.get(reservation.clientId);
+  if (totals) totals.requests = Math.max(0, totals.requests - 1);
+}
+
+export function releaseClientApiKeyCapacity(id: string | undefined): void {
+  if (!id) return;
+  const reservation = clientCapacityReservations.get(id);
+  if (!reservation) return;
+  const totals = clientReservedCapacity.get(reservation.clientId);
+  if (totals) {
+    if (reservation.requestReserved) totals.requests = Math.max(0, totals.requests - 1);
+    totals.tokens = Math.max(0, totals.tokens - reservation.tokens);
+    if (totals.requests === 0 && totals.tokens === 0) clientReservedCapacity.delete(reservation.clientId);
+  }
+  clientCapacityReservations.delete(id);
+}
+
+function cleanupClientApiKeyUsage(db: Database.Database, now: number) {
+  if (now - lastClientUsageCleanupAt < 60 * 60 * 1000) return;
+  db.prepare('DELETE FROM client_api_key_usage WHERE created_at_ms < ?').run(now - (2 * CLIENT_USAGE_DAY_MS));
+  lastClientUsageCleanupAt = now;
+}
+
+export function recordClientApiKeyRequest(clientApiKeyId: number) {
   const now = Date.now();
-  db.prepare(`
-    INSERT INTO client_api_key_usage (client_api_key_id, kind, tokens, created_at_ms)
-    VALUES (?, 'request', 0, ?)
-  `).run(clientApiKeyId, now);
-  if (totalTokens > 0) {
+  let db: Database.Database;
+  try {
+    db = getDb();
+    db.prepare(`
+      INSERT INTO client_api_key_usage (client_api_key_id, kind, tokens, created_at_ms)
+      VALUES (?, 'request', 0, ?)
+    `).run(clientApiKeyId, now);
+  } catch {
+    noteUnpersistedClientRequest(clientApiKeyId, now);
+    warnClientUsagePersistenceUnavailable(now);
+    return;
+  }
+  try { cleanupClientApiKeyUsage(db, now); } catch { /* insertion already persisted; retry maintenance later */ }
+}
+
+export function recordClientApiKeyTokens(clientApiKeyId: number, totalTokens: number) {
+  if (!Number.isFinite(totalTokens) || totalTokens <= 0) return;
+  const now = Date.now();
+  const tokens = Math.ceil(totalTokens);
+  let db: Database.Database;
+  try {
+    db = getDb();
     db.prepare(`
       INSERT INTO client_api_key_usage (client_api_key_id, kind, tokens, created_at_ms)
       VALUES (?, 'tokens', ?, ?)
-    `).run(clientApiKeyId, Math.ceil(totalTokens), now);
+    `).run(clientApiKeyId, tokens, now);
+  } catch {
+    noteUnpersistedClientTokens(clientApiKeyId, tokens, now);
+    warnClientUsagePersistenceUnavailable(now);
+    return;
   }
-  db.prepare('DELETE FROM client_api_key_usage WHERE created_at_ms < ?').run(now - (2 * CLIENT_USAGE_DAY_MS));
+  try { cleanupClientApiKeyUsage(db, now); } catch { /* insertion already persisted; retry maintenance later */ }
+}
+
+/** @deprecated Prefer recording the inbound request and resulting tokens separately. */
+export function recordClientApiKeyUsage(clientApiKeyId: number, totalTokens = 0) {
+  recordClientApiKeyRequest(clientApiKeyId);
+  recordClientApiKeyTokens(clientApiKeyId, totalTokens);
 }

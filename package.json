@@ -11,14 +11,17 @@
   ],
   "scripts": {
     "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
+    "lint": "npm run lint -w client",
     "test": "npm run test -w server && npm run test -w client --if-present",
     "build": "npm run build -w server && npm run build -w client",
-    "build:server": "npm run build -w server"
+    "build:server": "npm run build -w server",
+    "check": "npm run lint && npm test && npm run build"
+  },
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0",
+    "npm": ">=10"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"
-  },
-  "overrides": {
-    "esbuild": "^0.25.12"
   }
 }

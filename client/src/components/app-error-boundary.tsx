@@ -27,7 +27,7 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, AppErro
           <p className="mt-2 text-sm leading-6 text-muted-foreground">
             The router is probably still running, but the UI hit a client-side error. Reload the dashboard; if it happens again, copy the message below.
           </p>
-          <pre className="mt-4 max-h-40 overflow-auto rounded-2xl bg-muted p-3 text-xs text-muted-foreground">
+          <pre className="mt-4 max-h-40 overflow-auto rounded-[var(--radius-panel)] bg-muted p-3 text-xs text-muted-foreground">
             {this.state.error.message}
           </pre>
           <div className="mt-5 flex flex-wrap gap-2">

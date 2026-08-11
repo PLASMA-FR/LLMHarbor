@@ -63,4 +63,29 @@ describe('CohereProvider', () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true } as any);
     expect(await provider.validateKey('valid')).toBe(true);
   });
+
+  it('rejects malformed successful responses', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ choices: [] }) as any);
+    await expect(provider.chatCompletion('key', [{ role: 'user', content: 'Hi' }], 'model'))
+      .rejects.toMatchObject({ code: 'malformed_provider_response', retryable: true });
+  });
+
+  it('uses typed upstream errors and rejects an all-malformed stream', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ error: { message: 'invalid key' } }, { status: 401 }) as any);
+    await expect(provider.chatCompletion('key', [{ role: 'user', content: 'Hi' }], 'model'))
+      .rejects.toMatchObject({ statusCode: 401, retryable: true });
+
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(
+      'data: {bad-json}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ) as any);
+    await expect(collect(provider.streamChatCompletion('key', [{ role: 'user', content: 'Hi' }], 'model')))
+      .rejects.toMatchObject({ code: 'malformed_provider_response' });
+  });
 });
+
+async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+  const values: T[] = [];
+  for await (const value of stream) values.push(value);
+  return values;
+}

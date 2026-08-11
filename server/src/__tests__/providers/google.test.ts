@@ -55,7 +55,40 @@ describe('GoogleProvider', () => {
 
     await expect(
       provider.chatCompletion('test-key', [{ role: 'user', content: 'Hi' }], 'gemini-2.5-pro')
-    ).rejects.toThrow(/Rate limit exceeded/);
+    ).rejects.toMatchObject({ message: expect.stringMatching(/Rate limit exceeded/), statusCode: 429, retryable: true });
+  });
+
+  it('bounds and validates Code Assist project discovery before routing', async () => {
+    let setupSignal: AbortSignal | undefined;
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (_url, init) => {
+      setupSignal = init?.signal ?? undefined;
+      return new Response('{not-json', { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    await expect(provider.chatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+      { oauth: { accountId: 7, provider: 'antigravity', metadata: {} } },
+    )).rejects.toMatchObject({ code: 'malformed_provider_response', retryable: true });
+    expect(setupSignal).toBeDefined();
+
+    vi.restoreAllMocks();
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({
+      ineligibleTiers: [{ reasonCode: 'VALIDATION_REQUIRED', reasonMessage: 'arbitrary upstream detail' }],
+    }));
+    await expect(provider.chatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+      { oauth: { accountId: 7, provider: 'antigravity', metadata: {} } },
+    )).rejects.toMatchObject({ statusCode: 403, retryable: true, code: 'oauth_account_verification_required' });
+  });
+
+  it('rejects a successful response without a completion candidate', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(Response.json({ candidates: [] }) as any);
+    await expect(provider.chatCompletion('test-key', [{ role: 'user', content: 'Hi' }], 'gemini-2.5-pro'))
+      .rejects.toMatchObject({ code: 'malformed_provider_response', retryable: true });
   });
 
   it('should validate key via models endpoint', async () => {
@@ -269,10 +302,7 @@ describe('GoogleProvider', () => {
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('stop');
   });
 
-  it('skips a malformed SSE frame instead of aborting the whole stream', async () => {
-    // Regression: previously an unguarded JSON.parse would propagate, killing
-    // the stream after a single bad chunk. Other providers (openai-compat,
-    // cohere, cloudflare) already protect this path with try/catch.
+  it('rejects malformed SSE instead of hiding a corrupted partial stream', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
       'data: {"candidates":[{"content":{"parts":[{"text":"Hel"}]}}]}\n\n',
       'data: {oops not json\n\n',
@@ -280,15 +310,34 @@ describe('GoogleProvider', () => {
       'data: [DONE]\n\n',
     ]));
 
-    const chunks = await collect(provider.streamChatCompletion(
+    await expect(collect(provider.streamChatCompletion(
       'test-key',
       [{ role: 'user', content: 'Hi' }],
       'gemini-2.5-pro',
-    ));
+    ))).rejects.toMatchObject({ code: 'malformed_provider_response' });
+  });
 
-    const text = chunks.map(c => c.choices[0].delta.content ?? '').join('');
-    expect(text).toBe('Hello');
-    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('stop');
+  it('rejects a truncated stream after partial content', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
+      'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n',
+    ]));
+
+    await expect(collect(provider.streamChatCompletion(
+      'test-key',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+    ))).rejects.toThrow(/truncated/i);
+  });
+
+  it('rejects a stream containing no valid candidates', async () => {
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce(sseResponse([
+      'data: {not-json}\n\n',
+      'data: {"usageMetadata":{"totalTokenCount":1}}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+    await expect(collect(provider.streamChatCompletion(
+      'test-key', [{ role: 'user', content: 'Hi' }], 'gemini-2.5-pro',
+    ))).rejects.toMatchObject({ code: 'malformed_provider_response' });
   });
 
   it('streams functionCall parts as tool_calls with finish_reason=tool_calls', async () => {
@@ -382,6 +431,35 @@ describe('GoogleProvider', () => {
     expect(capturedBody.request.systemInstruction.parts[1].text).toContain('[ignore]');
     expect(capturedBody.request.contents[0].parts[0].text).toBe('Hi');
     expect(result.choices[0].message.content).toBe('ahoy');
+  });
+
+  it('fails over to the alternate Code Assist host after a transport failure', async () => {
+    const urls: string[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      urls.push(typeof url === 'string' ? url : url.toString());
+      if (urls.length === 1) {
+        throw new TypeError('fetch failed', { cause: { code: 'ENOTFOUND' } });
+      }
+      return Response.json({
+        response: {
+          candidates: [{ content: { parts: [{ text: 'alternate host' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 2, totalTokenCount: 4 },
+        },
+      });
+    });
+
+    const result = await provider.chatCompletion(
+      'oauth-access-token',
+      [{ role: 'user', content: 'Hi' }],
+      'gemini-2.5-pro',
+      { oauth: { accountId: 7, provider: 'antigravity', metadata: { cloudaicompanionProject: 'cloud-project-123' } } },
+    );
+
+    expect(urls).toEqual([
+      'https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent',
+      'https://cloudcode-pa.googleapis.com/v1internal:generateContent',
+    ]);
+    expect(result.choices[0].message.content).toBe('alternate host');
   });
 
   it('uses Code Assist SSE endpoint for non-streaming Antigravity thinking models', async () => {

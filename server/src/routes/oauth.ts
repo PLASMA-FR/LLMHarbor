@@ -5,6 +5,9 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { safeUpstreamFailure } from '../lib/errors.js';
+import { parsePositiveResourceId } from '../lib/resourceId.js';
+import { toUtcTimestamp } from '../lib/time.js';
 import { refreshOAuthAccountInventory } from '../services/oauth-discovery.js';
 import { ANTIGRAVITY_OAUTH_CLIENT_ID, ANTIGRAVITY_OAUTH_TOKEN_URL, OPENAI_OAUTH_CLIENT_ID, OPENAI_OAUTH_TOKEN_URL, oauthTokenClient } from '../services/oauth-clients.js';
 
@@ -69,12 +72,20 @@ const BROWSER_OAUTH_PROVIDERS: BrowserOAuthProvider[] = [
 const FREEBUFF_AUTH_BASE_URLS = ['https://freebuff.com', 'https://www.codebuff.com'];
 const FREEBUFF_OAUTH_HEADERS = { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': 'Bun/1.3.11' };
 
+const oauthStateSchema = z.string().min(16).max(512);
+const oauthAuthorizationCodeSchema = z.string().min(1).max(16_384);
+
 const callbackSchema = z.object({
-  state: z.string().min(16),
-  code: z.string().min(1).optional(),
-  error: z.string().optional(),
-  error_description: z.string().optional(),
+  state: oauthStateSchema,
+  code: oauthAuthorizationCodeSchema.optional(),
+  error: z.string().max(256).optional(),
+  error_description: z.string().max(2_048).optional(),
 });
+
+const manualBrowserCallbackSchema = z.union([
+  z.object({ callbackUrl: z.string().trim().min(1).max(32_768) }).strict(),
+  z.object({ state: oauthStateSchema, code: oauthAuthorizationCodeSchema }).strict(),
+]);
 
 const updateAccountSchema = z.object({
   label: z.string().min(1).max(100).optional(),
@@ -85,6 +96,49 @@ const updateAccountSchema = z.object({
 
 let openaiCallbackServer: HttpServer | null = null;
 const googleCallbackServers = new Map<string, HttpServer>();
+const oauthCallbackControllers = new Set<AbortController>();
+
+function boundedRequestOperation(req: Request, res: Response, timeoutMs = 30_000): { signal: AbortSignal; cleanup: () => void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort(new DOMException('Client disconnected.', 'AbortError'));
+  const abortOnClose = () => {
+    if (!res.writableEnded) abort();
+  };
+  req.once('aborted', abort);
+  res.once('close', abortOnClose);
+  return {
+    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
+    cleanup: () => {
+      req.off('aborted', abort);
+      res.off('close', abortOnClose);
+    },
+  };
+}
+
+function cleanupOAuthLoginStates(): void {
+  getDb().prepare(`
+    DELETE FROM oauth_login_states
+     WHERE expires_at <= datetime('now')
+        OR (consumed_at IS NOT NULL AND consumed_at <= datetime('now', '-1 day'))
+  `).run();
+}
+
+function closeCallbackServer(server: HttpServer): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise(resolve => server.close(() => resolve()));
+}
+
+/** Stop localhost OAuth listeners and abort any in-flight token exchanges. */
+export async function stopOAuthCallbackServers(): Promise<void> {
+  for (const controller of oauthCallbackControllers) {
+    if (!controller.signal.aborted) controller.abort(new Error('LLMHarbor is shutting down.'));
+  }
+  const active = [openaiCallbackServer, ...googleCallbackServers.values()]
+    .filter((server): server is HttpServer => server !== null);
+  openaiCallbackServer = null;
+  googleCallbackServers.clear();
+  await Promise.all(active.map(closeCallbackServer));
+}
 
 function runtimePlatformFor(providerId: string) {
   if (providerId === 'openai') return 'openai';
@@ -130,14 +184,27 @@ function syncProviderKeyForOAuthAccount(accountId: number, rawAccessToken?: stri
   `).run(platform, label, access.encrypted, access.iv, access.authTag, enabled, accountId);
 }
 
-async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string, code: string) {
+async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string, code: string, signal?: AbortSignal) {
   if (!provider.clientId || !provider.tokenUrl) throw new Error(`${provider.name} is not a browser OAuth provider.`);
   const clientId = provider.clientId;
   const tokenUrl = provider.tokenUrl;
-  const stateRow = getDb().prepare(`
-    SELECT * FROM oauth_login_states
-    WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
-  `).get(state, provider.id) as any;
+  const db = getDb();
+  // Claim before the network exchange. OAuth authorization codes are
+  // single-use, so a failed exchange requires starting login again; allowing
+  // two callbacks to race would instead create duplicate accounts.
+  const stateRow = db.transaction(() => {
+    const row = db.prepare(`
+      SELECT * FROM oauth_login_states
+      WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
+    `).get(state, provider.id) as any;
+    if (!row) return null;
+    const claimed = db.prepare(`
+      UPDATE oauth_login_states
+         SET consumed_at = datetime('now')
+       WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
+    `).run(state, provider.id);
+    return claimed.changes === 1 ? row : null;
+  })();
   if (!stateRow) throw new Error('OAuth login state expired. Return to LLMHarbor and start login again.');
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -157,9 +224,17 @@ async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string,
     method: 'POST',
     headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString(),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(15_000)])
+      : AbortSignal.timeout(15_000),
   });
-  if (!upstream.ok) throw new Error(`${provider.name} token exchange failed with HTTP ${upstream.status}. ${(await upstream.text()).slice(0, 300)}`);
-  const tokenData = await upstream.json() as any;
+  if (!upstream.ok) {
+    await upstream.body?.cancel().catch(() => {});
+    throw new Error(`${provider.name} token exchange failed with HTTP ${upstream.status}.`);
+  }
+  const tokenData = await upstream.json().catch(() => {
+    throw new Error(`${provider.name} token exchange returned malformed JSON.`);
+  }) as any;
   if (!tokenData.access_token) throw new Error(`${provider.name} token response did not contain an access token.`);
   const access = encrypt(String(tokenData.access_token));
   const refresh = tokenData.refresh_token ? encrypt(String(tokenData.refresh_token)) : null;
@@ -173,9 +248,8 @@ async function finishBrowserOAuth(provider: BrowserOAuthProvider, state: string,
     `).run(provider.id, `${provider.name} - ${accountHint}`, accountHint, access.encrypted, access.iv, access.authTag, refresh?.encrypted ?? null, refresh?.iv ?? null, refresh?.authTag ?? null, expiresAt, JSON.stringify(metadataForToken(provider, tokenData, 'browser-oauth')));
     accountId = Number(result.lastInsertRowid);
     syncProviderKeyForOAuthAccount(accountId, String(tokenData.access_token));
-    getDb().prepare("UPDATE oauth_login_states SET consumed_at = datetime('now') WHERE state = ?").run(state);
   })();
-  try { await refreshOAuthAccountInventory(getDb(), accountId); } catch {}
+  try { await refreshOAuthAccountInventory(getDb(), accountId, signal); } catch {}
 }
 
 function ensureChatgptCallbackServer() {
@@ -183,8 +257,11 @@ function ensureChatgptCallbackServer() {
   const provider = providerById('openai');
   if (!provider) throw new Error('OpenAI provider is not registered');
   openaiCallbackServer = createServer(async (req, res) => {
+    const controller = new AbortController();
+    oauthCallbackControllers.add(controller);
     const url = new URL(req.url ?? '/', 'http://localhost:1455');
     if (url.pathname !== '/auth/callback') {
+      oauthCallbackControllers.delete(controller);
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not found');
       return;
@@ -195,12 +272,14 @@ function ensureChatgptCallbackServer() {
       const state = url.searchParams.get('state');
       const code = url.searchParams.get('code');
       if (!state || !code) throw new Error('Missing authorization code or state');
-      await finishBrowserOAuth(provider, state, code);
+      await finishBrowserOAuth(provider, state, code, controller.signal);
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<!doctype html><title>LLMHarbor connected</title><body style="font-family:system-ui;background:#0f1115;color:#f4f1ea;display:grid;place-items:center;min-height:100vh"><main><h1>Account connected</h1><p>You can close this window and return to LLMHarbor.</p><script>setTimeout(()=>window.close(),1800)</script></main></body>');
     } catch (error: any) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
       res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${escapeHtml(error?.message ?? error)}</p></body>`);
+    } finally {
+      oauthCallbackControllers.delete(controller);
     }
   });
   return new Promise<void>((resolve, reject) => {
@@ -261,12 +340,13 @@ function deviceExpiresAtMs(value: unknown) {
   return Number.isFinite(parsed) ? parsed : Date.now() + 10 * 60 * 1000;
 }
 
-async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider) {
+async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider, signal?: AbortSignal) {
   const fingerprintId = `llmharbor-${crypto.randomBytes(12).toString('hex')}`;
   let lastError = '';
   for (const authBaseUrl of FREEBUFF_AUTH_BASE_URLS) {
     const upstream = await fetch(`${authBaseUrl}/api/auth/cli/code`, {
       method: 'POST',
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
       headers: FREEBUFF_OAUTH_HEADERS,
       body: JSON.stringify({ fingerprintId }),
     }).catch(error => {
@@ -275,10 +355,11 @@ async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider) {
     });
     if (!upstream) continue;
     if (!upstream.ok) {
-      lastError = `HTTP ${upstream.status}: ${(await upstream.text().catch(() => '')).slice(0, 300)}`;
+      await upstream.body?.cancel().catch(() => {});
+      lastError = `HTTP ${upstream.status}`;
       continue;
     }
-    const data = await upstream.json() as any;
+    const data = await upstream.json().catch(() => null) as any;
     if (!data.loginUrl || !data.fingerprintHash || !data.expiresAt) {
       lastError = 'Login response did not include loginUrl, fingerprintHash, and expiresAt.';
       continue;
@@ -287,6 +368,7 @@ async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider) {
     const expiresAt = String(data.expiresAt);
     const expiresAtMs = deviceExpiresAtMs(data.expiresAt);
     const expiresInSeconds = Math.max(30, Math.floor((expiresAtMs - Date.now()) / 1000));
+    cleanupOAuthLoginStates();
     getDb().prepare(`
       INSERT INTO oauth_login_states (state, provider, code_verifier, redirect_uri, expires_at)
       VALUES (?, ?, ?, ?, datetime('now', ?))
@@ -311,7 +393,7 @@ async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider) {
   throw new Error(`Freebuff device login failed. ${lastError || 'No auth endpoint responded.'}`);
 }
 
-async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state: string) {
+async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state: string, signal?: AbortSignal) {
   const stateRow = getDb().prepare(`
     SELECT * FROM oauth_login_states
     WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
@@ -322,10 +404,18 @@ async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state
   statusUrl.searchParams.set('fingerprintId', device.fingerprintId);
   statusUrl.searchParams.set('fingerprintHash', device.fingerprintHash);
   statusUrl.searchParams.set('expiresAt', device.expiresAt);
-  const upstream = await fetch(statusUrl, { headers: { Accept: 'application/json', 'User-Agent': 'Bun/1.3.11' } });
+  const upstream = await fetch(statusUrl, {
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+    headers: { Accept: 'application/json', 'User-Agent': 'Bun/1.3.11' },
+  });
   if (upstream.status === 401) return { pending: true };
-  if (!upstream.ok) throw new Error(`Freebuff login status failed with HTTP ${upstream.status}. ${(await upstream.text()).slice(0, 300)}`);
-  const data = await upstream.json() as any;
+  if (!upstream.ok) {
+    await upstream.body?.cancel().catch(() => {});
+    throw new Error(`Freebuff login status failed with HTTP ${upstream.status}.`);
+  }
+  const data = await upstream.json().catch(() => {
+    throw new Error('Freebuff login status returned malformed JSON.');
+  }) as any;
   const user = data.user;
   if (!user?.authToken) return { pending: true };
 
@@ -334,6 +424,12 @@ async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state
   const accountHint = user.email ?? user.name ?? 'Freebuff account';
   let accountId = 0;
   getDb().transaction(() => {
+    const claimed = getDb().prepare(`
+      UPDATE oauth_login_states
+         SET consumed_at = datetime('now')
+       WHERE state = ? AND provider = ? AND consumed_at IS NULL AND expires_at > datetime('now')
+    `).run(state, provider.id);
+    if (claimed.changes !== 1) throw new Error('Device login was already completed. Start Freebuff login again.');
     const result = getDb().prepare(`
       INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, metadata_json, enabled)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1)
@@ -346,9 +442,8 @@ async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state
     }));
     accountId = Number(result.lastInsertRowid);
     syncProviderKeyForOAuthAccount(accountId, token);
-    getDb().prepare("UPDATE oauth_login_states SET consumed_at = datetime('now') WHERE state = ?").run(state);
   })();
-  try { await refreshOAuthAccountInventory(getDb(), accountId); } catch {}
+  try { await refreshOAuthAccountInventory(getDb(), accountId, signal); } catch {}
   const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(accountId) as any;
   return { account: rowToAccount(row) };
 }
@@ -358,8 +453,11 @@ function ensureAntigravityCallbackServer(provider: BrowserOAuthProvider) {
   if (existing?.listening) return Promise.resolve();
   const port = antigravityCallbackPort();
   const server = createServer(async (req, res) => {
+    const controller = new AbortController();
+    oauthCallbackControllers.add(controller);
     const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`);
     if (url.pathname !== '/oauth-callback') {
+      oauthCallbackControllers.delete(controller);
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not found');
       return;
@@ -370,12 +468,14 @@ function ensureAntigravityCallbackServer(provider: BrowserOAuthProvider) {
       const state = url.searchParams.get('state');
       const code = url.searchParams.get('code');
       if (!state || !code) throw new Error('Missing authorization code or state');
-      await finishBrowserOAuth(provider, state, code);
+      await finishBrowserOAuth(provider, state, code, controller.signal);
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<!doctype html><title>LLMHarbor connected</title><body style="font-family:system-ui;background:#0f1115;color:#f4f1ea;display:grid;place-items:center;min-height:100vh"><main><h1>Antigravity account connected</h1><p>You can close this window and return to LLMHarbor.</p><script>setTimeout(()=>window.close(),1800)</script></main></body>');
     } catch (error: any) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
       res.end(`<!doctype html><title>LLMHarbor OAuth failed</title><body style="font-family:system-ui"><h1>Connection failed</h1><p>${escapeHtml(error?.message ?? error)}</p></body>`);
+    } finally {
+      oauthCallbackControllers.delete(controller);
     }
   });
   googleCallbackServers.set(provider.id, server);
@@ -438,13 +538,13 @@ function rowToAccount(row: any) {
     accountHint: row.account_hint,
     maskedToken,
     enabled: row.enabled === 1,
-    expiresAt: row.expires_at,
-    lastUsedAt: row.last_used_at,
-    lastDiscoveredAt: row.last_discovered_at,
+    expiresAt: toUtcTimestamp(row.expires_at),
+    lastUsedAt: toUtcTimestamp(row.last_used_at),
+    lastDiscoveredAt: toUtcTimestamp(row.last_discovered_at),
     metadata,
     limits: Array.isArray(metadata.oauthLimits) ? metadata.oauthLimits : [],
     modelCount: typeof metadata.oauthModelCount === 'number' ? metadata.oauthModelCount : null,
-    createdAt: row.created_at,
+    createdAt: toUtcTimestamp(row.created_at),
   };
 }
 
@@ -457,6 +557,76 @@ function callbackUri(req: Request, providerId: string) {
   if (providerId === 'openai') return 'http://localhost:1455/auth/callback';
   if (providerId === 'antigravity') return 'http://localhost:51121/oauth-callback';
   return `${baseUrl(req)}/api/oauth/callback/${encodeURIComponent(providerId)}`;
+}
+
+type BrowserCallbackFields = { state: string; code: string };
+
+function browserCallbackFieldsFromUrl(req: Request, provider: BrowserOAuthProvider, rawCallbackUrl: string): BrowserCallbackFields {
+  let submitted: URL;
+  try {
+    submitted = new URL(rawCallbackUrl);
+  } catch {
+    throw new Error('Paste the complete callback URL from the browser address bar.');
+  }
+
+  const expected = new URL(callbackUri(req, provider.id));
+  if (submitted.protocol !== expected.protocol
+    || submitted.hostname.toLowerCase() !== expected.hostname.toLowerCase()
+    || submitted.port !== expected.port
+    || submitted.pathname !== expected.pathname
+    || submitted.username
+    || submitted.password
+    || submitted.hash) {
+    throw new Error(`The callback URL must begin with ${expected.origin}${expected.pathname}.`);
+  }
+
+  for (const name of ['state', 'code', 'error', 'error_description']) {
+    if (submitted.searchParams.getAll(name).length > 1) {
+      throw new Error('The callback URL contains duplicate OAuth parameters. Start login again.');
+    }
+  }
+
+  const parsed = callbackSchema.safeParse({
+    state: submitted.searchParams.get('state') ?? undefined,
+    code: submitted.searchParams.get('code') ?? undefined,
+    error: submitted.searchParams.get('error') ?? undefined,
+    error_description: submitted.searchParams.get('error_description') ?? undefined,
+  });
+  if (!parsed.success) {
+    throw new Error('The callback URL is missing a valid authorization code or state.');
+  }
+  if (parsed.data.error) {
+    throw new Error('The provider declined or could not complete authorization. Start login again.');
+  }
+  if (!parsed.data.code) {
+    throw new Error('The callback URL does not contain an authorization code.');
+  }
+  return { state: parsed.data.state, code: parsed.data.code };
+}
+
+function cachedAccountInventory(row: any) {
+  let metadata: Record<string, unknown> = {};
+  try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {}; } catch {}
+  const models = getDb().prepare(`
+    SELECT oam.model_id AS id, m.display_name AS displayName, m.context_window AS contextWindow
+      FROM oauth_account_models oam
+      LEFT JOIN models m ON m.platform = oam.platform AND m.model_id = oam.model_id
+     WHERE oam.oauth_account_id = ? AND oam.supported = 1
+     ORDER BY m.intelligence_rank ASC, oam.model_id ASC
+  `).all(row.id) as Array<{ id: string; displayName: string | null; contextWindow: number | null }>;
+  return {
+    models: models.map(model => ({
+      id: model.id,
+      object: 'model',
+      displayName: model.displayName ?? model.id,
+      ownedBy: row.provider,
+      contextWindow: model.contextWindow,
+      visibility: null,
+    })),
+    limits: Array.isArray(metadata.oauthLimits) ? metadata.oauthLimits : [],
+    provider: row.provider,
+    automatic: true,
+  };
 }
 
 oauthRouter.get('/providers', (_req: Request, res: Response) => {
@@ -475,10 +645,14 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
     return;
   }
   if (provider.loginMode === 'device-oauth') {
+    const operation = boundedRequestOperation(req, res);
     try {
-      res.json(await startFreebuffDeviceOAuth(provider));
+      const result = await startFreebuffDeviceOAuth(provider, operation.signal);
+      if (!operation.signal.aborted) res.json(result);
     } catch (error: any) {
-      res.status(502).json({ error: { message: String(error?.message ?? error) } });
+      if (!operation.signal.aborted) res.status(502).json({ error: { message: safeUpstreamFailure(error, 'OAuth login could not be started.') } });
+    } finally {
+      operation.cleanup();
     }
     return;
   }
@@ -507,6 +681,7 @@ oauthRouter.post('/connect/:provider/start', async (req: Request, res: Response)
   const state = crypto.randomUUID?.() ?? crypto.randomBytes(16).toString('hex');
   const verifier = base64Url(crypto.randomBytes(48));
   const redirectUri = callbackUri(req, provider.id);
+  cleanupOAuthLoginStates();
   getDb().prepare(`
     INSERT INTO oauth_login_states (state, provider, code_verifier, redirect_uri, expires_at)
     VALUES (?, ?, ?, ?, datetime('now', '+10 minutes'))
@@ -544,10 +719,83 @@ oauthRouter.post('/connect/:provider/complete', async (req: Request, res: Respon
     res.status(400).json({ error: { message: 'Device OAuth state is required' } });
     return;
   }
+  const operation = boundedRequestOperation(req, res);
   try {
-    res.json(await completeFreebuffDeviceOAuth(provider, state));
+    const result = await completeFreebuffDeviceOAuth(provider, state, operation.signal);
+    if (!operation.signal.aborted) res.json(result);
   } catch (error: any) {
-    res.status(502).json({ error: { message: String(error?.message ?? error) } });
+    if (!operation.signal.aborted) res.status(502).json({ error: { message: safeUpstreamFailure(error, 'OAuth login could not be completed.') } });
+  } finally {
+    operation.cleanup();
+  }
+});
+
+/**
+ * Complete a native-client loopback OAuth flow from a remote dashboard.
+ * The browser may fail to reach localhost on the LLMHarbor host, so the user
+ * can submit that exact failed callback URL. State is still claimed once and
+ * the stored PKCE verifier is still required by finishBrowserOAuth.
+ */
+oauthRouter.post('/connect/:provider/callback', async (req: Request, res: Response) => {
+  const provider = providerById(String(req.params.provider));
+  if (!provider || provider.loginMode !== 'browser-oauth') {
+    res.status(404).json({
+      error: {
+        message: 'Browser OAuth provider not found.',
+        type: 'invalid_request_error',
+        code: 'oauth_provider_not_found',
+      },
+    });
+    return;
+  }
+
+  const parsed = manualBrowserCallbackSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: 'Provide the full callbackUrl, or provide both code and state.',
+        type: 'invalid_request_error',
+        code: 'invalid_oauth_callback',
+      },
+    });
+    return;
+  }
+
+  let callback: BrowserCallbackFields;
+  try {
+    callback = 'callbackUrl' in parsed.data
+      ? browserCallbackFieldsFromUrl(req, provider, parsed.data.callbackUrl)
+      : parsed.data;
+  } catch (error) {
+    res.status(400).json({
+      error: {
+        message: String((error as Error)?.message ?? 'The callback URL is invalid.'),
+        type: 'invalid_request_error',
+        code: 'invalid_oauth_callback',
+      },
+    });
+    return;
+  }
+
+  const operation = boundedRequestOperation(req, res);
+  try {
+    await finishBrowserOAuth(provider, callback.state, callback.code, operation.signal);
+    if (!operation.signal.aborted) res.json({ connected: true });
+  } catch (error) {
+    if (!operation.signal.aborted) {
+      const stateRejected = /OAuth login state expired/i.test(String((error as Error)?.message ?? error));
+      res.status(stateRejected ? 400 : 502).json({
+        error: {
+          message: stateRejected
+            ? 'OAuth login state expired or was already used. Start login again.'
+            : safeUpstreamFailure(error, 'OAuth login could not be completed.'),
+          type: stateRejected ? 'invalid_request_error' : 'upstream_error',
+          code: stateRejected ? 'invalid_oauth_state' : 'oauth_exchange_failed',
+        },
+      });
+    }
+  } finally {
+    operation.cleanup();
   }
 });
 
@@ -566,19 +814,24 @@ oauthRouter.get('/callback/:provider', async (req: Request, res: Response) => {
     res.status(400).type('html').send(`${escapeHtml(provider.name)} did not return an authorization code.`);
     return;
   }
+  const operation = boundedRequestOperation(req, res);
   try {
-    await finishBrowserOAuth(provider, parsed.data.state, parsed.data.code);
+    await finishBrowserOAuth(provider, parsed.data.state, parsed.data.code, operation.signal);
   } catch (error: any) {
-    res.status(502).type('html').send(escapeHtml(error?.message ?? error));
+    const message = String(error?.message ?? error);
+    const status = /OAuth login state expired/i.test(message) ? 400 : 502;
+    res.status(status).type('html').send(escapeHtml(message));
+    operation.cleanup();
     return;
   }
+  operation.cleanup();
   res.redirect('/oauth?connected=1');
 });
 
 oauthRouter.patch('/accounts/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+  const id = parsePositiveResourceId(req.params.id);
   const parsed = updateAccountSchema.safeParse(req.body ?? {});
-  if (Number.isNaN(id)) {
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid account ID' } });
     return;
   }
@@ -586,42 +839,72 @@ oauthRouter.patch('/accounts/:id', (req: Request, res: Response) => {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
-  const existing = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(id) as any;
-  if (!existing) {
+  const db = getDb();
+  const row = db.transaction(() => {
+    const existing = db.prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(id) as any;
+    if (!existing) return null;
+    if (parsed.data.label !== undefined) db.prepare('UPDATE oauth_accounts SET label = ? WHERE id = ?').run(parsed.data.label.trim(), id);
+    if (parsed.data.enabled !== undefined) db.prepare('UPDATE oauth_accounts SET enabled = ? WHERE id = ?').run(parsed.data.enabled ? 1 : 0, id);
+    syncProviderKeyForOAuthAccount(id);
+    return db.prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(id) as any;
+  })();
+  if (!row) {
     res.status(404).json({ error: { message: 'OAuth account not found' } });
     return;
   }
-  if (parsed.data.label !== undefined) getDb().prepare('UPDATE oauth_accounts SET label = ? WHERE id = ?').run(parsed.data.label.trim(), id);
-  if (parsed.data.enabled !== undefined) getDb().prepare('UPDATE oauth_accounts SET enabled = ? WHERE id = ?').run(parsed.data.enabled ? 1 : 0, id);
-  syncProviderKeyForOAuthAccount(id);
-  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ?').get(id) as any;
   res.json(rowToAccount(row));
 });
 
 oauthRouter.delete('/accounts/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
-  if (Number.isNaN(id)) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid account ID' } });
     return;
   }
-  getDb().prepare('DELETE FROM api_keys WHERE oauth_account_id = ?').run(id);
-  const result = getDb().prepare('DELETE FROM oauth_accounts WHERE id = ?').run(id);
-  if (result.changes === 0) {
+  const db = getDb();
+  const deleted = db.transaction(() => {
+    const existing = db.prepare('SELECT 1 FROM oauth_accounts WHERE id = ?').get(id);
+    if (!existing) return false;
+    db.prepare('DELETE FROM api_keys WHERE oauth_account_id = ?').run(id);
+    db.prepare('DELETE FROM oauth_accounts WHERE id = ?').run(id);
+    return true;
+  })();
+  if (!deleted) {
     res.status(404).json({ error: { message: 'OAuth account not found' } });
     return;
   }
   res.json({ success: true });
 });
 
-oauthRouter.get('/accounts/:id/models', async (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+oauthRouter.get('/accounts/:id/models', (req: Request, res: Response) => {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
+    res.status(400).json({ error: { message: 'Invalid account ID' } });
+    return;
+  }
   const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ? AND enabled = 1').get(id) as any;
-  if (Number.isNaN(id) || !row) {
+  if (!row) {
     res.status(404).json({ error: { message: 'OAuth account not found' } });
     return;
   }
+  res.json(cachedAccountInventory(row));
+});
+
+oauthRouter.post('/accounts/:id/models/refresh', async (req: Request, res: Response) => {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
+    res.status(400).json({ error: { message: 'Invalid account ID' } });
+    return;
+  }
+  const row = getDb().prepare('SELECT * FROM oauth_accounts WHERE id = ? AND enabled = 1').get(id) as any;
+  if (!row) {
+    res.status(404).json({ error: { message: 'OAuth account not found' } });
+    return;
+  }
+  const operation = boundedRequestOperation(req, res, 120_000);
   try {
-    const discovered = await refreshOAuthAccountInventory(getDb(), id);
+    const discovered = await refreshOAuthAccountInventory(getDb(), id, operation.signal);
+    if (operation.signal.aborted) return;
     res.json({
       models: discovered.models.map(model => ({
         id: model.id,
@@ -636,6 +919,10 @@ oauthRouter.get('/accounts/:id/models', async (req: Request, res: Response) => {
       automatic: true,
     });
   } catch (error: any) {
-    res.status(502).json({ error: { message: String(error?.message ?? error) } });
+    if (!operation.signal.aborted) {
+      res.status(502).json({ error: { message: safeUpstreamFailure(error, 'OAuth model inventory refresh failed.') } });
+    }
+  } finally {
+    operation.cleanup();
   }
 });

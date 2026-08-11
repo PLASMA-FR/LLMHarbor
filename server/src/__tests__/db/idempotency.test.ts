@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import Database from 'better-sqlite3';
 import { initDb } from '../../db/index.js';
+import { encrypt } from '../../lib/crypto.js';
 
 /**
  * All migrations must be idempotent: running initDb twice on the same
@@ -102,14 +103,18 @@ describe('Migration idempotency', () => {
       VALUES ('google', 'gemini-legacy-oauth', 'Gemini Legacy (Google browser account)', 1, 1, 'Frontier', 1)
     `).run();
     db1.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 9999, 1)').run(Number(model.lastInsertRowid));
+    const legacyToken = encrypt('legacy-google-oauth-token');
     const account = db1.prepare(`
       INSERT INTO oauth_accounts (provider, label, account_hint, encrypted_access_token, access_iv, access_auth_tag, enabled)
-      VALUES ('google-ai-studio', 'Old Google OAuth', 'captain@example.com', 'enc', 'iv', 'tag', 1)
-    `).run();
+      VALUES ('google-ai-studio', 'Old Google OAuth', 'captain@example.com', ?, ?, ?, 1)
+    `).run(legacyToken.encrypted, legacyToken.iv, legacyToken.authTag);
     db1.prepare(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source, oauth_account_id)
-      VALUES ('google', 'Old Google OAuth', 'enc', 'iv', 'tag', 'healthy', 1, 'oauth', ?)
-    `).run(Number(account.lastInsertRowid));
+      VALUES ('google', 'Old Google OAuth', ?, ?, ?, 'healthy', 1, 'oauth', ?)
+    `).run(legacyToken.encrypted, legacyToken.iv, legacyToken.authTag, Number(account.lastInsertRowid));
+    // Simulate a database created immediately before the one-time browser
+    // account catalog repair migration was introduced.
+    db1.prepare('DELETE FROM schema_migrations WHERE version = 16').run();
     db1.close();
 
     const db2 = initDb(tmpPath);

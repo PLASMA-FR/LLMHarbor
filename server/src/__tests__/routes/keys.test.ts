@@ -30,7 +30,9 @@ describe('Keys API', () => {
 
   beforeEach(() => {
     const db = getDb();
+    db.prepare('DELETE FROM requests').run();
     db.prepare('DELETE FROM api_keys').run();
+    db.prepare("DELETE FROM custom_endpoints WHERE platform = 'custom-disabled-test'").run();
   });
 
   it('GET /api/keys returns empty array initially', async () => {
@@ -54,15 +56,20 @@ describe('Keys API', () => {
 
   it('GET /api/keys returns the created key', async () => {
     // First create a key
-    await request(app, 'POST', '/api/keys', {
+    const created = await request(app, 'POST', '/api/keys', {
       platform: 'groq',
       key: 'gsk_test123456789',
     });
+    getDb().prepare(`
+      INSERT INTO requests (request_id, attempt, is_final, platform, model_id, key_id, status)
+      VALUES ('keys-last-success', 1, 1, 'groq', 'test-model', ?, 'success')
+    `).run(created.body.id);
 
     const { status, body } = await request(app, 'GET', '/api/keys');
     expect(status).toBe(200);
     expect(body).toHaveLength(1);
     expect(body[0].platform).toBe('groq');
+    expect(body[0].lastSuccessAt).toMatch(/T.*Z$/);
   });
 
   it('POST /api/keys rejects invalid platform', async () => {
@@ -78,6 +85,57 @@ describe('Keys API', () => {
       platform: 'groq',
     });
     expect(status).toBe(400);
+  });
+
+  it('does not accept OAuth-only providers as pasted or bulk API-key targets', async () => {
+    const providers = await request(app, 'GET', '/api/keys/providers');
+    expect(providers.body.some((provider: any) => provider.platform === 'google-oauth')).toBe(false);
+    expect(providers.body.some((provider: any) => provider.platform === 'freebuff')).toBe(false);
+
+    const pasted = await request(app, 'POST', '/api/keys', {
+      platform: 'google-oauth',
+      key: 'must-not-be-stored-as-an-api-key',
+    });
+    expect(pasted.status).toBe(400);
+    expect(pasted.body.error.code).toBe('oauth_credentials_required');
+    expect(getDb().prepare("SELECT COUNT(*) AS count FROM api_keys WHERE platform = 'google-oauth'").get()).toEqual({ count: 0 });
+  });
+
+  it('keeps credentials for a disabled custom endpoint manageable', async () => {
+    getDb().prepare(`
+      INSERT INTO custom_endpoints (platform, name, base_url, enabled)
+      VALUES ('custom-disabled-test', 'Disabled test endpoint', 'https://example.com/v1', 0)
+    `).run();
+
+    const providers = await request(app, 'GET', '/api/keys/providers');
+    const target = providers.body.find((provider: any) => provider.platform === 'custom-disabled-test');
+    expect(target).toBeTruthy();
+
+    const created = await request(app, 'POST', '/api/keys', {
+      platform: 'custom-disabled-test',
+      key: 'disabled-endpoint-secret',
+    });
+    expect(created.status).toBe(201);
+
+    const toggled = await request(app, 'PATCH', '/api/keys/platform/custom-disabled-test', { enabled: false });
+    expect(toggled.status).toBe(200);
+    expect(toggled.body.updatedKeys).toBe(1);
+  });
+
+  it('bounds provider labels and secrets before storing them', async () => {
+    const oversizedLabel = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'valid-key',
+      label: 'l'.repeat(81),
+    });
+    expect(oversizedLabel.status).toBe(400);
+
+    const oversizedSecret = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'k'.repeat(16_385),
+    });
+    expect(oversizedSecret.status).toBe(400);
+    expect(getDb().prepare('SELECT COUNT(*) AS count FROM api_keys').get()).toEqual({ count: 0 });
   });
 
   it('DELETE /api/keys/:id removes a key', async () => {
@@ -121,6 +179,18 @@ describe('Keys API', () => {
     expect(listed.body.filter((key: any) => key.platform === 'google')).toHaveLength(2);
   });
 
+  it('POST /api/keys/import resolves the stable platform instead of an ephemeral list position', async () => {
+    const imported = await request(app, 'POST', '/api/keys/import', {
+      platform: 'groq',
+      contents: 'gsk-stable-target',
+    });
+
+    expect(imported.status).toBe(201);
+    expect(imported.body).toMatchObject({ platform: 'groq', imported: 1 });
+    const stored = getDb().prepare('SELECT platform FROM api_keys').get() as { platform: string };
+    expect(stored.platform).toBe('groq');
+  });
+
   it('POST /api/keys/import rejects unknown provider list ids', async () => {
     const { status, body } = await request(app, 'POST', '/api/keys/import', {
       providerId: 999,
@@ -128,6 +198,28 @@ describe('Keys API', () => {
     });
 
     expect(status).toBe(400);
-    expect(body.error.message).toContain('Unknown provider id');
+    expect(body.error.message).toContain("Unknown provider '999'");
+  });
+
+  it('rejects oversized bulk-import secrets atomically', async () => {
+    const imported = await request(app, 'POST', '/api/keys/import', {
+      providerId: 1,
+      contents: `valid-key\n${'k'.repeat(16_385)}`,
+    });
+
+    expect(imported.status).toBe(400);
+    expect(imported.body.error.message).toContain('at most 16384 characters');
+    expect(getDb().prepare('SELECT COUNT(*) AS count FROM api_keys').get()).toEqual({ count: 0 });
+  });
+
+  it('bounds bulk-import row count before writing any credentials', async () => {
+    const imported = await request(app, 'POST', '/api/keys/import', {
+      providerId: 1,
+      contents: Array.from({ length: 5_001 }, (_, index) => `key-${index}`).join('\n'),
+    });
+
+    expect(imported.status).toBe(400);
+    expect(imported.body.error.code).toBe('bulk_import_too_many_keys');
+    expect(getDb().prepare('SELECT COUNT(*) AS count FROM api_keys').get()).toEqual({ count: 0 });
   });
 });

@@ -16,6 +16,8 @@ import {
   isFreeModelProvider,
 } from '../lib/providerFreeModels.js';
 import { filterFreeModels } from './freeModelFilters.js';
+import { safeUpstreamFailure } from '../lib/errors.js';
+import { toUtcTimestamp } from '../lib/time.js';
 
 const MIN_INTERVAL_HOURS = 1;
 const MAX_INTERVAL_HOURS = 24;
@@ -29,7 +31,7 @@ export interface DiscoveryProvider {
   source?: 'built-in' | 'custom';
   detectionPolicy?: ProviderFreePolicy;
   canListAnonymously?: boolean;
-  listModels(apiKey: string): Promise<ProviderCatalogModel[]>;
+  listModels(apiKey: string, signal?: AbortSignal): Promise<ProviderCatalogModel[]>;
 }
 
 type KeyResolver = (platform: Platform) => string | null;
@@ -42,7 +44,7 @@ type ProbeResult = {
   noKey?: boolean;
 };
 
-type ProbeModel = (model: DetectedFreeModel) => Promise<ProbeResult>;
+type ProbeModel = (model: DetectedFreeModel, signal?: AbortSignal) => Promise<ProbeResult>;
 
 export interface FreeModelRefreshResult {
   success: boolean;
@@ -73,8 +75,8 @@ function rowToStatus(row: any): FreeModelUpdaterStatus {
   const providers = selectedVisiblePlatforms();
   return {
     enabled: row.enabled === 1,
-    lastRunAt: row.last_run_at,
-    nextRunAt: row.next_run_at,
+    lastRunAt: toUtcTimestamp(row.last_run_at),
+    nextRunAt: toUtcTimestamp(row.next_run_at),
     refreshIntervalHours: row.refresh_interval_hours,
     status: row.status,
     detectedCount: row.detected_count,
@@ -85,7 +87,7 @@ function rowToStatus(row: any): FreeModelUpdaterStatus {
 }
 
 function shortError(error: unknown): string {
-  return error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+  return safeUpstreamFailure(error, 'Provider operation failed.');
 }
 
 function selectedPlatforms(): Platform[] {
@@ -103,7 +105,7 @@ function hasEnabledKey(platform: Platform): boolean {
       FROM api_keys
      WHERE platform = ?
        AND enabled = 1
-       AND (status IN ('healthy', 'unknown') OR source = 'oauth')
+       AND (status IN ('healthy', 'unknown') OR (source = 'oauth' AND status NOT IN ('invalid', 'error')))
      LIMIT 1
   `).get(platform);
 }
@@ -175,7 +177,7 @@ function resolveDiscoveryProvider(platform: Platform): DiscoveryProvider | null 
     source: custom ? 'custom' : 'built-in',
     detectionPolicy: custom ? 'custom_catalog' : freeModelPolicyForPlatform(String(provider.platform)),
     canListAnonymously: custom || ANONYMOUS_MODEL_CATALOG_PLATFORMS.has(String(provider.platform)),
-    listModels: apiKey => provider.listModels(apiKey),
+    listModels: (apiKey, signal) => provider.listModels(apiKey, signal),
   };
 }
 
@@ -185,7 +187,7 @@ function defaultKeyResolver(platform: Platform): string | null {
       FROM api_keys
      WHERE platform = ?
        AND enabled = 1
-       AND (status IN ('healthy', 'unknown') OR source = 'oauth')
+       AND (status IN ('healthy', 'unknown') OR (source = 'oauth' AND status NOT IN ('invalid', 'error')))
      ORDER BY CASE status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, id DESC
      LIMIT 1
   `).get(platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
@@ -274,6 +276,9 @@ export class FreeModelUpdater {
   private readonly failRefreshOnProviderError: boolean;
   private intervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private idleWaiters: Array<() => void> = [];
+  private runController: AbortController | null = null;
+  private schedulerGeneration = 0;
 
   constructor(options: FreeModelUpdaterOptions = {}) {
     this.now = options.now ?? (() => new Date());
@@ -347,7 +352,7 @@ export class FreeModelUpdater {
       detectionMethod: row.detection_method,
       verificationStatus: row.verification_status,
       contextWindow: row.context_window,
-      lastVerifiedAt: row.last_verified_at,
+      lastVerifiedAt: toUtcTimestamp(row.last_verified_at),
       lastError: row.last_error,
     }));
   }
@@ -365,7 +370,7 @@ export class FreeModelUpdater {
              updated_at = datetime('now')
        WHERE id = 1
     `).run(interval, nextRunAt);
-    if (this.intervalId) this.start();
+    this.start();
     return this.getStatus();
   }
 
@@ -383,23 +388,37 @@ export class FreeModelUpdater {
   }
 
   start(): void {
-    const status = this.getStatus();
-    if (!status.enabled) return;
-    this.stop();
-    this.intervalId = setInterval(() => {
-      if (!this.getStatus().enabled) return;
-      this.refreshNow().catch(error => console.error('[FreeModelUpdater] refresh failed:', error));
-    }, status.refreshIntervalHours * 60 * 60 * 1000);
-    this.intervalId.unref?.();
-  }
-
-  stop(): void {
-    if (!this.intervalId) return;
-    clearInterval(this.intervalId);
+    const generation = ++this.schedulerGeneration;
+    if (this.intervalId) clearInterval(this.intervalId);
     this.intervalId = null;
+    this.runController?.abort(new Error('Free-model updater configuration changed.'));
+    const schedule = async () => {
+      if (this.running) await new Promise<void>(resolve => this.idleWaiters.push(resolve));
+      if (generation !== this.schedulerGeneration) return;
+      const status = this.getStatus();
+      if (!status.enabled) return;
+      this.intervalId = setInterval(() => {
+        if (!this.getStatus().enabled) return;
+        this.refreshNow().catch(error => console.error('[FreeModelUpdater] refresh failed:', shortError(error)));
+      }, status.refreshIntervalHours * 60 * 60 * 1000);
+      this.intervalId.unref?.();
+    };
+    void schedule();
   }
 
-  private async discoverFreeModels(): Promise<DiscoveryRun> {
+  async stop(): Promise<void> {
+    this.schedulerGeneration++;
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+    this.runController?.abort(new Error('Free-model updater stopped.'));
+    if (this.running) {
+      await new Promise<void>(resolve => this.idleWaiters.push(resolve));
+    }
+  }
+
+  private async discoverFreeModels(signal?: AbortSignal): Promise<DiscoveryRun> {
     const selected = selectedVisiblePlatforms();
     const providers = this.providers
       ? this.providers.filter(provider => selected.includes(provider.platform))
@@ -410,6 +429,7 @@ export class FreeModelUpdater {
     const errors: string[] = [];
 
     for (const provider of providers) {
+      if (signal?.aborted) throw signal.reason ?? new Error('Free-model updater stopped.');
       const platform = String(provider.platform);
       const source = provider.source ?? (isCustomEndpoint(provider.platform) ? 'custom' : 'built-in');
       const policy = provider.detectionPolicy ?? (source === 'custom' ? 'custom_catalog' : freeModelPolicyForPlatform(platform));
@@ -419,7 +439,8 @@ export class FreeModelUpdater {
 
       if (key || canListAnonymously) {
         try {
-          catalog = await provider.listModels(key ?? '');
+          catalog = await provider.listModels(key ?? '', signal);
+          if (signal?.aborted) throw signal.reason ?? new Error('Free-model updater stopped.');
           scannedProviders.push({ platform: provider.platform, source });
         } catch (error) {
           errors.push(`${platform}: ${shortError(error)}`);
@@ -439,10 +460,12 @@ export class FreeModelUpdater {
         const probeCandidates = catalog
           .map(row => catalogRowProbeCandidate(provider.platform, row))
           .filter((model): model is DetectedFreeModel => model !== null);
-        const probe = this.injectedProbeModel ?? (model => this.defaultProbeModel(model));
+        const probe = this.injectedProbeModel ?? ((model, runSignal) => this.defaultProbeModel(model, runSignal));
         const accepted = new Map<string, DetectedFreeModel>();
         await runWithConcurrency(probeCandidates, PROBE_CONCURRENCY, async model => {
-          const result = await probe(model);
+          if (signal?.aborted) throw signal.reason ?? new Error('Free-model updater stopped.');
+          const result = await probe(model, signal);
+          if (signal?.aborted) throw signal.reason ?? new Error('Free-model updater stopped.');
           if (!result.ok) return;
           const keyForModel = detectedKey(model);
           accepted.set(keyForModel, explicitFree.get(keyForModel) ?? model);
@@ -519,7 +542,7 @@ export class FreeModelUpdater {
     return modelDbId;
   }
 
-  private async defaultProbeModel(model: DetectedFreeModel): Promise<ProbeResult> {
+  private async defaultProbeModel(model: DetectedFreeModel, signal?: AbortSignal): Promise<ProbeResult> {
     const apiKey = this.keyResolver(model.platform);
     const canProbeAnonymously = isCustomEndpoint(model.platform);
     if (!apiKey && !canProbeAnonymously) return { ok: false, noKey: true, message: 'No enabled key available for probe.' };
@@ -532,7 +555,7 @@ export class FreeModelUpdater {
       const completion = await provider.chatCompletion(apiKey ?? '', [
         { role: 'system', content: 'Reply with exactly: harbor-ok' },
         { role: 'user', content: 'LLMHarbor free model probe.' },
-      ], model.modelId, { temperature: 0, max_tokens: 16 });
+      ], model.modelId, { temperature: 0, max_tokens: 16, signal });
       const content = completion.choices?.[0]?.message?.content;
       return {
         ok: true,
@@ -638,6 +661,8 @@ export class FreeModelUpdater {
     }
 
     this.running = true;
+    const runController = new AbortController();
+    this.runController = runController;
     const startedAt = this.now().toISOString();
     getDb().prepare(`
       UPDATE free_model_updater_settings
@@ -646,19 +671,24 @@ export class FreeModelUpdater {
     `).run();
 
     try {
-      const discovery = await this.discoverFreeModels();
+      const discovery = await this.discoverFreeModels(runController.signal);
+      if (runController.signal.aborted) throw runController.signal.reason;
       const detected = discovery.detected;
       const modelDbIds: number[] = [];
       for (const model of detected) {
+        if (runController.signal.aborted) throw runController.signal.reason;
         modelDbIds.push(this.upsertDetectedModel(model));
       }
 
-      const probe = this.injectedProbeModel ?? (model => this.defaultProbeModel(model));
+      const probe = this.injectedProbeModel ?? ((model, signal) => this.defaultProbeModel(model, signal));
       await runWithConcurrency(detected.map((model, index) => ({ model, modelDbId: modelDbIds[index] })), PROBE_CONCURRENCY, async item => {
-        const result = discovery.probeResults.get(detectedKey(item.model)) ?? await probe(item.model);
+        if (runController.signal.aborted) throw runController.signal.reason;
+        const result = discovery.probeResults.get(detectedKey(item.model)) ?? await probe(item.model, runController.signal);
+        if (runController.signal.aborted) throw runController.signal.reason;
         this.applyProbeResult(item.modelDbId, result);
       });
 
+      if (runController.signal.aborted) throw runController.signal.reason;
       this.expireMissingModels(modelDbIds, discovery.scannedProviders);
       const status = this.getStatus();
       const nextRunAt = status.enabled
@@ -676,6 +706,14 @@ export class FreeModelUpdater {
       `).run(startedAt, nextRunAt, detected.length);
       return { success: true, detectedCount: detected.length };
     } catch (error) {
+      if (runController.signal.aborted) {
+        getDb().prepare(`
+          UPDATE free_model_updater_settings
+             SET status = 'idle', error_message = NULL, updated_at = datetime('now')
+           WHERE id = 1
+        `).run();
+        return { success: false, skipped: true, detectedCount: this.getStatus().detectedCount };
+      }
       getDb().prepare(`
         UPDATE free_model_updater_settings
            SET status = 'error',
@@ -685,7 +723,9 @@ export class FreeModelUpdater {
       `).run(shortError(error));
       throw error;
     } finally {
+      if (this.runController === runController) this.runController = null;
       this.running = false;
+      for (const resolve of this.idleWaiters.splice(0)) resolve();
     }
   }
 }
@@ -696,6 +736,6 @@ export function startFreeModelUpdater(): void {
   freeModelUpdater.start();
 }
 
-export function stopFreeModelUpdater(): void {
-  freeModelUpdater.stop();
+export function stopFreeModelUpdater(): Promise<void> {
+  return freeModelUpdater.stop();
 }

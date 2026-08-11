@@ -1,4 +1,5 @@
 import { clientApiKeyLimitsFromRow, getDb } from '../db/index.js';
+import { toUtcTimestamp } from '../lib/time.js';
 import { getBuiltInProviderSummaries } from '../providers/index.js';
 
 export type LocalApiRouteId = 'v1.chat.completions' | 'v1.models';
@@ -28,28 +29,61 @@ export interface ClientAccessPolicyPatch {
 
 export interface ClientAccessDenial {
   status: number;
-  code: 'local_api_route_denied' | 'provider_endpoint_access_denied' | 'model_access_denied';
+  code: 'local_api_route_denied' | 'local_endpoint_binding_denied' | 'provider_endpoint_access_denied' | 'model_access_denied';
   message: string;
+}
+
+export function getClientEndpointBindingDenial(
+  client: { localEndpointId: number | null },
+  requestedSlug: string | null,
+): ClientAccessDenial | null {
+  // Modern keys (null) and keys attached to the default endpoint use /v1.
+  if (client.localEndpointId === null || client.localEndpointId === 1) {
+    return requestedSlug === null
+      ? null
+      : {
+        status: 403,
+        code: 'local_endpoint_binding_denied',
+        message: 'This local API key is not assigned to the requested compatibility endpoint.',
+      };
+  }
+
+  const endpoint = getDb().prepare('SELECT slug, enabled FROM local_endpoints WHERE id = ?').get(client.localEndpointId) as { slug: string; enabled: number } | undefined;
+  if (!endpoint || endpoint.enabled !== 1 || requestedSlug !== endpoint.slug) {
+    return {
+      status: 403,
+      code: 'local_endpoint_binding_denied',
+      message: 'This local API key is not assigned to the requested compatibility endpoint.',
+    };
+  }
+  return null;
+}
+
+export function isClientLegacyEndpointPlatformAllowed(client: { localEndpointId: number | null }, platform: string): boolean {
+  if (client.localEndpointId === null || client.localEndpointId === 1) return true;
+  const count = getDb().prepare('SELECT COUNT(*) AS count FROM local_endpoint_provider_scopes WHERE local_endpoint_id = ?')
+    .get(client.localEndpointId) as { count: number };
+  if (count.count === 0) return true;
+  return Boolean(getDb().prepare(`
+    SELECT 1 FROM local_endpoint_provider_scopes
+     WHERE local_endpoint_id = ? AND platform = ?
+  `).get(client.localEndpointId, platform));
 }
 
 function boolFromRow(row: { enabled: number } | undefined): boolean {
   return row ? row.enabled !== 0 : true;
 }
 
-function maskClientApiKey(key: string): string {
-  return key.length <= 18 ? `${key.slice(0, 8)}••••` : `${key.slice(0, 13)}${'•'.repeat(26)}${key.slice(-6)}`;
-}
-
 function keyToJson(row: any) {
   return {
     id: row.id,
     label: row.label,
-    maskedKey: maskClientApiKey(row.key),
+    maskedKey: row.key_hint || 'llmharbor-••••••••',
     enabled: row.enabled === 1,
     localEndpointId: row.local_endpoint_id ?? null,
     limits: clientApiKeyLimitsFromRow(row),
-    createdAt: row.created_at,
-    lastUsedAt: row.last_used_at,
+    createdAt: toUtcTimestamp(row.created_at),
+    lastUsedAt: toUtcTimestamp(row.last_used_at),
   };
 }
 

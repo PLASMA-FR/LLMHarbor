@@ -6,6 +6,7 @@ import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
 import { getDb } from '../db/index.js';
+import { normalizeCustomEndpointUrl } from '../lib/urlSecurity.js';
 
 const providers = new Map<string, BaseProvider>();
 const dynamicProviders = new Map<string, BaseProvider>();
@@ -180,9 +181,10 @@ export function getProvider(platform: string): BaseProvider | undefined {
     const provider = new OpenAICompatProvider({
       platform: row.platform,
       name: row.name,
-      baseUrl: row.base_url.replace(/\/+$/, ''),
-      validateUrl: row.validate_url || undefined,
+      baseUrl: normalizeCustomEndpointUrl(row.base_url),
+      validateUrl: row.validate_url ? normalizeCustomEndpointUrl(row.validate_url) : undefined,
       timeoutMs: row.timeout_ms,
+      allowRedirects: false,
     });
     dynamicProviders.set(platform, provider);
     return provider;
@@ -195,7 +197,15 @@ export function getAllProviders(): BaseProvider[] {
   return Array.from(providers.values());
 }
 
-export function getBuiltInProviderSummaries(): Array<{ platform: string; name: string; baseUrl: string | null; timeoutMs: number | null }> {
+export type ProviderCredentialMode = 'api-key' | 'oauth' | 'optional-api-key';
+
+function providerCredentialMode(platform: string): ProviderCredentialMode {
+  if (platform === 'google-oauth' || platform === 'freebuff') return 'oauth';
+  if (platform === 'kilo' || platform === 'pollinations' || platform === 'llm7') return 'optional-api-key';
+  return 'api-key';
+}
+
+export function getBuiltInProviderSummaries(): Array<{ platform: string; name: string; baseUrl: string | null; timeoutMs: number | null; credentialMode: ProviderCredentialMode }> {
   return Array.from(providers.values()).map(provider => {
     const details = provider as BaseProvider & { baseUrl?: string; timeoutMs?: number };
     return {
@@ -203,6 +213,7 @@ export function getBuiltInProviderSummaries(): Array<{ platform: string; name: s
       name: provider.name,
       baseUrl: typeof details.baseUrl === 'string' ? details.baseUrl : null,
       timeoutMs: typeof details.timeoutMs === 'number' ? details.timeoutMs : null,
+      credentialMode: providerCredentialMode(provider.platform),
     };
   });
 }

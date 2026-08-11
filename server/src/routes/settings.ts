@@ -2,6 +2,8 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { parsePositiveResourceId } from '../lib/resourceId.js';
+import { toUtcTimestamp } from '../lib/time.js';
 import {
   getClientApiKeyPolicySnapshot,
   isKnownClientPolicyPlatform,
@@ -13,13 +15,46 @@ import {
   clientApiKeyLimitsFromRow,
   createNamedClientApiKey,
   deleteClientApiKey,
-  getUnifiedApiKey,
   listClientApiKeys,
   regenerateUnifiedKey,
   updateClientApiKey,
 } from '../db/index.js';
 
 export const settingsRouter = Router();
+
+function firstConfiguredEnv(...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function configuredPort(names: string[], fallback: number): number {
+  const raw = firstConfiguredEnv(...names);
+  const value = raw === undefined ? fallback : Number(raw);
+  return Number.isInteger(value) && value >= 1 && value <= 65535 ? value : fallback;
+}
+
+settingsRouter.get('/connection', (_req: Request, res: Response) => {
+  const dashboardHost = firstConfiguredEnv('LLMHARBOR_DASHBOARD_HOST', 'DASHBOARD_HOST', 'HOST') ?? '127.0.0.1';
+  const dashboardPort = configuredPort(['LLMHARBOR_DASHBOARD_PORT', 'DASHBOARD_PORT', 'PORT'], 3001);
+  const publicPortRaw = firstConfiguredEnv('LLMHARBOR_PUBLIC_API_PORT', 'PUBLIC_API_PORT', 'API_PORT');
+  const splitMode = publicPortRaw !== undefined;
+  res.json({
+    splitMode,
+    dashboard: { host: dashboardHost, port: dashboardPort },
+    publicApi: {
+      host: splitMode
+        ? (firstConfiguredEnv('LLMHARBOR_PUBLIC_API_HOST', 'PUBLIC_API_HOST', 'API_HOST') ?? '0.0.0.0')
+        : dashboardHost,
+      port: splitMode
+        ? configuredPort(['LLMHARBOR_PUBLIC_API_PORT', 'PUBLIC_API_PORT', 'API_PORT'], 3001)
+        : dashboardPort,
+      basePath: '/v1',
+    },
+  });
+});
 
 const limitValueSchema = z.union([z.number().int().positive(), z.null()]).optional();
 
@@ -31,15 +66,15 @@ const clientKeyLimitsSchema = z.object({
 }).strict().optional();
 
 const createClientKeySchema = z.object({
-  label: z.string().min(1).max(80).optional(),
+  label: z.string().trim().min(1).max(80).optional(),
   limits: clientKeyLimitsSchema,
-});
+}).strict();
 
 const updateClientKeySchema = z.object({
-  label: z.string().min(1).max(80).optional(),
+  label: z.string().trim().min(1).max(80).optional(),
   enabled: z.boolean().optional(),
   limits: clientKeyLimitsSchema,
-}).refine(body => body.label !== undefined || body.enabled !== undefined || body.limits !== undefined, {
+}).strict().refine(body => body.label !== undefined || body.enabled !== undefined || body.limits !== undefined, {
   message: 'Provide label, enabled, or limits',
 });
 
@@ -47,22 +82,30 @@ const accessPolicyPatchSchema = z.object({
   routes: z.array(z.object({
     route: z.string().min(1).max(80).refine(isKnownLocalApiRoute, 'Unknown local API route'),
     enabled: z.boolean(),
-  })).optional(),
+  })).max(32).optional(),
   platforms: z.array(z.object({
     platform: z.string().trim().min(1).max(80).refine(isKnownClientPolicyPlatform, 'Unknown provider platform'),
     enabled: z.boolean(),
-  })).optional(),
+  })).max(512).optional(),
   models: z.array(z.object({
     modelDbId: z.number().int().positive(),
     enabled: z.boolean(),
-  })).optional(),
+  })).max(10_000).optional(),
 }).strict().refine(body => body.routes !== undefined || body.platforms !== undefined || body.models !== undefined, {
   message: 'Provide routes, platforms, or models',
 });
 
-// Backward-compatible primary key endpoint for older clients and docs.
+// Client API keys are hash-only at rest and are revealed once on creation or
+// rotation. The dashboard Playground has its own loopback/control-plane route
+// and never needs to recover a stored secret.
 settingsRouter.get('/api-key', (_req: Request, res: Response) => {
-  res.json({ apiKey: getUnifiedApiKey() });
+  res.status(410).json({
+    error: {
+      message: 'Stored client API keys cannot be revealed. Create a new key or regenerate the primary key to receive its secret once.',
+      type: 'gone',
+      code: 'client_key_not_revealable',
+    },
+  });
 });
 
 // Backward-compatible rotation of the oldest/default client key.
@@ -77,8 +120,8 @@ settingsRouter.get('/api-keys', (_req: Request, res: Response) => {
 });
 
 settingsRouter.get('/api-keys/:id/access-policy', (req: Request, res: Response) => {
-  const id = Number.parseInt(req.params.id as string, 10);
-  if (Number.isNaN(id)) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -93,8 +136,8 @@ settingsRouter.get('/api-keys/:id/access-policy', (req: Request, res: Response) 
 });
 
 settingsRouter.patch('/api-keys/:id/access-policy', (req: Request, res: Response) => {
-  const id = Number.parseInt(req.params.id as string, 10);
-  if (Number.isNaN(id)) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -136,8 +179,8 @@ settingsRouter.post('/api-keys', (req: Request, res: Response) => {
 });
 
 settingsRouter.patch('/api-keys/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(req.params.id as string, 10);
-  if (Number.isNaN(id)) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -158,9 +201,20 @@ settingsRouter.patch('/api-keys/:id', (req: Request, res: Response) => {
 });
 
 settingsRouter.delete('/api-keys/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(req.params.id as string, 10);
-  if (Number.isNaN(id)) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
+    return;
+  }
+
+  const existing = getDb().prepare('SELECT id FROM client_api_keys WHERE id = ?').get(id);
+  if (!existing) {
+    res.status(404).json({ error: { message: 'Client key not found' } });
+    return;
+  }
+  const count = (getDb().prepare('SELECT COUNT(*) AS count FROM client_api_keys').get() as { count: number }).count;
+  if (count <= 1) {
+    res.status(409).json({ error: { message: 'Create another client API key before deleting the final key.', type: 'conflict', code: 'last_client_key' } });
     return;
   }
 
@@ -217,12 +271,12 @@ function endpointRowToJson(row: any) {
   const keys = db.prepare('SELECT * FROM client_api_keys WHERE local_endpoint_id = ? ORDER BY created_at DESC, id DESC').all(row.id).map((key: any) => ({
     id: key.id,
     label: key.label,
-    maskedKey: key.key.length <= 18 ? `${key.key.slice(0, 8)}••••` : `${key.key.slice(0, 13)}${'•'.repeat(26)}${key.key.slice(-6)}`,
+    maskedKey: key.key_hint || 'llmharbor-••••••••',
     enabled: key.enabled === 1,
     localEndpointId: key.local_endpoint_id,
     limits: clientApiKeyLimitsFromRow(key),
-    createdAt: key.created_at,
-    lastUsedAt: key.last_used_at,
+    createdAt: toUtcTimestamp(key.created_at),
+    lastUsedAt: toUtcTimestamp(key.last_used_at),
   }));
   return {
     id: row.id,
@@ -233,7 +287,7 @@ function endpointRowToJson(row: any) {
     domains,
     keys,
     basePath: row.slug === 'default' ? '/v1' : `/e/${row.slug}/v1`,
-    createdAt: row.created_at,
+    createdAt: toUtcTimestamp(row.created_at),
   };
 }
 
@@ -253,9 +307,9 @@ settingsRouter.post('/local-endpoints', (_req: Request, res: Response) => {
 });
 
 settingsRouter.patch('/local-endpoints/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+  const id = parsePositiveResourceId(req.params.id);
   const parsed = updateLocalEndpointSchema.safeParse(req.body ?? {});
-  if (Number.isNaN(id)) {
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid endpoint ID' } });
     return;
   }
@@ -283,9 +337,9 @@ settingsRouter.patch('/local-endpoints/:id', (req: Request, res: Response) => {
 });
 
 settingsRouter.post('/local-endpoints/:id/domains', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+  const id = parsePositiveResourceId(req.params.id);
   const parsed = domainSchema.safeParse(req.body ?? {});
-  if (Number.isNaN(id)) {
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid endpoint ID' } });
     return;
   }
@@ -311,7 +365,11 @@ settingsRouter.post('/local-endpoints/:id/domains', (req: Request, res: Response
 });
 
 settingsRouter.delete('/local-endpoints/:id/domains/:domain', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) {
+    res.status(400).json({ error: { message: 'Invalid endpoint ID' } });
+    return;
+  }
   const domain = decodeURIComponent(String(req.params.domain)).toLowerCase();
   const result = getDb().prepare('DELETE FROM local_endpoint_domains WHERE local_endpoint_id = ? AND domain = ?').run(id, domain);
   if (result.changes === 0) res.status(404).json({ error: { message: 'Domain not found on endpoint' } });
@@ -319,8 +377,8 @@ settingsRouter.delete('/local-endpoints/:id/domains/:domain', (req: Request, res
 });
 
 settingsRouter.delete('/local-endpoints/:id', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
-  if (Number.isNaN(id) || id === 1) {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null || id === 1) {
     res.status(400).json({ error: { message: id === 1 ? 'Default endpoint cannot be deleted' : 'Invalid endpoint ID' } });
     return;
   }
@@ -330,9 +388,9 @@ settingsRouter.delete('/local-endpoints/:id', (req: Request, res: Response) => {
 });
 
 settingsRouter.post('/local-endpoints/:id/keys', (req: Request, res: Response) => {
-  const id = Number.parseInt(String(req.params.id), 10);
+  const id = parsePositiveResourceId(req.params.id);
   const parsed = createEndpointKeySchema.safeParse(req.body ?? {});
-  if (Number.isNaN(id)) {
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid endpoint ID' } });
     return;
   }

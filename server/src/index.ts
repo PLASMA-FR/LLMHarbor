@@ -1,8 +1,15 @@
 import './env.js';
+import type { Server } from 'http';
 import { createApp, createPublicApiApp } from './app.js';
-import { initDb } from './db/index.js';
-import { startHealthChecker } from './services/health.js';
-import { startFreeModelUpdater } from './services/freeModelUpdater.js';
+import { closeDb, initDb, stopDatabaseOperations } from './db/index.js';
+import { startHealthChecker, stopHealthChecker } from './services/health.js';
+import { startFreeModelUpdater, stopFreeModelUpdater } from './services/freeModelUpdater.js';
+import { stopOAuthCallbackServers } from './routes/oauth.js';
+import { stopOAuthRefreshes } from './services/oauth-refresh.js';
+import { stopFreebuffProviderWork } from './providers/freebuff.js';
+
+const servers = new Set<Server>();
+let shuttingDown = false;
 
 function firstEnv(...names: string[]): string | undefined {
   for (const name of names) {
@@ -37,9 +44,45 @@ function listen(app: ReturnType<typeof createApp>, port: number, host: string, l
   });
   server.on('error', (err) => {
     console.error(`${label} failed to listen on ${host}:${port}`);
-    throw err;
+    console.error(err);
+    process.exitCode = 1;
+    void shutdown('listener error');
   });
+  servers.add(server);
   return server;
+}
+
+async function closeServer(server: Server): Promise<void> {
+  await new Promise<void>(resolve => {
+    const forceTimer = setTimeout(() => {
+      server.closeAllConnections?.();
+      resolve();
+    }, 10_000);
+    forceTimer.unref?.();
+    server.close(() => {
+      clearTimeout(forceTimer);
+      resolve();
+    });
+  }).catch(() => undefined);
+}
+
+async function shutdown(reason: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Shutting down LLMHarbor (${reason})...`);
+  // Stop accepting work first, then drain background jobs/callback exchanges
+  // before closing SQLite. This prevents late scheduler writes to a closed DB.
+  const closingServers = Promise.all(Array.from(servers, closeServer));
+  await Promise.all([
+    closingServers,
+    stopHealthChecker(),
+    stopFreeModelUpdater(),
+    stopOAuthCallbackServers(),
+    stopOAuthRefreshes(),
+    stopFreebuffProviderWork(),
+    stopDatabaseOperations(),
+  ]);
+  closeDb();
 }
 
 async function main() {
@@ -87,4 +130,11 @@ async function main() {
   }
 }
 
-main().catch(console.error);
+process.once('SIGINT', () => { void shutdown('SIGINT'); });
+process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
+
+main().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+  void shutdown('startup failure');
+});
