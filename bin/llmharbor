@@ -810,6 +810,12 @@ systemd_manages_project() {
   [[ "$working_directory" == "$PROJECT_ROOT" ]]
 }
 
+systemd_runs_current_process() {
+  local main_pid
+  main_pid="$(systemctl show llmharbor.service -p MainPID --value 2>/dev/null || true)"
+  [[ "$main_pid" =~ ^[0-9]+$ && "$main_pid" -eq "$$" ]]
+}
+
 load_process_listener_environment() {
   local pid="$1"
   [[ -r "/proc/$pid/environ" ]] || return 0
@@ -906,7 +912,7 @@ start_prepared() {
     if is_running; then
       fail "$APP_NAME is already running with PID $(managed_pid). Stop it first or omit --foreground for managed background mode."
     fi
-    if systemd_manages_project; then
+    if systemd_manages_project && ! systemd_runs_current_process; then
       fail "$APP_NAME is already managed by the active llmharbor.service systemd unit"
     fi
     ensure_production_build
