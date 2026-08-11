@@ -66,8 +66,14 @@ jobs:
           }
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File bin/llmharbor.ps1 help *> $null
           if ($LASTEXITCODE -ne 0) { throw "llmharbor help exited with $LASTEXITCODE" }
+          # Windows PowerShell 5.1 promotes native stderr to NativeCommandError
+          # under Stop. This command is expected to write an error and fail, so
+          # capture its process exit code without weakening the other checks.
+          $ErrorActionPreference = 'SilentlyContinue'
           & powershell.exe -NoProfile -ExecutionPolicy Bypass -File bin/llmharbor.ps1 definitely-not-a-command *> $null
-          if ($LASTEXITCODE -eq 0) { throw 'An unknown command must return a non-zero exit code' }
+          $unknownCommandExit = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($unknownCommandExit -eq 0) { throw 'An unknown command must return a non-zero exit code' }
 
   test:
     name: Node ${{ matrix.node-version }}
