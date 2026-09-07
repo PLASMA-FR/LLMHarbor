@@ -160,7 +160,7 @@
     @apply font-sans antialiased;
     width: 100%;
     max-width: 100%;
-    overflow-x: hidden;
+    overflow-x: clip;
     font-feature-settings: 'ss01', 'cv11';
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
@@ -172,13 +172,15 @@
     max-width: 100%;
     min-width: 320px;
     font-feature-settings: 'ss01', 'cv11', 'tnum';
-    overflow-x: hidden;
+    overflow-x: clip;
     min-height: 100vh;
   }
   #root {
     width: 100%;
     max-width: 100%;
-    overflow-x: hidden;
+    /* Clip horizontal overflow without creating a scroll container that
+       prevents the sidebar and mobile header from sticking to the viewport. */
+    overflow-x: clip;
   }
   code, pre, kbd, samp {
     font-family: var(--font-mono);

@@ -106,6 +106,14 @@ jobs:
       - name: Build workspaces
         run: npm run build
 
+      - name: Install browser test runtime
+        if: matrix.node-version == '24'
+        run: npx playwright install --with-deps chromium
+
+      - name: Verify dashboard workflows
+        if: matrix.node-version == '24'
+        run: npm run test:e2e
+
       - name: Validate static website script
         if: matrix.node-version == '24'
         run: node --check website/script.js

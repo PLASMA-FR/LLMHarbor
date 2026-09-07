@@ -16,7 +16,7 @@ const MAX_BULK_IMPORT_KEYS = 5_000;
 
 const addKeySchema = z.object({
   platform: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use a lowercase platform id like custom-local-vllm'),
-  key: z.string().min(1).max(MAX_PROVIDER_SECRET_LENGTH),
+  key: z.string().trim().min(1).max(MAX_PROVIDER_SECRET_LENGTH),
   label: z.string().trim().max(80).optional(),
 });
 

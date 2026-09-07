@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { copyText } from '@/lib/clipboard'
 import { formatDateTime, formatRelativeTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
@@ -242,12 +243,7 @@ export default function OAuthPage() {
   const selectedAccountId = selectedAccountRecord?.id ?? null
 
   function invalidateOAuthRoutingState() {
-    queryClient.invalidateQueries({ queryKey: ['oauth-accounts'] })
-    queryClient.invalidateQueries({ queryKey: ['oauth-models'] })
-    queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-    queryClient.invalidateQueries({ queryKey: ['keys'] })
-    queryClient.invalidateQueries({ queryKey: ['health'] })
-    queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    void invalidateRoutingQueries(queryClient)
   }
 
   useEffect(() => {
@@ -372,11 +368,7 @@ export default function OAuthPage() {
     }),
     onSuccess: (inventory, accountId) => {
       queryClient.setQueryData(['oauth-models', accountId], inventory)
-      queryClient.invalidateQueries({ queryKey: ['oauth-accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { apiFetch, apiUrl } from '@/lib/api'
+import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -108,11 +109,10 @@ export default function SettingsPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const location = useLocation()
-  const [selectedKeyId, setSelectedKeyId] = useState<number | null>(() => {
-    const keyParam = new URLSearchParams(window.location.search).get('key')
-    const keyId = Number.parseInt(keyParam ?? '', 10)
-    return Number.isNaN(keyId) ? null : keyId
-  })
+  const keyParam = new URLSearchParams(location.search).get('key')
+  const parsedKeyId = Number(keyParam)
+  const selectedKeyId = Number.isSafeInteger(parsedKeyId) && parsedKeyId > 0 ? parsedKeyId : null
+  const [visibleModelLimit, setVisibleModelLimit] = useState(160)
   const [modelSearch, setModelSearch] = useState('')
   const [platformFilter, setPlatformFilter] = useState('all')
   const [showBlockedOnly, setShowBlockedOnly] = useState(false)
@@ -156,10 +156,7 @@ export default function SettingsPage() {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['client-api-key-access-policy', variables.keyId] })
-      queryClient.invalidateQueries({ queryKey: ['client-api-keys'] })
-    },
+    onSuccess: () => invalidateRoutingQueries(queryClient),
   })
 
   const { data: freeUpdaterStatus, isLoading: freeUpdaterStatusLoading, isError: freeUpdaterStatusError, error: freeUpdaterStatusQueryError, refetch: refetchFreeUpdaterStatus } = useQuery<FreeModelUpdaterStatus>({
@@ -188,7 +185,7 @@ export default function SettingsPage() {
     const latest = freeUpdaterStatus?.lastRunAt
     if (lastUpdaterRunRef.current !== undefined && latest && latest !== lastUpdaterRunRef.current) {
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
-      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
+      void invalidateRoutingQueries(queryClient)
     }
     lastUpdaterRunRef.current = latest
   }, [freeUpdaterStatus?.lastRunAt, queryClient])
@@ -217,8 +214,7 @@ export default function SettingsPage() {
       setManualRefreshActive(false)
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-status'] })
       queryClient.invalidateQueries({ queryKey: ['free-model-updater-detected-models'] })
-      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
-      queryClient.invalidateQueries({ queryKey: ['client-api-key-access-policy'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -273,14 +269,14 @@ export default function SettingsPage() {
   const selectedFreeUpdaterProviders = freeUpdaterProviders.filter(provider => provider.selected).map(provider => provider.platform)
   const freeUpdaterActionError = enableFreeUpdater.error ?? disableFreeUpdater.error ?? refreshFreeModels.error ?? updateFreeUpdaterProviders.error
   const providerOptions = useMemo(() => Array.from(new Set(policy?.models.map(model => model.platform) ?? [])).sort((a, b) => a.localeCompare(b)), [policy?.models])
-  const visibleModels = useMemo(() => {
+  const filteredModels = useMemo(() => {
     const query = modelSearch.trim().toLowerCase()
     return (policy?.models ?? [])
       .filter(model => platformFilter === 'all' || model.platform === platformFilter)
       .filter(model => !showBlockedOnly || !model.enabled)
       .filter(model => !query || `${model.modelId} ${model.displayName} ${model.platform}`.toLowerCase().includes(query))
-      .slice(0, 160)
   }, [modelSearch, platformFilter, policy?.models, showBlockedOnly])
+  const visibleModels = filteredModels.slice(0, visibleModelLimit)
   const freeUpdaterBusy = (freeUpdaterStatus?.status === 'running') || enableFreeUpdater.isPending || disableFreeUpdater.isPending || refreshFreeModels.isPending || updateFreeUpdaterProviders.isPending
   const canRefreshFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
   const canEnableFreeUpdater = selectedFreeUpdaterProviders.length > 0 && !freeUpdaterBusy
@@ -292,7 +288,7 @@ export default function SettingsPage() {
   }
 
   function chooseKey(keyId: number) {
-    setSelectedKeyId(keyId)
+    setVisibleModelLimit(160)
     navigate(`/settings?key=${keyId}#access-policies`, { replace: true })
   }
 
@@ -613,6 +609,7 @@ export default function SettingsPage() {
                     key={key.id}
                     type="button"
                     onClick={() => chooseKey(key.id)}
+                    aria-pressed={activeKeyId === key.id}
                     className={cn(
                       'w-full rounded-[var(--radius-panel)] border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/30',
                       activeKeyId === key.id ? 'border-primary bg-primary/10' : 'border-border bg-background hover:bg-muted/60',
@@ -746,11 +743,11 @@ export default function SettingsPage() {
                   <div className="grid w-full min-w-0 gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(180px,1fr)_minmax(140px,180px)_max-content] 2xl:max-w-[620px]">
                     <div className="grid gap-1">
                       <Label htmlFor="client-key-model-search" className="text-xs text-muted-foreground">Search</Label>
-                      <Input id="client-key-model-search" type="search" value={modelSearch} onChange={event => setModelSearch(event.target.value)} placeholder="gpt, gemini, llama…" />
+                      <Input id="client-key-model-search" type="search" value={modelSearch} onChange={event => { setModelSearch(event.target.value); setVisibleModelLimit(160) }} placeholder="gpt, gemini, llama…" />
                     </div>
                     <div className="grid gap-1">
                       <Label className="text-xs text-muted-foreground">Provider</Label>
-                      <Select value={platformFilter} onValueChange={value => setPlatformFilter(value ?? 'all')}>
+                      <Select value={platformFilter} onValueChange={value => { setPlatformFilter(value ?? 'all'); setVisibleModelLimit(160) }}>
                         <SelectTrigger className="w-full" aria-label="Filter models by provider"><SelectValue /></SelectTrigger>
                         <SelectContent>
                           <SelectItem value="all">All providers</SelectItem>
@@ -758,7 +755,7 @@ export default function SettingsPage() {
                         </SelectContent>
                       </Select>
                     </div>
-                    <Button type="button" className="h-10 w-full self-end whitespace-nowrap sm:col-span-2 lg:col-span-1 lg:w-auto" variant={showBlockedOnly ? 'default' : 'outline'} onClick={() => setShowBlockedOnly(prev => !prev)}>
+                    <Button type="button" className="h-10 w-full self-end whitespace-nowrap sm:col-span-2 lg:col-span-1 lg:w-auto" variant={showBlockedOnly ? 'default' : 'outline'} aria-pressed={showBlockedOnly} onClick={() => { setShowBlockedOnly(prev => !prev); setVisibleModelLimit(160) }}>
                       {showBlockedOnly ? 'Show all models' : 'Blocked only'}
                     </Button>
                   </div>
@@ -766,7 +763,7 @@ export default function SettingsPage() {
 
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-panel)] border border-border bg-background p-3">
                   <p className="text-sm text-muted-foreground">
-                    Showing <span className="font-medium text-foreground tabular-nums">{visibleModels.length}</span> of <span className="font-medium text-foreground tabular-nums">{policy.models.length}</span> models. <span className="font-medium text-foreground tabular-nums">{allowedModels}</span> currently allowed.
+                    Showing <span className="font-medium text-foreground tabular-nums">{visibleModels.length}</span> of <span className="font-medium text-foreground tabular-nums">{filteredModels.length}</span> matching models. <span className="font-medium text-foreground tabular-nums">{allowedModels}</span> allowed across the catalog.
                   </p>
                   <div className="flex flex-wrap gap-2">
                     <PolicyActionButton disabled={patchPolicy.isPending || visibleModels.length === 0} onClick={() => setVisibleModels(true)}>Allow visible</PolicyActionButton>
@@ -800,8 +797,10 @@ export default function SettingsPage() {
                     )
                   })}
                 </div>
-                {(policy.models.length > visibleModels.length) && (
-                  <p className="mt-3 text-xs text-muted-foreground">Showing {visibleModels.length} filtered models out of {policy.models.length}. Use search or provider filters to narrow the catalog.</p>
+                {filteredModels.length > visibleModels.length && (
+                  <Button className="mt-3" variant="outline" size="sm" onClick={() => setVisibleModelLimit(limit => limit + 160)}>
+                    Show more models ({filteredModels.length - visibleModels.length} remaining)
+                  </Button>
                 )}
               </section>
             </>

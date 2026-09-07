@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -8,6 +9,7 @@ import { PageHeader, SectionTitle, EmptyState, ErrorState, LoadingState } from '
 import { MetricCard } from '@/components/metric-card'
 import { InlineNotice, StatusIndicator } from '@/components/status-indicator'
 import { cn } from '@/lib/utils'
+import { ModelEditor, type ModelSettings } from '@/components/model-editor'
 
 interface EndpointSummary {
   id: number | null
@@ -26,7 +28,7 @@ interface EndpointSummary {
   availableKeyCount: number
 }
 
-interface EndpointModel {
+interface EndpointModel extends ModelSettings {
   id: number
   platform: string
   modelId: string
@@ -62,6 +64,7 @@ export default function ModelsPage() {
   const [modelDisplayName, setModelDisplayName] = useState('')
   const [modelSearch, setModelSearch] = useState('')
   const [probeResult, setProbeResult] = useState<ProbeResult | null>(null)
+  const [editingModelId, setEditingModelId] = useState<number | null>(null)
 
   const { data: endpoints = [], isLoading, isError, error, refetch } = useQuery<EndpointSummary[]>({
     queryKey: ['custom-endpoints'],
@@ -70,7 +73,7 @@ export default function ModelsPage() {
 
   const activeEndpoint = endpoints.some(endpoint => endpoint.platform === selectedEndpoint)
     ? selectedEndpoint
-    : endpoints[0]?.platform ?? ''
+    : (endpoints.find(endpoint => endpoint.enabled && endpoint.availableKeyCount > 0) ?? endpoints[0])?.platform ?? ''
 
   const { data: endpointModels = [], isLoading: modelsLoading, isError: modelsError, error: modelsQueryError, refetch: refetchModels } = useQuery<EndpointModel[]>({
     queryKey: ['custom-endpoint-models', activeEndpoint],
@@ -91,9 +94,7 @@ export default function ModelsPage() {
         }),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', activeEndpoint] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      void invalidateRoutingQueries(queryClient)
       setModelId('')
       setModelDisplayName('')
       setProbeResult(null)
@@ -105,6 +106,7 @@ export default function ModelsPage() {
       apiFetch<ProbeResult>(`/api/endpoints/${encodeURIComponent(body.platform)}/models/probe`, {
         method: 'POST',
         body: JSON.stringify({ modelId: body.modelId }),
+        timeoutMs: Math.max(240_000, (endpoints.find(endpoint => endpoint.platform === body.platform)?.timeoutMs ?? 120_000) * 2) + 15_000,
       }),
     onSuccess: (result) => setProbeResult(result),
     onError: (error, variables) => setProbeResult({
@@ -119,9 +121,16 @@ export default function ModelsPage() {
     mutationFn: ({ endpointPlatform, modelDbId }: { endpointPlatform: string; modelDbId: number }) =>
       apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}/models/${modelDbId}`, { method: 'DELETE' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoint-models', activeEndpoint] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      void invalidateRoutingQueries(queryClient)
+    },
+  })
+
+  const updateModel = useMutation({
+    mutationFn: ({ model, settings }: { model: EndpointModel; settings: Partial<ModelSettings> }) =>
+      apiFetch(`/api/endpoints/${encodeURIComponent(model.platform)}/models/${model.id}`, { method: 'PATCH', body: JSON.stringify(settings) }),
+    onSuccess: () => {
+      setEditingModelId(null)
+      return invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -167,13 +176,21 @@ export default function ModelsPage() {
             <EmptyState title="No endpoints available" description="Add a provider key or create a custom endpoint from the Keys page." />
           ) : (
             <div className="mt-5 grid gap-4 lg:grid-cols-[320px_1fr]">
-              <div className="space-y-2">
+              <div className="lg:hidden">
+                <Label htmlFor="mobile-model-provider" className="mb-2">Provider</Label>
+                <select id="mobile-model-provider" value={activeEndpoint} className="h-10 w-full rounded-[var(--radius-input)] border border-input bg-background px-3 text-sm"
+                  onChange={event => { setSelectedEndpoint(event.target.value); setEditingModelId(null); setProbeResult(null); setModelSearch('') }}>
+                  {endpoints.map(endpoint => <option key={endpoint.platform} value={endpoint.platform}>{endpoint.name} · {endpoint.modelCount} models</option>)}
+                </select>
+              </div>
+              <div className="hidden max-h-[720px] space-y-2 overflow-y-auto pr-1 lg:block">
                 {endpoints.map(endpoint => (
                   <button
                     type="button"
                     key={endpoint.platform}
                     onClick={() => {
                       setSelectedEndpoint(endpoint.platform)
+                      setEditingModelId(null)
                       setProbeResult(null)
                       setModelSearch('')
                     }}
@@ -255,7 +272,7 @@ export default function ModelsPage() {
                             : 'Add a credential before probing this endpoint.'
                           : 'Probe uses an available endpoint credential before you rely on the model.'}
                     </p>
-                    {addModel.isError || deleteModel.isError ? <InlineNotice tone="critical">{(addModel.error ?? deleteModel.error)?.message ?? 'Could not update the model registry.'}</InlineNotice> : null}
+                    {addModel.isError || deleteModel.isError || updateModel.isError ? <InlineNotice tone="critical">{(addModel.error ?? deleteModel.error ?? updateModel.error)?.message ?? 'Could not update the model registry.'}</InlineNotice> : null}
 
                     {endpointModels.length > 6 ? (
                       <div>
@@ -274,14 +291,18 @@ export default function ModelsPage() {
                       ) : visibleEndpointModels.length === 0 ? (
                         <p className="px-4 py-5 text-sm text-muted-foreground">No registered models match this search.</p>
                       ) : visibleEndpointModels.map(model => (
-                        <div key={model.id} className="grid gap-2 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_120px_auto_auto] sm:items-center">
+                        <div key={model.id} className="px-4 py-3">
+                          <div className="flex flex-wrap items-center gap-2">
                           <div className="min-w-0">
                             <p className="truncate text-sm font-medium">{model.displayName}</p>
                             <code className="block truncate text-[11px] text-muted-foreground">{model.modelId}</code>
                           </div>
                           <StatusIndicator label={!model.enabled ? 'Disabled' : model.fallbackEnabled ? `Route ${model.priority ?? 'set'}` : 'Not routed'} tone={!model.enabled ? 'warning' : model.fallbackEnabled ? 'positive' : 'neutral'} />
+                          <Button variant="outline" size="xs" className="sm:ml-auto" onClick={() => { updateModel.reset(); setEditingModelId(editingModelId === model.id ? null : model.id) }} disabled={updateModel.isPending} aria-expanded={editingModelId === model.id} aria-label={`Edit ${model.displayName}`}>Edit</Button>
                           <Button variant="ghost" size="xs" onClick={() => probeModel.mutate({ platform: selectedEndpointInfo.platform, modelId: model.modelId })} disabled={probeModel.isPending || !selectedEndpointInfo.enabled || selectedEndpointInfo.availableKeyCount === 0} aria-label={`Test ${model.displayName}`}>Test</Button>
                           <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => { if (window.confirm(`Remove model "${model.displayName}"?`)) deleteModel.mutate({ endpointPlatform: selectedEndpointInfo.platform, modelDbId: model.id }) }} disabled={deleteModel.isPending} aria-label={`Remove ${model.displayName}`}>Remove</Button>
+                          </div>
+                          {editingModelId === model.id ? <ModelEditor model={model} busy={updateModel.isPending} onSave={settings => updateModel.mutate({ model, settings })} onCancel={() => setEditingModelId(null)} /> : null}
                         </div>
                       ))}
                     </div>

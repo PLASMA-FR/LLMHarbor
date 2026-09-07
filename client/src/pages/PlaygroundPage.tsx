@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Braces, CircleStop, Send, Trash2 } from 'lucide-react'
+import { ArrowDown, Braces, CircleStop, Copy, Download, RotateCcw, Send, Trash2 } from 'lucide-react'
 import { apiFetch, apiUrl } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
+import { usePlaygroundField, type PlaygroundMessage, type RouteMeta } from '@/lib/playground-state'
 import { formatCompactNumber, formatDuration } from '@/lib/format'
 import { extractSseFrames, readSseData } from '@/lib/sse'
 import { Button } from '@/components/ui/button'
@@ -62,29 +64,6 @@ interface PlaygroundAccessPolicy {
   models: Array<{ modelDbId: number; enabled: boolean }>
 }
 
-interface RouteMeta {
-  clientKey?: string
-  platform?: string
-  model?: string
-  latencyMs?: number
-  firstTokenMs?: number
-  fallbackAttempts?: number
-  finishReason?: string | null
-  usage?: TokenUsage
-  usageEstimated?: boolean
-}
-
-interface PlaygroundMessage {
-  id: string
-  role: 'user' | 'assistant' | 'tool'
-  content: string
-  kind?: 'normal' | 'error'
-  toolCallId?: string
-  toolCalls?: ChatToolCall[]
-  meta?: RouteMeta
-  streamError?: string
-}
-
 interface StreamToolCallDelta {
   index?: number
   id?: string
@@ -95,7 +74,7 @@ interface StreamToolCallDelta {
 
 interface StreamFrame {
   choices?: Array<{
-    delta?: { content?: string; tool_calls?: StreamToolCallDelta[] }
+    delta?: { content?: string; refusal?: string; tool_calls?: StreamToolCallDelta[] }
     finish_reason?: string | null
   }>
   usage?: TokenUsage
@@ -169,7 +148,8 @@ function toApiMessages(messages: PlaygroundMessage[], systemPrompt: string): Cha
       apiMessages.push({
         role: 'assistant',
         content: message.content || null,
-        ...(message.toolCalls?.length ? { tool_calls: message.toolCalls } : {}),
+        ...(message.refusal ? { refusal: message.refusal } : {}),
+        ...(!message.streamError && message.toolCalls?.length ? { tool_calls: message.toolCalls } : {}),
       })
       continue
     }
@@ -182,7 +162,7 @@ function MetaItem({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <dt className="text-[10px] font-medium uppercase tracking-[0.06em] text-muted-foreground">{label}</dt>
-      <dd className="mt-0.5 truncate text-xs font-medium tabular-nums">{value}</dd>
+      <dd title={value} className="mt-0.5 truncate text-xs font-medium tabular-nums select-all">{value}</dd>
     </div>
   )
 }
@@ -193,12 +173,14 @@ function ToolCallCard({
   onResultChange,
   onAddResult,
   alreadyAnswered,
+  disabled,
 }: {
   call: ChatToolCall
   result: string
   onResultChange: (value: string) => void
   onAddResult: () => void
   alreadyAnswered: boolean
+  disabled: boolean
 }) {
   return (
     <div className="mt-3 rounded-[var(--radius-panel)] border border-border bg-card p-3 text-foreground">
@@ -216,13 +198,14 @@ function ToolCallCard({
             <Label htmlFor={`tool-result-${call.id}`} className="mb-1.5 text-xs">Tool result</Label>
             <Textarea
               id={`tool-result-${call.id}`}
+              disabled={disabled}
               value={result}
               onChange={event => onResultChange(event.target.value)}
               placeholder='{"status":"ok"}'
               className="min-h-16 font-mono text-xs"
             />
           </div>
-          <Button type="button" variant="outline" size="sm" disabled={!result.trim()} onClick={onAddResult}>Add result</Button>
+          <Button type="button" variant="outline" size="sm" disabled={disabled || !result.trim()} onClick={onAddResult}>Add result</Button>
         </div>
       )}
     </div>
@@ -230,20 +213,22 @@ function ToolCallCard({
 }
 
 export default function PlaygroundPage() {
-  const [messages, setMessages] = useState<PlaygroundMessage[]>([])
-  const [input, setInput] = useState('')
+  const [messages, setMessages] = usePlaygroundField('messages')
+  const [input, setInput] = usePlaygroundField('input')
   const [loading, setLoading] = useState(false)
-  const [selectedModel, setSelectedModel] = useState('auto')
-  const [selectedClientKeyId, setSelectedClientKeyId] = useState<number | null>(null)
-  const [streaming, setStreaming] = useState(true)
-  const [temperature, setTemperature] = useState('')
-  const [maxTokens, setMaxTokens] = useState('')
-  const [systemPrompt, setSystemPrompt] = useState('')
-  const [toolsJson, setToolsJson] = useState('')
-  const [toolChoice, setToolChoice] = useState<'auto' | 'none' | 'required'>('auto')
+  const [selectedModel, setSelectedModel] = usePlaygroundField('selectedModel')
+  const [selectedClientKeyId, setSelectedClientKeyId] = usePlaygroundField('selectedClientKeyId')
+  const [streaming, setStreaming] = usePlaygroundField('streaming')
+  const [temperature, setTemperature] = usePlaygroundField('temperature')
+  const [maxTokens, setMaxTokens] = usePlaygroundField('maxTokens')
+  const [systemPrompt, setSystemPrompt] = usePlaygroundField('systemPrompt')
+  const [toolsJson, setToolsJson] = usePlaygroundField('toolsJson')
+  const [toolChoice, setToolChoice] = usePlaygroundField('toolChoice')
   const [formError, setFormError] = useState<string | null>(null)
-  const [toolResults, setToolResults] = useState<Record<string, string>>({})
-  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [toolResults, setToolResults] = usePlaygroundField('toolResults')
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [following, setFollowing] = useState(true)
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
@@ -298,11 +283,9 @@ export default function PlaygroundPage() {
   }
 
   useEffect(() => {
-    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-    // Streaming updates are already batched below. Avoid starting overlapping
-    // smooth-scroll animations while the response is still growing.
-    messagesEndRef.current?.scrollIntoView({ behavior: reducedMotion || loading ? 'auto' : 'smooth' })
-  }, [messages, loading])
+    const container = scrollRef.current
+    if (following && container) container.scrollTop = container.scrollHeight
+  }, [messages, loading, following])
 
   useEffect(() => () => abortRef.current?.abort(), [])
 
@@ -314,7 +297,7 @@ export default function PlaygroundPage() {
     ? chatRouteAllowed && availableModels.length > 0
     : chatRouteAllowed && availableModels.some(model => localModelId(model) === selectedModel)
   const hasEnabledClientKey = Boolean(selectedClientKey)
-  const latestToolCalls = messages.toReversed().find(message => message.role === 'assistant' && message.toolCalls?.length)?.toolCalls ?? []
+  const latestToolCalls = messages.toReversed().find(message => message.role === 'assistant' && !message.streamError && message.toolCalls?.length)?.toolCalls ?? []
   const answeredToolCallIds = new Set(messages.filter(message => message.role === 'tool' && message.toolCallId).map(message => message.toolCallId))
   const unresolvedToolCalls = latestToolCalls.filter(call => !answeredToolCallIds.has(call.id))
   const canContinueToolCall = latestToolCalls.length > 0 && unresolvedToolCalls.length === 0 && messages.at(-1)?.role === 'tool'
@@ -385,9 +368,9 @@ export default function PlaygroundPage() {
     inputRef.current?.focus()
   }
 
-  async function handleSend() {
-    const text = input.trim()
-    if ((!text && !canContinueToolCall) || loading) return
+  async function handleSend(retryLast = false) {
+    const text = retryLast ? '' : input.trim()
+    if ((!text && !canContinueToolCall && !retryLast) || loading) return
     if (!selectedClientKey) {
       setFormError('Select an enabled local client key before sending a request.')
       return
@@ -407,6 +390,7 @@ export default function PlaygroundPage() {
     try {
       requestTemperature = parseOptionalNumber(temperature, 'Temperature', 0, 2)
       requestMaxTokens = parseOptionalNumber(maxTokens, 'Max tokens', 1, 1_000_000)
+      if (requestMaxTokens !== undefined && !Number.isInteger(requestMaxTokens)) throw new Error('Max tokens must be a whole number.')
       requestTools = parseTools(toolsJson)
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Check the request options.')
@@ -414,12 +398,13 @@ export default function PlaygroundPage() {
     }
 
     const userMessage: PlaygroundMessage | null = text ? { id: createMessageId(), role: 'user', content: text } : null
-    const requestMessages = userMessage ? [...messages, userMessage] : messages
+    const requestMessages = retryLast ? messages.slice(0, -1) : userMessage ? [...messages, userMessage] : messages
     const assistantId = createMessageId()
     const controller = new AbortController()
     abortRef.current = controller
     setMessages(requestMessages)
-    setInput('')
+    if (!retryLast) setInput('')
+    setFollowing(true)
     setFormError(null)
     setLoading(true)
     if (inputRef.current) inputRef.current.style.height = 'auto'
@@ -461,6 +446,7 @@ export default function PlaygroundPage() {
       const responseClientKey = clientKeys.find(key => key.id === responseClientKeyId) ?? selectedClientKey
       const baseMeta: RouteMeta = {
         ...route,
+        requestId: response.headers.get('X-Request-Id') ?? undefined,
         clientKey: responseClientKey.label,
         fallbackAttempts: Number.isNaN(fallbackHeader) ? undefined : fallbackHeader,
       }
@@ -473,6 +459,7 @@ export default function PlaygroundPage() {
           id: assistantId,
           role: 'assistant',
           content: contentToText(choice?.message?.content ?? ''),
+          refusal: choice?.message?.refusal,
           toolCalls: choice?.message?.tool_calls,
           meta: {
             ...baseMeta,
@@ -495,6 +482,7 @@ export default function PlaygroundPage() {
       const toolCalls = new Map<number, ChatToolCall>()
       let buffer = ''
       let content = ''
+      let refusal = ''
       let firstTokenMs: number | undefined
       let finishReason: string | null | undefined
       let usage: TokenUsage | undefined
@@ -508,6 +496,7 @@ export default function PlaygroundPage() {
         replaceMessage(assistantId, message => ({
           ...message,
           content,
+          refusal: refusal || undefined,
           toolCalls: toolCalls.size > 0 ? [...toolCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call) : undefined,
           streamError,
           meta: {
@@ -557,10 +546,11 @@ export default function PlaygroundPage() {
         const choice = frame.choices?.[0]
         if (choice) sawChoice = true
         const deltaText = choice?.delta?.content ?? ''
-        if ((deltaText || choice?.delta?.tool_calls?.length) && firstTokenMs === undefined) {
+        if ((deltaText || choice?.delta?.refusal || choice?.delta?.tool_calls?.length) && firstTokenMs === undefined) {
           firstTokenMs = performance.now() - startedAt
         }
         content += deltaText
+        refusal += choice?.delta?.refusal ?? ''
         finishReason = choice?.finish_reason ?? finishReason
         usage = frame.usage ?? usage
 
@@ -596,7 +586,7 @@ export default function PlaygroundPage() {
       }
       if (!usage) {
         const promptTokens = Math.ceil(JSON.stringify(body.messages).length / 4)
-        const completionTokens = Math.ceil((content.length + [...toolCalls.values()].reduce((sum, call) => sum + call.function.name.length + call.function.arguments.length, 0)) / 4)
+        const completionTokens = Math.ceil((content.length + refusal.length + [...toolCalls.values()].reduce((sum, call) => sum + call.function.name.length + call.function.arguments.length, 0)) / 4)
         usage = { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
         usageEstimated = true
       }
@@ -611,7 +601,7 @@ export default function PlaygroundPage() {
       if (streaming && response?.ok && streamingMessageStarted) {
         replaceMessage(assistantId, current => ({
           ...current,
-          kind: current.content || current.toolCalls?.length ? 'normal' : 'error',
+          kind: current.content || current.refusal || current.toolCalls?.length ? 'normal' : 'error',
           streamError: message,
           meta: { ...current.meta, latencyMs: elapsed, finishReason: cancelled ? 'cancelled' : 'error' },
         }))
@@ -621,7 +611,7 @@ export default function PlaygroundPage() {
           role: 'assistant',
           kind: 'error',
           content: message,
-          meta: { latencyMs: elapsed, finishReason: cancelled ? 'cancelled' : 'error' },
+          meta: { requestId: response?.headers.get('X-Request-Id') ?? undefined, latencyMs: elapsed, finishReason: cancelled ? 'cancelled' : 'error' },
         }])
       }
     } finally {
@@ -647,7 +637,33 @@ export default function PlaygroundPage() {
     }
   }
 
+  async function copyMessage(message: PlaygroundMessage) {
+    try {
+      await copyText(message.content || message.refusal || '')
+      setCopiedMessageId(message.id)
+      setFormError(null)
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Could not copy the response.')
+    }
+  }
+
+  function exportThread() {
+    const data = {
+      format: 'llmharbor.playground.v1',
+      exportedAt: new Date().toISOString(),
+      request: { model: selectedModel, stream: streaming, temperature, maxTokens, systemPrompt, toolsJson, toolChoice },
+      messages,
+    }
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }))
+    const link = document.createElement('a')
+    link.href = url
+    link.download = 'llmharbor-conversation.json'
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
   function clearThread() {
+    if (messages.length && !window.confirm('Clear this conversation? Export it first if you want to keep a copy.')) return
     setMessages([])
     setToolResults({})
     setFormError(null)
@@ -662,9 +678,9 @@ export default function PlaygroundPage() {
         description="Exercise the same OpenAI-compatible endpoint your applications use, including streaming and tool calls."
         actions={
           <>
-            <Select value={selectedModel} onValueChange={value => setSelectedModel(value ?? 'auto')}>
+            <Select disabled={loading} value={selectedModel} onValueChange={value => setSelectedModel(value ?? 'auto')}>
               <SelectTrigger className="w-full sm:w-[280px]" aria-label="Choose model route">
-                <SelectValue />
+                <SelectValue>{activeModelLabel}</SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="auto">Auto routing</SelectItem>
@@ -676,20 +692,23 @@ export default function PlaygroundPage() {
               </SelectContent>
             </Select>
             {messages.length > 0 ? (
+              <>
+              <Button variant="outline" size="sm" onClick={exportThread} disabled={loading}><Download aria-hidden="true" /> Export</Button>
               <Button variant="outline" size="sm" onClick={clearThread} disabled={loading}>
                 <Trash2 aria-hidden="true" /> Clear
               </Button>
+              </>
             ) : null}
           </>
         }
       />
 
       <div className="grid flex-1 min-w-0 gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <section className="panel-card flex min-h-[620px] min-w-0 flex-col overflow-hidden rounded-[var(--radius-panel)]" aria-labelledby="playground-thread-title">
+        <section className="panel-card flex h-[min(760px,calc(100dvh-12rem))] min-h-[460px] min-w-0 flex-col overflow-hidden rounded-[var(--radius-panel)]" aria-labelledby="playground-thread-title">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
             <div>
               <h2 id="playground-thread-title" className="text-sm font-semibold">Conversation</h2>
-              <p className="mt-0.5 text-xs text-muted-foreground">Enter sends · Shift Enter adds a line</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">Enter sends · Shift Enter adds a line · Kept until reload</p>
             </div>
             <div className="flex items-center gap-2">
               <StatusIndicator label={streaming ? 'Streaming' : 'Single response'} tone={loading ? 'warning' : 'info'} />
@@ -698,7 +717,7 @@ export default function PlaygroundPage() {
           </div>
 
           <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{conversationAnnouncement}</div>
-          <div className="relative flex-1 overflow-y-auto p-4 sm:p-5" role="log" aria-label="Conversation" aria-live="off" aria-relevant="additions" aria-busy={loading}>
+          <div ref={scrollRef} onScroll={event => { const el = event.currentTarget; setFollowing(el.scrollHeight - el.scrollTop - el.clientHeight < 80) }} className="relative min-h-0 flex-1 overflow-y-auto p-4 sm:p-5" role="log" aria-label="Conversation" aria-live="off" aria-relevant="additions" aria-busy={loading}>
             <div className="relative space-y-5">
               {keyLoading || routesLoading || policyLoading ? (
                 <div className="flex min-h-[360px] items-center justify-center"><LoadingState title="Preparing Playground" description={setupMessage} /></div>
@@ -716,7 +735,7 @@ export default function PlaygroundPage() {
                     message.role === 'tool' && 'rounded-[var(--radius-panel)] border border-primary/25 bg-primary/5 px-4 py-3',
                   )}>
                     <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.08em] opacity-65">{message.role === 'tool' ? 'Tool result' : message.role}</p>
-                    {message.content ? <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content}</div> : message.toolCalls?.length ? null : <span className="text-sm text-muted-foreground">Waiting for response…</span>}
+                    {message.content || message.refusal ? <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content || message.refusal}</div> : message.toolCalls?.length ? null : <span className="text-sm text-muted-foreground">{loading && message.id === latestMessage?.id ? 'Waiting for response…' : 'No response text returned.'}</span>}
 
                     {message.toolCalls?.map(call => (
                       <ToolCallCard
@@ -726,13 +745,22 @@ export default function PlaygroundPage() {
                         onResultChange={value => setToolResults(current => ({ ...current, [call.id]: value }))}
                         onAddResult={() => addToolResult(call)}
                         alreadyAnswered={messages.some(item => item.role === 'tool' && item.toolCallId === call.id)}
+                        disabled={loading || Boolean(message.streamError)}
                       />
                     ))}
 
                     {message.streamError ? <InlineNotice className="mt-3" tone={message.meta?.finishReason === 'cancelled' ? 'neutral' : 'critical'}>{message.streamError}</InlineNotice> : null}
 
+                    {message.role === 'assistant' && !loading ? (
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {message.content || message.refusal ? <Button variant="ghost" size="xs" onClick={() => void copyMessage(message)} aria-label="Copy assistant response"><Copy aria-hidden="true" /> {copiedMessageId === message.id ? 'Copied' : 'Copy'}</Button> : null}
+                        {message.id === latestMessage?.id && message.kind === 'error' ? <Button variant="outline" size="xs" disabled={!selectedModelReady} onClick={() => void handleSend(true)}><RotateCcw aria-hidden="true" /> Retry request</Button> : null}
+                      </div>
+                    ) : null}
+
                     {message.meta ? (
                       <dl className={cn('mt-3 grid gap-x-4 gap-y-2 border-t pt-3', message.role === 'user' ? 'border-primary-foreground/25' : 'border-border', 'grid-cols-2 sm:grid-cols-4')}>
+                        {message.meta.requestId ? <MetaItem label="Request ID" value={message.meta.requestId} /> : null}
                         {message.meta.platform ? <MetaItem label="Provider" value={message.meta.platform} /> : null}
                         {message.meta.model ? <MetaItem label="Model" value={message.meta.model} /> : null}
                         {message.meta.clientKey ? <MetaItem label="Client key" value={message.meta.clientKey} /> : null}
@@ -746,11 +774,11 @@ export default function PlaygroundPage() {
                   </div>
                 </article>
               ))}
-              <div ref={messagesEndRef} />
             </div>
           </div>
 
           <div className="border-t border-border bg-card p-3">
+            {!following && messages.length > 0 ? <Button variant="outline" size="sm" className="mb-2" onClick={() => setFollowing(true)}><ArrowDown aria-hidden="true" /> Jump to latest</Button> : null}
             {formError ? <InlineNotice tone="critical" className="mb-3">{formError}</InlineNotice> : null}
             <div className="flex items-end gap-2 rounded-[var(--radius-panel)] border border-input bg-background p-2 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/20">
               <Label htmlFor="playground-prompt" className="sr-only">Message</Label>
@@ -861,7 +889,7 @@ export default function PlaygroundPage() {
           <section className="panel-card rounded-[var(--radius-panel)] p-4">
             <SectionTitle title="Last route" description="Response metadata from this browser session." />
             <dl className="grid grid-cols-2 gap-x-4 gap-y-3">
-              <MetaItem label="Mode" value={selectedModel === 'auto' ? 'Automatic' : 'Pinned'} />
+              <MetaItem label="Mode" value={selectedModel === 'auto' ? 'Automatic' : 'Preferred model'} />
               <MetaItem label="Ready models" value={String(availableModels.length)} />
               <MetaItem label="Client key" value={lastMeta?.clientKey ?? '—'} />
               <MetaItem label="Provider" value={lastMeta?.platform ?? '—'} />

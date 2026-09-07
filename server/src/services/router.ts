@@ -3,7 +3,7 @@ import { getProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, releaseProviderCapacity, reserveProviderCapacity } from './ratelimit.js';
 import { ProviderError, type BaseProvider } from '../providers/base.js';
-import { ensureFreshOAuthAccount } from './oauth-refresh.js';
+import { getRouteCredentials, oauthOptionsForCredential, prepareProviderCredential } from './credentials.js';
 
 interface ModelRow {
   id: number;
@@ -14,26 +14,6 @@ interface ModelRow {
   rpd_limit: number | null;
   tpm_limit: number | null;
   tpd_limit: number | null;
-}
-
-interface KeyRow {
-  id: number;
-  platform: string;
-  encrypted_key: string;
-  iv: string;
-  auth_tag: string;
-  status: string;
-  enabled: number;
-  oauth_account_id?: number | null;
-  source?: string;
-  oauth_provider?: string | null;
-}
-
-interface OAuthAccountRow {
-  id: number;
-  provider: string;
-  account_hint: string | null;
-  metadata_json: string | null;
 }
 
 interface FallbackRow {
@@ -75,23 +55,6 @@ export class RoutePreparationError extends ProviderError {
     this.failedRoute = failedRoute;
     this.cause = error;
   }
-}
-
-function oauthOptionsForKey(db: ReturnType<typeof getDb>, key: KeyRow): RouteResult['oauth'] {
-  if (!key.oauth_account_id) return undefined;
-  const account = db.prepare('SELECT id, provider, account_hint, metadata_json FROM oauth_accounts WHERE id = ? AND enabled = 1')
-    .get(key.oauth_account_id) as OAuthAccountRow | undefined;
-  if (!account) return undefined;
-  let metadata: Record<string, unknown> = {};
-  try {
-    metadata = account.metadata_json ? JSON.parse(account.metadata_json) as Record<string, unknown> : {};
-  } catch {}
-  return {
-    accountId: account.id,
-    provider: account.provider,
-    accountHint: account.account_hint,
-    metadata,
-  };
 }
 
 // Round-robin index per platform
@@ -292,36 +255,7 @@ export function routeRequest(
     if (!provider) continue;
 
     // Get enabled keys that have not already failed validation or decryption.
-    const keys = db.prepare(
-      `SELECT ak.*, oa.provider AS oauth_provider
-         FROM api_keys ak
-         LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
-        WHERE ak.platform = ?
-          AND ak.enabled = 1
-          AND (
-            ak.status IN ('healthy', 'unknown')
-            OR (ak.source = 'oauth' AND ak.status NOT IN ('invalid', 'error'))
-          )
-          AND (
-            ak.source != 'oauth'
-            OR (
-              oa.enabled = 1
-              AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1
-              AND (
-                NOT EXISTS (SELECT 1 FROM oauth_account_models known WHERE known.oauth_account_id = ak.oauth_account_id)
-                OR EXISTS (
-                  SELECT 1 FROM oauth_account_models eligible
-                   WHERE eligible.oauth_account_id = ak.oauth_account_id
-                     AND eligible.platform = ak.platform
-                     AND eligible.model_id = ?
-                     AND eligible.supported = 1
-                )
-              )
-            )
-          )
-        ORDER BY CASE ak.status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
-                 ak.id ASC`
-    ).all(model.platform, model.model_id) as KeyRow[];
+    const keys = getRouteCredentials(model.platform, model.model_id);
 
     const eligibleKeys = keyAccessFilter
       ? keys.filter(key => keyAccessFilter({ id: key.id, platform: key.platform, source: key.source, oauthProvider: key.oauth_provider }))
@@ -395,7 +329,7 @@ export function routeRequest(
         keyId: key.id,
         platform: model.platform,
         displayName: model.display_name,
-        oauth: oauthOptionsForKey(db, key),
+        oauth: oauthOptionsForCredential(key),
       };
     }
 
@@ -437,6 +371,7 @@ export async function routeRequestAsync(
   const preparationFailures = new Map<string, number>();
   let lastPreparationError: RoutePreparationError | null = null;
   for (let preparationAttempt = 0; preparationAttempt < 32; preparationAttempt++) {
+    signal?.throwIfAborted();
     let route: RouteResult;
     try {
       route = routeRequest(estimatedTokens, selectionSkips, preferredModelDbId, strictPreferredModel, accessFilter, keyAccessFilter);
@@ -447,13 +382,8 @@ export async function routeRequestAsync(
     const capacityReservationId = reserveProviderCapacity(route.platform, route.modelId, route.keyId, estimatedTokens);
     const reservedRoute = { ...route, capacityReservationId };
     try {
-      const key = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(route.keyId) as KeyRow | undefined;
-      if (key?.oauth_account_id) {
-        const account = await ensureFreshOAuthAccount(getDb(), key.oauth_account_id, signal);
-        const freshAccessToken = decrypt(account.encrypted_access_token, account.access_iv, account.access_auth_tag);
-        return { ...reservedRoute, apiKey: freshAccessToken, oauth: oauthOptionsForKey(getDb(), key) };
-      }
-      return reservedRoute;
+      const credential = await prepareProviderCredential(route.keyId, signal);
+      return { ...reservedRoute, ...credential };
     } catch (error) {
       releaseProviderCapacity(capacityReservationId);
       if (signal?.aborted) throw error;

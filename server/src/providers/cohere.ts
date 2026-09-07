@@ -1,3 +1,4 @@
+import { streamOpenAIResponse } from './openai-stream.js';
 import type {
   ChatMessage,
   ChatCompletionResponse,
@@ -5,7 +6,7 @@ import type {
 } from '@llmharbor/shared/types.js';
 import { BaseProvider, ProviderError, ProviderProtocolError, type CompletionOptions } from './base.js';
 import { flattenMessageContent } from '../lib/content.js';
-import { hasSubstantiveOpenAIStreamDelta, isOpenAIStreamChunk, normalizeOpenAICompatibleResponse } from './openai-compat.js';
+import { normalizeOpenAICompatibleResponse } from './openai-compat.js';
 
 const API_BASE = 'https://api.cohere.ai/compatibility/v1';
 
@@ -85,81 +86,7 @@ export class CohereProvider extends BaseProvider {
       throw new ProviderError(`Cohere API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
     }
 
-    const reader = res.body?.getReader();
-    if (!reader) throw new ProviderProtocolError('Cohere returned no streaming response body.');
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let substantiveFrames = 0;
-    let validFrames = 0;
-    let malformedFrames = 0;
-    let terminalFrames = 0;
-    let sawToolCallDelta = false;
-    let streamId: string | null = null;
-    let streamCreated = Math.floor(Date.now() / 1000);
-    const pendingChunks: ChatCompletionChunk[] = [];
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trimStart();
-          if (data === '[DONE]') {
-            if (substantiveFrames === 0) {
-              throw new ProviderProtocolError(`Cohere returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without completion choices' : 'an empty stream'}.`);
-            }
-            if (malformedFrames > 0) throw new ProviderProtocolError('Cohere returned malformed streaming data.');
-            if (terminalFrames === 0) {
-              yield {
-                id: streamId ?? this.makeId(), object: 'chat.completion.chunk', created: streamCreated, model: modelId,
-                choices: [{ index: 0, delta: {}, finish_reason: sawToolCallDelta ? 'tool_calls' : 'stop' }],
-              };
-            }
-            return;
-          }
-          try {
-            const chunk = JSON.parse(data) as unknown;
-            if (!isOpenAIStreamChunk(chunk)) {
-              malformedFrames++;
-              continue;
-            }
-            validFrames++;
-            streamId ??= typeof chunk.id === 'string' && chunk.id ? chunk.id : this.makeId();
-            streamCreated = typeof chunk.created === 'number' && Number.isFinite(chunk.created) && chunk.created >= 0 ? chunk.created : streamCreated;
-            if (chunk.choices.some(choice => choice.finish_reason !== null && choice.finish_reason !== undefined)) terminalFrames++;
-            if (chunk.choices.some(choice => (choice.delta?.tool_calls?.length ?? 0) > 0)) sawToolCallDelta = true;
-            const substantive = hasSubstantiveOpenAIStreamDelta(chunk);
-            if (!substantiveFrames && !substantive) {
-              pendingChunks.push(chunk);
-              continue;
-            }
-            if (!substantiveFrames) {
-              for (const pending of pendingChunks) yield pending;
-            }
-            if (substantive) substantiveFrames++;
-            yield chunk;
-          } catch {
-            // Tolerate one corrupt frame if the stream recovers.
-            malformedFrames++;
-          }
-        }
-      }
-      if (substantiveFrames === 0) {
-        throw new ProviderProtocolError(`Cohere returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without completion choices' : 'an empty stream'}.`);
-      }
-      if (malformedFrames > 0) throw new ProviderProtocolError('Cohere returned malformed streaming data.');
-      if (terminalFrames === 0) throw new ProviderProtocolError('Cohere returned a truncated completion stream.');
-    } finally {
-      try { await reader.cancel(); } catch { /* body already closed */ }
-    }
+    yield* streamOpenAIResponse(res, this.name, modelId, () => this.makeId());
   }
 
   async validateKey(apiKey: string, signal?: AbortSignal): Promise<boolean> {

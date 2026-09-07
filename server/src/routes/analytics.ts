@@ -35,6 +35,13 @@ function analyticsRange(req: Request, res: Response): { range: z.infer<typeof ra
   return { range: parsed.data, since: getSinceTimestamp(parsed.data) };
 }
 
+// Keep the timestamp as a direct range predicate so SQLite can use its
+// time indexes. A parameterized OR forced scans of the entire request history.
+function timePredicate(since: string | null, column: 'created_at' | 'r.created_at' = 'created_at'): string {
+  return since === null ? '1 = 1' : column + ' >= datetime(?)';
+}
+function timeParams(since: string | null): string[] { return since === null ? [] : [since]; }
+
 // Summary stats
 analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const range = analyticsRange(req, res);
@@ -52,13 +59,12 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
       SUM(output_tokens) as total_output_tokens,
       AVG(CASE WHEN status != 'cancelled' THEN latency_ms END) as avg_latency_ms
     FROM requests
-    WHERE is_final = 1 AND (? IS NULL OR created_at >= datetime(?))
-  `).get(since, since) as any;
+    WHERE is_final = 1 AND ${timePredicate(since)}
+  `).get(...timeParams(since)) as any;
 
   const totalRequests = stats.total_requests ?? 0;
   const completedRequests = (stats.success_count ?? 0) + (stats.failure_count ?? 0);
   const successRate = completedRequests > 0 ? (stats.success_count / completedRequests) * 100 : 0;
-  const totalTokens = (stats.total_input_tokens ?? 0) + (stats.total_output_tokens ?? 0);
 
   // Estimate cost savings: average ~$3/M input + $15/M output tokens (GPT-4o pricing)
   const inputCost = ((stats.total_input_tokens ?? 0) / 1_000_000) * 3;
@@ -98,10 +104,10 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
       SUM(r.output_tokens) as total_output_tokens
     FROM requests r
     LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-    WHERE r.is_final = 1 AND (? IS NULL OR r.created_at >= datetime(?))
+    WHERE r.is_final = 1 AND ${timePredicate(since, 'r.created_at')}
     GROUP BY r.platform, r.model_id
     ORDER BY requests DESC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -134,10 +140,10 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
       SUM(input_tokens) as total_input_tokens,
       SUM(output_tokens) as total_output_tokens
     FROM requests
-    WHERE is_final = 1 AND (? IS NULL OR created_at >= datetime(?))
+    WHERE is_final = 1 AND ${timePredicate(since)}
     GROUP BY platform
     ORDER BY requests DESC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   res.json(rows.map(r => ({
     platform: r.platform,
@@ -174,10 +180,10 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
       SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as failure_count,
       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled_count
     FROM requests
-    WHERE is_final = 1 AND (? IS NULL OR created_at >= datetime(?))
+    WHERE is_final = 1 AND ${timePredicate(since)}
     GROUP BY strftime('${dateFormat}', created_at)
     ORDER BY timestamp ASC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   res.json(rows.map(r => ({
     timestamp: r.timestamp,
@@ -205,17 +211,17 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
         WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR (error LIKE '%invalid%' AND error LIKE '%key%') THEN 'Auth Error (401)'
         WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
         WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
+        WHEN error LIKE '%timed out%' OR error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
         WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
         WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
         ELSE 'Other'
       END as error_category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND (? IS NULL OR created_at >= datetime(?))
+    WHERE status = 'error' AND ${timePredicate(since)}
     GROUP BY platform, error_category
     ORDER BY count DESC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   // Also get totals by category
   const byCategory = db.prepare(`
@@ -225,26 +231,26 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
         WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR (error LIKE '%invalid%' AND error LIKE '%key%') THEN 'Auth Error (401)'
         WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
         WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
+        WHEN error LIKE '%timed out%' OR error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
         WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
         WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
         ELSE 'Other'
       END as category,
       COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND (? IS NULL OR created_at >= datetime(?))
+    WHERE status = 'error' AND ${timePredicate(since)}
     GROUP BY category
     ORDER BY count DESC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   // Errors by platform
   const byPlatform = db.prepare(`
     SELECT platform, COUNT(*) as count
     FROM requests
-    WHERE status = 'error' AND (? IS NULL OR created_at >= datetime(?))
+    WHERE status = 'error' AND ${timePredicate(since)}
     GROUP BY platform
     ORDER BY count DESC
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   res.json({
     byCategory,
@@ -263,10 +269,10 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
   const rows = db.prepare(`
     SELECT id, request_id, attempt, is_final, platform, model_id, error, latency_ms, created_at
     FROM requests
-    WHERE status = 'error' AND (? IS NULL OR created_at >= datetime(?))
+    WHERE status = 'error' AND ${timePredicate(since)}
     ORDER BY created_at DESC, id DESC
     LIMIT 50
-  `).all(since, since) as any[];
+  `).all(...timeParams(since)) as any[];
 
   res.json(rows.map(r => ({
     id: r.id,
@@ -286,6 +292,7 @@ analyticsRouter.get('/errors', (req: Request, res: Response) => {
 analyticsRouter.get('/recent', (req: Request, res: Response) => {
   const range = analyticsRange(req, res);
   if (!range) return;
+  const { since } = range;
   const limitResult = z.coerce.number().int().min(1).max(100).default(10).safeParse(req.query.limit);
   if (!limitResult.success) {
     res.status(400).json({ error: { message: 'Invalid limit. Use an integer from 1 to 100.', type: 'invalid_request_error', code: 'invalid_analytics_limit' } });
@@ -296,10 +303,10 @@ analyticsRouter.get('/recent', (req: Request, res: Response) => {
            r.input_tokens, r.output_tokens, r.latency_ms, r.error, r.created_at
       FROM requests r
       LEFT JOIN models m ON m.platform = r.platform AND m.model_id = r.model_id
-     WHERE r.is_final = 1 AND (? IS NULL OR r.created_at >= datetime(?))
+     WHERE r.is_final = 1 AND ${timePredicate(since, 'r.created_at')}
      ORDER BY r.created_at DESC, r.id DESC
      LIMIT ?
-  `).all(range.since, range.since, limitResult.data) as any[];
+  `).all(...timeParams(since), limitResult.data) as any[];
 
   res.json(rows.map(row => ({
     id: row.id,

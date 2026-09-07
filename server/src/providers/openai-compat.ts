@@ -1,3 +1,4 @@
+import { streamOpenAIResponse } from './openai-stream.js';
 import type {
   ChatMessage,
   ChatCompletionResponse,
@@ -221,93 +222,7 @@ export class OpenAICompatProvider extends BaseProvider {
       throw new ProviderError(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, { statusCode: res.status });
     }
 
-    const reader = res.body?.getReader();
-    if (!reader) throw new ProviderProtocolError(`${this.name} returned no streaming response body.`);
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let validFrames = 0;
-    let substantiveFrames = 0;
-    let malformedFrames = 0;
-    let completionId: string | null = null;
-    let completionCreated: number | null = null;
-    let terminalFrames = 0;
-    let sawToolCallDelta = false;
-    const pendingChunks: ChatCompletionChunk[] = [];
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trimStart();
-          if (data === '[DONE]') {
-            if (substantiveFrames === 0) {
-              throw new ProviderProtocolError(`${this.name} returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without any completion choices' : 'an empty stream'}.`);
-            }
-            if (malformedFrames > 0) {
-              throw new ProviderProtocolError(`${this.name} returned malformed streaming data.`);
-            }
-            if (terminalFrames === 0) {
-              yield {
-                id: completionId!,
-                object: 'chat.completion.chunk',
-                created: completionCreated!,
-                model: modelId,
-                choices: [{ index: 0, delta: {}, finish_reason: sawToolCallDelta ? 'tool_calls' : 'stop' }],
-              };
-            }
-            return;
-          }
-          let chunk: unknown;
-          try {
-            chunk = JSON.parse(data);
-          } catch {
-            // Tolerate a corrupt frame when later valid frames may still arrive.
-            malformedFrames++;
-            continue;
-          }
-          if (!isOpenAIStreamChunk(chunk)) {
-            malformedFrames++;
-            continue;
-          }
-          validFrames++;
-          completionId ??= typeof (chunk as any).id === 'string' && (chunk as any).id
-            ? (chunk as any).id
-            : this.makeId();
-          completionCreated ??= finiteNonNegative((chunk as any).created) || Math.floor(Date.now() / 1000);
-          const normalized = normalizeOpenAIStreamChunk(chunk, modelId, completionId!, completionCreated!);
-          if (normalized.choices.some(choice => choice.finish_reason !== null)) terminalFrames++;
-          const substantive = hasSubstantiveOpenAIStreamDelta(normalized);
-          if (normalized.choices.some(choice => (choice.delta?.tool_calls?.length ?? 0) > 0)) sawToolCallDelta = true;
-          if (!substantiveFrames && !substantive) {
-            pendingChunks.push(normalized);
-            continue;
-          }
-          if (!substantiveFrames) {
-            for (const pending of pendingChunks) yield pending;
-          }
-          if (substantive) substantiveFrames++;
-          yield normalized;
-        }
-      }
-      if (substantiveFrames === 0) {
-        throw new ProviderProtocolError(`${this.name} returned ${malformedFrames > 0 ? 'only malformed frames' : validFrames > 0 ? 'usage without any completion choices' : 'an empty stream'}.`);
-      }
-      if (malformedFrames > 0) {
-        throw new ProviderProtocolError(`${this.name} returned malformed streaming data.`);
-      }
-      if (terminalFrames === 0) throw new ProviderProtocolError(`${this.name} returned a truncated completion stream.`);
-    } finally {
-      try { await reader.cancel(); } catch { /* body already closed */ }
-    }
+    yield* streamOpenAIResponse(res, this.name, modelId, () => this.makeId());
   }
 
   async validateKey(apiKey: string, signal?: AbortSignal): Promise<boolean> {
@@ -540,17 +455,6 @@ function normalizeMessageText(message: ChatMessage): string {
   return String(message.content);
 }
 
-function extractResponsesText(data: any): string {
-  if (typeof data.output_text === 'string') return data.output_text;
-  const pieces: string[] = [];
-  for (const item of data.output ?? []) {
-    for (const part of item.content ?? []) {
-      if (typeof part.text === 'string') pieces.push(part.text);
-    }
-  }
-  return pieces.join('');
-}
-
 class CodexTextAccumulator {
   private emittedText = '';
   private emittedRefusal = '';
@@ -688,67 +592,7 @@ function finiteNonNegative(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
-export function isOpenAIStreamChunk(value: unknown): value is ChatCompletionChunk {
-  if (!value || typeof value !== 'object' || !Array.isArray((value as any).choices)) return false;
-  const choices = (value as any).choices as unknown[];
-  if (choices.length === 0) return isValidUsage((value as any).usage);
-  return choices.every((choice: unknown) => {
-    if (choice === null || typeof choice !== 'object') return false;
-    const delta = (choice as any).delta;
-    if (delta === null || typeof delta !== 'object') return false;
-    if (delta.content !== undefined && delta.content !== null && typeof delta.content !== 'string') return false;
-    if (delta.refusal !== undefined && delta.refusal !== null && typeof delta.refusal !== 'string') return false;
-    if ((choice as any).finish_reason !== undefined && (choice as any).finish_reason !== null && typeof (choice as any).finish_reason !== 'string') return false;
-    if (delta.tool_calls === undefined) return true;
-    return Array.isArray(delta.tool_calls) && delta.tool_calls.every((call: unknown) => {
-      if (!call || typeof call !== 'object' || !Number.isInteger((call as any).index) || (call as any).index < 0) return false;
-      const fn = (call as any).function;
-      return fn === undefined || (fn !== null && typeof fn === 'object'
-        && (fn.name === undefined || typeof fn.name === 'string')
-        && (fn.arguments === undefined || typeof fn.arguments === 'string'));
-    });
-  });
-}
-
-export function hasSubstantiveOpenAIStreamDelta(chunk: ChatCompletionChunk): boolean {
-  return chunk.choices.some(choice => (
-    Boolean(choice.delta?.content)
-    || Boolean((choice.delta as any)?.refusal)
-    || (choice.delta?.tool_calls?.length ?? 0) > 0
-    || (choice.finish_reason !== null && choice.finish_reason !== undefined)
-  ));
-}
-
-function normalizeOpenAIStreamChunk(
-  value: ChatCompletionChunk,
-  requestedModel: string,
-  completionId: string,
-  created: number,
-): ChatCompletionChunk {
-  return {
-    ...value,
-    id: completionId,
-    object: 'chat.completion.chunk',
-    created,
-    model: requestedModel,
-    choices: value.choices.map((choice, index) => ({
-      ...choice,
-      index: Number.isInteger(choice.index) && choice.index >= 0 ? choice.index : index,
-      delta: choice.delta,
-      finish_reason: typeof choice.finish_reason === 'string' || choice.finish_reason === null
-        ? choice.finish_reason
-        : null,
-    })),
-  };
-}
-
-function isValidUsage(value: unknown): boolean {
-  if (!value || typeof value !== 'object') return false;
-  const usage = value as Record<string, unknown>;
-  return ['prompt_tokens', 'completion_tokens', 'total_tokens'].every(field => (
-    typeof usage[field] === 'number' && Number.isFinite(usage[field]) && (usage[field] as number) >= 0
-  ));
-}
+export { isOpenAIStreamChunk, hasSubstantiveOpenAIStreamDelta } from './openai-stream.js';
 
 function normalizeChatCompletionResponse(
   raw: unknown,
@@ -768,11 +612,20 @@ function normalizeChatCompletionResponse(
       throw new ProviderProtocolError(`${providerName} returned a malformed choice at index ${index}.`);
     }
     const message = choice.message;
+    if (message.content === undefined && (message.tool_calls?.length || typeof message.refusal === 'string')) {
+      message.content = null;
+    }
     if (message.content !== null && typeof message.content !== 'string' && !Array.isArray(message.content)) {
       throw new ProviderProtocolError(`${providerName} returned an invalid assistant message content value.`);
     }
     if (message.refusal !== undefined && message.refusal !== null && typeof message.refusal !== 'string') {
       throw new ProviderProtocolError(`${providerName} returned an invalid assistant refusal value.`);
+    }
+    if (Array.isArray(message.content) && message.content.some((part: unknown) => (
+      typeof part !== 'string' && (!part || typeof part !== 'object'
+        || ('text' in part && typeof part.text !== 'string'))
+    ))) {
+      throw new ProviderProtocolError(`${providerName} returned malformed assistant content blocks.`);
     }
     if (message.tool_calls !== undefined && !Array.isArray(message.tool_calls)) {
       throw new ProviderProtocolError(`${providerName} returned malformed tool_calls.`);

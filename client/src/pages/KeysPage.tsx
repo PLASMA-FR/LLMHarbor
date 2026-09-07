@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { copyText } from '@/lib/clipboard'
 import { formatDateTime, formatRelativeTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
@@ -417,6 +418,7 @@ export default function KeysPage() {
   const [importLabelPrefix, setImportLabelPrefix] = useState('')
   const [importContents, setImportContents] = useState('')
   const [importFileName, setImportFileName] = useState('')
+  const [importFileError, setImportFileError] = useState<string | null>(null)
   const [lastImport, setLastImport] = useState<BulkImportResult | null>(null)
   const importFileRef = useRef<HTMLInputElement | null>(null)
 
@@ -452,8 +454,7 @@ export default function KeysPage() {
     mutationFn: (body: { name: string; baseUrl: string }) =>
       apiFetch<EndpointSummary>('/api/endpoints', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['key-import-providers'] })
+      void invalidateRoutingQueries(queryClient)
       setEndpointName('')
       setEndpointBaseUrl('')
     },
@@ -462,10 +463,7 @@ export default function KeysPage() {
   const deleteEndpoint = useMutation({
     mutationFn: (endpointPlatform: string) => apiFetch(`/api/endpoints/${encodeURIComponent(endpointPlatform)}`, { method: 'DELETE' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['key-import-providers'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -476,9 +474,7 @@ export default function KeysPage() {
         body: JSON.stringify({ enabled }),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['free-model-updater-providers'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -490,9 +486,7 @@ export default function KeysPage() {
       }),
     onSuccess: () => {
       setEndpointEditor(null)
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
-      queryClient.invalidateQueries({ queryKey: ['key-import-providers'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -500,10 +494,7 @@ export default function KeysPage() {
     mutationFn: (body: { platform: string; key: string; label?: string }) =>
       apiFetch('/api/keys', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
       setPlatform('')
       setApiKey('')
       setAccountId('')
@@ -514,30 +505,21 @@ export default function KeysPage() {
   const deleteKey = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/keys/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
   const checkAll = useMutation({
     mutationFn: () => apiFetch('/api/health/check-all', { method: 'POST', timeoutMs: 300_000 }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -548,10 +530,7 @@ export default function KeysPage() {
         body: JSON.stringify({ enabled }),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -562,11 +541,7 @@ export default function KeysPage() {
         body: JSON.stringify({ enabled }),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['oauth-accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -584,10 +559,7 @@ export default function KeysPage() {
       setImportContents('')
       setImportFileName('')
       if (importFileRef.current) importFileRef.current.value = ''
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['custom-endpoints'] })
+      void invalidateRoutingQueries(queryClient)
     },
   })
 
@@ -610,7 +582,15 @@ export default function KeysPage() {
     const file = event.target.files?.[0]
     if (!file) return
     setImportFileName(file.name)
-    setImportContents(await file.text())
+    setImportContents('')
+    setImportFileError(null)
+    try {
+      if (file.size > 250_000) throw new Error('Import files must be 250 KB or smaller. Split larger lists into separate files.')
+      setImportContents(await file.text())
+    } catch (error) {
+      setImportFileError(error instanceof Error ? error.message : 'Could not read the selected file.')
+      if (importFileRef.current) importFileRef.current.value = ''
+    }
   }
 
   const selectedImportTarget = providerTargets.find(target => target.platform === importPlatform)
@@ -831,6 +811,7 @@ export default function KeysPage() {
             </InlineNotice>
           )}
           {bulkImport.isError ? <InlineNotice tone="critical" className="mt-3">{bulkImport.error.message}</InlineNotice> : null}
+          {importFileError ? <InlineNotice tone="critical" className="mt-3">{importFileError}</InlineNotice> : null}
         </section>
 
         <section>

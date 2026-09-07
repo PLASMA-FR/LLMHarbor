@@ -710,6 +710,7 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_requests_status_created_at ON requests(status, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_requests_platform_model_created_at ON requests(platform, model_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_created_at_ms ON rate_limit_usage(created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
     CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_lookup ON client_api_key_usage(client_api_key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_client_api_key_usage_created_at_ms ON client_api_key_usage(created_at_ms);
@@ -1075,9 +1076,6 @@ function seedModels(db: Database.Database) {
  */
 function migrateModels(db: Database.Database) {
   // 1) Replace outdated models in-place (preserves fallback_config & any references)
-  const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
-    // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
-  ];
   const renameStmt = db.prepare(`
     UPDATE models
        SET model_id = ?, display_name = ?, intelligence_rank = ?,
@@ -2335,7 +2333,7 @@ export function updateClientApiKey(
     db.prepare('UPDATE client_api_keys SET enabled = ? WHERE id = ?').run(updates.enabled ? 1 : 0, id);
   }
   if (updates.limits !== undefined) {
-    const normalizedLimits = normalizeClientApiKeyLimits(updates.limits);
+    const normalizedLimits = normalizeClientApiKeyLimits({ ...rowToClientApiKeyLimits(existing), ...updates.limits });
     db.prepare(`
       UPDATE client_api_keys
          SET rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?

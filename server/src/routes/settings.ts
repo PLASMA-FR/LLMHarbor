@@ -56,7 +56,7 @@ settingsRouter.get('/connection', (_req: Request, res: Response) => {
   });
 });
 
-const limitValueSchema = z.union([z.number().int().positive(), z.null()]).optional();
+const limitValueSchema = z.union([z.number().int().positive().safe(), z.null()]).optional();
 
 const clientKeyLimitsSchema = z.object({
   rpm: limitValueSchema,
@@ -88,7 +88,7 @@ const accessPolicyPatchSchema = z.object({
     enabled: z.boolean(),
   })).max(512).optional(),
   models: z.array(z.object({
-    modelDbId: z.number().int().positive(),
+    modelDbId: z.number().int().positive().safe(),
     enabled: z.boolean(),
   })).max(10_000).optional(),
 }).strict().refine(body => body.routes !== undefined || body.platforms !== undefined || body.models !== undefined, {
@@ -227,13 +227,6 @@ settingsRouter.delete('/api-keys/:id', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-
-const createLocalEndpointSchema = z.object({
-  name: z.string().min(1).max(100),
-  slug: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use a lowercase slug like openai-only'),
-  providerScopes: z.array(z.string().min(1).max(80)).default([]),
-  domains: z.array(z.string().min(1).max(160)).default([]),
-});
 
 const updateLocalEndpointSchema = z.object({
   name: z.string().min(1).max(100).optional(),

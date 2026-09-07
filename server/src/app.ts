@@ -237,6 +237,9 @@ function createBaseApp() {
       : crypto.randomUUID();
     res.locals.requestId = requestId;
     res.setHeader('X-Request-Id', requestId);
+    if (/^\/(?:api|v1|e)(?:\/|$)/.test(req.path)) {
+      res.setHeader('Cache-Control', 'no-store, private');
+    }
     next();
   });
 
@@ -330,10 +333,13 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
 
   // Serve client static files (after API error handler)
   const clientDist = options.clientDistPath ?? path.resolve(__dirname, '../../client/dist');
-  app.use(express.static(clientDist));
+  app.use('/assets', express.static(path.join(clientDist, 'assets'), { immutable: true, maxAge: '1y' }));
+  app.use(express.static(clientDist, { maxAge: 0 }));
   // SPA fallback — serve index.html for dashboard routes only.
   app.use((req, res, next) => {
-    if (req.path.startsWith('/api/') || req.path.startsWith('/v1/') || req.path.startsWith('/e/')) {
+    if (!['GET', 'HEAD'].includes(req.method)
+      || /^\/(?:api|v1|e|assets)(?:\/|$)/.test(req.path)
+      || path.extname(req.path)) {
       next();
       return;
     }
@@ -346,7 +352,7 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
 
   // Express' default 404 is HTML. Keep every API namespace machine-readable,
   // including unknown routes on the combined dashboard listener.
-  app.use((req, res) => {
+  app.use((_req, res) => {
     const requestId = String(res.locals.requestId ?? 'unknown');
     res.status(404).json({
       error: {

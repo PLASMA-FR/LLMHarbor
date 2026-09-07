@@ -665,6 +665,7 @@ export class GoogleProvider extends BaseProvider {
           finish_reason: choice?.finish_reason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop'),
         }],
       };
+      yield { id, object: 'chat.completion.chunk', created: completion.created, model: modelId, choices: [], usage: completion.usage };
       return;
     }
 
@@ -790,6 +791,16 @@ export class GoogleProvider extends BaseProvider {
         } catch {
           malformedFrames++;
           continue;
+        }
+        if (chunk.usageMetadata) {
+          yield {
+            id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: modelId, choices: [],
+            usage: {
+              prompt_tokens: chunk.usageMetadata.promptTokenCount ?? 0,
+              completion_tokens: chunk.usageMetadata.candidatesTokenCount ?? 0,
+              total_tokens: chunk.usageMetadata.totalTokenCount ?? 0,
+            },
+          };
         }
         const candidate = chunk.candidates?.[0];
         if (!candidate || typeof candidate !== 'object') {

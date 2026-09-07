@@ -265,7 +265,7 @@ function removeFailedAccountInventory(
   if (enabledAccounts.count <= 1) disableOAuthModelsForPlatform(db, platform, reason);
 }
 
-export async function discoverOAuthAccount(db: Database.Database, row: any, signal?: AbortSignal): Promise<OAuthDiscoveryResult> {
+export async function discoverOAuthAccount(_db: Database.Database, row: any, signal?: AbortSignal): Promise<OAuthDiscoveryResult> {
   const token = decrypt(row.encrypted_access_token, row.access_iv, row.access_auth_tag);
   if (row.provider === 'openai') {
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'LLMHarbor/0.1.0', originator: 'codex_cli_rs' };

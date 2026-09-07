@@ -106,11 +106,22 @@ function boundedRequestOperation(req: Request, res: Response, timeoutMs = 30_000
   };
   req.once('aborted', abort);
   res.once('close', abortOnClose);
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
+  const onTimeout = () => {
+    if (signal.reason?.name === 'TimeoutError' && !res.headersSent && !res.destroyed) {
+      res.status(504).json({ error: {
+        message: 'OAuth operation timed out. Try again.', type: 'upstream_error',
+        code: 'oauth_timeout', request_id: String(res.locals.requestId ?? 'unknown'),
+      } });
+    }
+  };
+  signal.addEventListener('abort', onTimeout, { once: true });
   return {
-    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]),
+    signal,
     cleanup: () => {
       req.off('aborted', abort);
       res.off('close', abortOnClose);
+      signal.removeEventListener('abort', onTimeout);
     },
   };
 }
@@ -360,7 +371,7 @@ async function startFreebuffDeviceOAuth(provider: BrowserOAuthProvider, signal?:
       continue;
     }
     const data = await upstream.json().catch(() => null) as any;
-    if (!data.loginUrl || !data.fingerprintHash || !data.expiresAt) {
+    if (!data?.loginUrl || !data.fingerprintHash || !data.expiresAt) {
       lastError = 'Login response did not include loginUrl, fingerprintHash, and expiresAt.';
       continue;
     }
@@ -408,7 +419,10 @@ async function completeFreebuffDeviceOAuth(provider: BrowserOAuthProvider, state
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
     headers: { Accept: 'application/json', 'User-Agent': 'Bun/1.3.11' },
   });
-  if (upstream.status === 401) return { pending: true };
+  if (upstream.status === 401) {
+    await upstream.body?.cancel().catch(() => {});
+    return { pending: true };
+  }
   if (!upstream.ok) {
     await upstream.body?.cancel().catch(() => {});
     throw new Error(`Freebuff login status failed with HTTP ${upstream.status}.`);

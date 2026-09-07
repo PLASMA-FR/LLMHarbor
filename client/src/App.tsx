@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ComponentType } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { BrowserRouter, Navigate, NavLink, Routes, Route, useLocation, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import {
@@ -20,6 +20,7 @@ import { HarborLogo } from '@/components/harbor-logo'
 import { LoadingState } from '@/components/page-header'
 import { ApiError, apiFetch } from '@/lib/api'
 import { cn } from '@/lib/utils'
+import { createPlaygroundDraft, PlaygroundContext } from '@/lib/playground-state'
 
 const OverviewPage = lazy(() => import('@/pages/OverviewPage'))
 const KeysPage = lazy(() => import('@/pages/KeysPage'))
@@ -203,7 +204,8 @@ function AppShell() {
       firstRoute.current = false
       return
     }
-    mainRef.current?.focus()
+    window.scrollTo(0, 0)
+    mainRef.current?.focus({ preventScroll: true })
   }, [currentPage, location.pathname])
 
   return (
@@ -272,12 +274,17 @@ function AppShell() {
   )
 }
 
+function PlaygroundDraftProvider({ children }: { children: ReactNode }) {
+  const [draft, setDraft] = useState(createPlaygroundDraft)
+  return <PlaygroundContext value={{ draft, setDraft }}>{children}</PlaygroundContext>
+}
+
 function App() {
   return (
     <AppErrorBoundary>
       <QueryClientProvider client={queryClient}>
         <BrowserRouter basename={import.meta.env.BASE_URL}>
-          <AppShell />
+          <PlaygroundDraftProvider><AppShell /></PlaygroundDraftProvider>
         </BrowserRouter>
       </QueryClientProvider>
     </AppErrorBoundary>

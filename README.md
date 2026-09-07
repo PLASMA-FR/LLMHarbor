@@ -417,19 +417,22 @@ Every successful response includes routing headers when available:
 |---|---|
 | `X-Routed-Via` | Provider and model that served the request. |
 | `X-Fallback-Attempts` | Number of failed route attempts before the successful route. |
+| `X-Request-Id` | Correlation ID for request diagnostics, including failures. |
 
 ## Dashboard map
 
 | Page | Use it for |
 |---|---|
 | Overview | Check service health, route readiness, quota pressure, recent traffic, and failures. |
-| Playground | Send a test request and inspect the route result. |
+| Playground | Test streaming, tool calls and refusals; inspect request IDs and routing; copy responses or export the conversation. Drafts and threads survive page navigation until reload. |
 | Providers & keys | Manage local client keys, provider keys, key health, and custom providers. |
 | OAuth accounts | Connect browser accounts, refresh discovered models, inspect account limits, and handle reconnects. |
-| Models | Register endpoint models and run probes. |
+| Models | Register and probe models, and edit display names, context windows and per-credential quotas in place. |
 | Routing | Reorder the fallback chain, inspect route eligibility, and switch models on or off. |
 | Analytics | Watch final client outcomes, latency, tokens, provider/model distribution, and sanitized failures. Failed fallback attempts remain visible in the recent-error feed for diagnosis. |
-| Settings | Tune local API access policies for each `llmharbor-*` key. |
+| Settings | Tune local API access policies for each `llmharbor-*` key, browse the entire model scope, and manage backups and discovery. |
+
+Model-setting and client-limit PATCH requests preserve omitted fields; send `null` to clear a quota. Newly discovered models remain unavailable to routing until their first successful verification. The discovery scheduler resumes its saved next-run deadline after a restart.
 
 ## How routing works
 
@@ -514,9 +517,12 @@ LLMHarbor focuses on OpenAI-compatible chat completions. These endpoint families
 ```bash
 npm ci
 npm run dev       # server on :3001, dashboard on :5173
+npm run typecheck # strict TypeScript checks for both workspaces
 npm test          # server Vitest suite, plus client tests if present
 npm run build     # TypeScript + Vite production build
 npm run check     # dashboard lint, tests, and both production builds
+npx playwright install chromium
+npm run test:e2e  # production-dashboard workflows with a local simulated provider
 ```
 
 Useful workspace commands:
@@ -614,6 +620,8 @@ server/src/__tests__/providers/<provider>.test.ts
 ```
 
 Please keep PRs focused and include tests for routing behavior when possible.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for focused validation commands and [engineering notes](docs/engineering-notes.md) for the architecture and audit scope.
 
 ## Terms of Use
 

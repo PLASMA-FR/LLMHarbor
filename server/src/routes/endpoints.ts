@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { decrypt } from '../lib/crypto.js';
+import { getRouteCredentials, prepareProviderCredential } from '../services/credentials.js';
 import { clearDynamicProvider, getBuiltInProviderSummaries, getProvider, hasProvider } from '../providers/index.js';
 import { safeUpstreamFailure } from '../lib/errors.js';
 import { parsePositiveResourceId } from '../lib/resourceId.js';
@@ -36,23 +36,26 @@ const endpointPatchSchema = endpointSchema
   });
 
 const modelSchema = z.object({
-  modelId: z.string().min(1).max(240),
-  displayName: z.string().min(1).max(160),
+  modelId: z.string().trim().min(1).max(240),
+  displayName: z.string().trim().min(1).max(160),
   intelligenceRank: z.number().int().min(1).max(999).default(50),
   speedRank: z.number().int().min(1).max(999).default(50),
   sizeLabel: z.string().max(60).default('Custom'),
-  rpmLimit: z.number().int().positive().nullable().optional(),
-  rpdLimit: z.number().int().positive().nullable().optional(),
-  tpmLimit: z.number().int().positive().nullable().optional(),
-  tpdLimit: z.number().int().positive().nullable().optional(),
+  rpmLimit: z.number().int().positive().safe().nullable().optional(),
+  rpdLimit: z.number().int().positive().safe().nullable().optional(),
+  tpmLimit: z.number().int().positive().safe().nullable().optional(),
+  tpdLimit: z.number().int().positive().safe().nullable().optional(),
   monthlyTokenBudget: z.string().max(80).default('custom'),
-  contextWindow: z.number().int().positive().nullable().optional(),
+  contextWindow: z.number().int().positive().safe().nullable().optional(),
   enabled: z.boolean().default(true),
 });
 
+const modelPatchSchema = modelSchema.omit({ modelId: true }).partial().strict()
+  .refine(value => Object.keys(value).length > 0, { message: 'Provide at least one model field to update.' });
+
 const probeSchema = z.object({
   modelId: z.string().min(1).max(240),
-  keyId: z.number().int().positive().optional(),
+  keyId: z.number().int().positive().safe().optional(),
 });
 
 function slugifyName(name: string): string {
@@ -389,13 +392,13 @@ endpointsRouter.post('/:platform/models/probe', async (req: Request, res: Respon
     return;
   }
 
-  const db = getDb();
+  const credentials = getRouteCredentials(platform.data, parsed.data.modelId);
   const keyRow = parsed.data.keyId
-    ? db.prepare('SELECT * FROM api_keys WHERE id = ? AND platform = ? AND enabled = 1').get(parsed.data.keyId, platform.data) as any
-    : db.prepare("SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 ORDER BY CASE status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, id DESC LIMIT 1").get(platform.data) as any;
+    ? credentials.find(key => key.id === parsed.data.keyId)
+    : credentials[0];
 
   if (!keyRow) {
-    res.status(400).json({ ok: false, modelId: parsed.data.modelId, message: 'Add an enabled key for this endpoint before probing a model.' });
+    res.status(400).json({ ok: false, modelId: parsed.data.modelId, message: 'Add an enabled, usable credential that supports this model before probing it.' });
     return;
   }
 
@@ -414,11 +417,11 @@ endpointsRouter.post('/:platform/models/probe', async (req: Request, res: Respon
   req.once('aborted', abortProbe);
   res.once('close', abortOnClose);
   try {
-    const key = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
-    const completion = await provider.chatCompletion(key, [
+    const credential = await prepareProviderCredential(keyRow.id, abortController.signal);
+    const completion = await provider.chatCompletion(credential.apiKey, [
       { role: 'system', content: 'Reply with exactly: harbor-ok' },
       { role: 'user', content: 'LLMHarbor model probe.' },
-    ], parsed.data.modelId, { temperature: 0, max_tokens: 16, signal: abortController.signal });
+    ], parsed.data.modelId, { temperature: 0, max_tokens: 16, oauth: credential.oauth, signal: abortController.signal });
 
     if (abortController.signal.aborted) return;
 
@@ -517,6 +520,45 @@ endpointsRouter.post('/:platform/models', (req: Request, res: Response) => {
   });
 });
 
+endpointsRouter.patch('/:platform/models/:modelDbId', (req: Request, res: Response) => {
+  const platform = platformSchema.safeParse(req.params.platform);
+  const modelDbId = parsePositiveResourceId(req.params.modelDbId);
+  if (!platform.success || !endpointExists(platform.data)) {
+    res.status(404).json({ error: { message: 'Endpoint not found' } });
+    return;
+  }
+  if (modelDbId === null) {
+    res.status(400).json({ error: { message: 'Invalid model id' } });
+    return;
+  }
+  const parsed = modelPatchSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(error => error.message).join(', ') } });
+    return;
+  }
+  const db = getDb();
+  // Column names come exclusively from this fixed mapping. Omitted fields
+  // retain their values, while explicit null clears a configured limit.
+  const columns = {
+    displayName: 'display_name', intelligenceRank: 'intelligence_rank', speedRank: 'speed_rank',
+    sizeLabel: 'size_label', rpmLimit: 'rpm_limit', rpdLimit: 'rpd_limit',
+    tpmLimit: 'tpm_limit', tpdLimit: 'tpd_limit', monthlyTokenBudget: 'monthly_token_budget',
+    contextWindow: 'context_window', enabled: 'enabled',
+  } as const;
+  const fields = Object.keys(parsed.data) as Array<keyof typeof columns>;
+  const result = db.prepare(`UPDATE models SET ${fields.map(field => `${columns[field]} = ?`).join(', ')} WHERE id = ? AND platform = ?`)
+    .run(...fields.map(field => field === 'enabled' ? Number(parsed.data[field]) : parsed.data[field]), modelDbId, platform.data);
+  if (result.changes === 0) {
+    res.status(404).json({ error: { message: 'Model not found' } });
+    return;
+  }
+  const model = db.prepare(`
+    SELECT m.*, fc.priority, fc.enabled AS fallback_enabled FROM models m
+    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id WHERE m.id = ?
+  `).get(modelDbId);
+  res.json(serializeModel(model));
+});
+
 endpointsRouter.delete('/:platform/models/:modelDbId', (req: Request, res: Response) => {
   const platform = platformSchema.safeParse(req.params.platform);
   if (!platform.success || !endpointExists(platform.data)) {
@@ -531,11 +573,12 @@ endpointsRouter.delete('/:platform/models/:modelDbId', (req: Request, res: Respo
 
   const db = getDb();
   const remove = db.transaction(() => {
+    if (!db.prepare('SELECT 1 FROM models WHERE id = ? AND platform = ?').get(modelDbId, platform.data)) return null;
     db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(modelDbId);
     return db.prepare('DELETE FROM models WHERE id = ? AND platform = ?').run(modelDbId, platform.data);
   });
   const result = remove();
-  if (result.changes === 0) {
+  if (!result || result.changes === 0) {
     res.status(404).json({ error: { message: 'Model not found' } });
     return;
   }

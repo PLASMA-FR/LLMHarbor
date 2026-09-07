@@ -56,8 +56,10 @@ function recordUsage(
     // Cleanup is maintenance, not part of every request. Running DELETE on
     // each usage write created needless WAL churn under concurrent streams.
     if (now - lastPersistedUsageCleanupAt >= HOUR) {
-      db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
-      lastPersistedUsageCleanupAt = now;
+      try {
+        db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+        lastPersistedUsageCleanupAt = now;
+      } catch { /* Usage already persisted; retry maintenance without counting it twice. */ }
     }
     return true;
   });

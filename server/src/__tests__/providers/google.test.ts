@@ -383,8 +383,10 @@ describe('GoogleProvider', () => {
     ));
 
     expect(capturedUrl).toBe('https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent');
-    expect(chunks.map(c => c.choices[0].delta.content ?? '').join('')).toBe('oauth stream ok');
-    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('stop');
+    const choices = chunks.flatMap(chunk => chunk.choices);
+    expect(choices.map(choice => choice.delta.content ?? '').join('')).toBe('oauth stream ok');
+    expect(choices.at(-1)?.finish_reason).toBe('stop');
+    expect(chunks.at(-1)?.usage).toEqual({ prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 });
   });
 
   it('uses Antigravity Code Assist wrapper for Google browser OAuth requests', async () => {

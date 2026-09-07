@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import type { ChatMessage } from '@llmharbor/shared/types.js';
+import type { ChatMessage, TokenUsage } from '@llmharbor/shared/types.js';
 import { routeRequestAsync, recordRateLimitHit, recordRouteFailure, recordSuccess, RoutePreparationError, type RouteResult } from '../services/router.js';
 import { commitProviderRequestReservation, recordRequest, recordTokens, releaseProviderCapacity, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
 import { authenticateClientApiKey, checkClientApiKeyLimits, commitClientApiKeyRequestReservation, getDashboardClientApiKey, getDb, recordClientApiKeyRequest, recordClientApiKeyTokens, releaseClientApiKeyCapacity, reserveClientApiKeyCapacity, type AuthenticatedClientApiKey } from '../db/index.js';
@@ -12,7 +12,9 @@ import { getClientEndpointBindingDenial, getClientModelAccessDenial, isClientLeg
 import { parseLocalModelId, toLocalModelId } from '../services/localModelIds.js';
 import { redactSensitive } from '../lib/errors.js';
 import { ProviderError, ProviderProtocolError } from '../providers/base.js';
-import { hasSubstantiveOpenAIStreamDelta } from '../providers/openai-compat.js';
+import { hasSubstantiveOpenAIStreamDelta, isOpenAIStreamChunk } from '../providers/openai-stream.js';
+import { resolveUsage } from '../lib/usage.js';
+import { routeableCredentialSql } from '../services/credentials.js';
 import { hasProvider } from '../providers/index.js';
 
 export const proxyRouter = Router({ mergeParams: true });
@@ -164,28 +166,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
            FROM api_keys ak
            LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
           WHERE ak.platform = m.platform
-            AND ak.enabled = 1
-            AND (
-              ak.status IN ('healthy', 'unknown')
-              OR (ak.source = 'oauth' AND ak.status NOT IN ('invalid', 'error'))
-            )
-            AND (
-              ak.source != 'oauth'
-              OR (
-                oa.enabled = 1
-                AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1
-                AND (
-                  NOT EXISTS (SELECT 1 FROM oauth_account_models known WHERE known.oauth_account_id = ak.oauth_account_id)
-                  OR EXISTS (
-                    SELECT 1 FROM oauth_account_models eligible
-                     WHERE eligible.oauth_account_id = ak.oauth_account_id
-                       AND eligible.platform = m.platform
-                       AND eligible.model_id = m.model_id
-                       AND eligible.supported = 1
-                  )
-                )
-              )
-            )
+            AND ${routeableCredentialSql('m.model_id')}
        )
      ORDER BY m.intelligence_rank
   `).all() as any[];
@@ -234,13 +215,16 @@ const MAX_FALLBACK_RETRY_WINDOW_MS = 3 * 60 * 1000;
 export function createAttemptDeadlineSignal(
   parent: AbortSignal,
   deadlineAt: number,
-): { signal: AbortSignal; cancel: () => void } {
+): { signal: AbortSignal; cancel: () => void; clearDeadline: () => void } {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | null = null;
   const abortFromParent = () => controller.abort(parent.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
-  const cleanup = () => {
+  const clearDeadline = () => {
     if (timer) clearTimeout(timer);
     timer = null;
+  };
+  const cleanup = () => {
+    clearDeadline();
     parent.removeEventListener('abort', abortFromParent);
   };
   if (parent.aborted) {
@@ -254,7 +238,7 @@ export function createAttemptDeadlineSignal(
     timer.unref?.();
   }
   controller.signal.addEventListener('abort', cleanup, { once: true });
-  return { signal: controller.signal, cancel: cleanup };
+  return { signal: controller.signal, cancel: cleanup, clearDeadline };
 }
 
 function retryBudgetForConfiguredRoutes(): number {
@@ -364,7 +348,7 @@ const chatCompletionSchema = z.object({
   ])).min(1),
   model: z.string().optional(),
   temperature: z.number().min(0).max(2).optional(),
-  max_tokens: z.number().int().positive().optional(),
+  max_tokens: z.number().int().positive().safe().optional(),
   top_p: z.number().min(0).max(1).optional(),
   stream: z.boolean().optional(),
   tools: z.array(toolDefinitionSchema).optional(),
@@ -520,7 +504,6 @@ function recordRetryFailure(summary: RetryFailureSummary, error: unknown): void 
 
 function sendFallbackExhausted(
   res: Response,
-  lastError: unknown,
   summary: RetryFailureSummary,
   attempts: number,
 ): void {
@@ -554,31 +537,6 @@ function sendFallbackExhausted(
       code: 'provider_fallback_exhausted',
       request_id: String(res.locals.requestId ?? 'unknown'),
     },
-  });
-}
-
-function isValidStreamChunk(value: unknown): boolean {
-  if (!value || typeof value !== 'object') return false;
-  const choices = (value as any).choices;
-  if (!Array.isArray(choices)) return false;
-  if (choices.length === 0) {
-    const usage = (value as any).usage;
-    return usage !== null && typeof usage === 'object'
-      && ['prompt_tokens', 'completion_tokens', 'total_tokens'].every(field => (
-        typeof usage[field] === 'number' && Number.isFinite(usage[field]) && usage[field] >= 0
-      ));
-  }
-  return choices.every((choice: unknown) => {
-    if (choice === null || typeof choice !== 'object') return false;
-    const delta = (choice as any).delta;
-    if (delta === null || typeof delta !== 'object') return false;
-    if (delta.content !== undefined && delta.content !== null && typeof delta.content !== 'string') return false;
-    if (delta.refusal !== undefined && delta.refusal !== null && typeof delta.refusal !== 'string') return false;
-    if (delta.tool_calls === undefined) return true;
-    return Array.isArray(delta.tool_calls) && delta.tool_calls.every((call: unknown) => (
-      call !== null && typeof call === 'object'
-      && Number.isInteger((call as any).index) && (call as any).index >= 0
-    ));
   });
 }
 
@@ -762,28 +720,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
            SELECT 1 FROM api_keys ak
            LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id
             WHERE ak.platform = m.platform
-              AND ak.enabled = 1
-              AND (
-                ak.status IN ('healthy', 'unknown')
-                OR (ak.source = 'oauth' AND ak.status NOT IN ('invalid', 'error'))
-              )
-              AND (
-                ak.source != 'oauth'
-                OR (
-                  oa.enabled = 1
-                  AND COALESCE(json_extract(oa.metadata_json, '$.oauthNeedsReconnect'), 0) != 1
-                  AND (
-                    NOT EXISTS (SELECT 1 FROM oauth_account_models known WHERE known.oauth_account_id = ak.oauth_account_id)
-                    OR EXISTS (
-                      SELECT 1 FROM oauth_account_models eligible
-                       WHERE eligible.oauth_account_id = ak.oauth_account_id
-                         AND eligible.platform = m.platform
-                         AND eligible.model_id = m.model_id
-                         AND eligible.supported = 1
-                    )
-                  )
-                )
-              )
+              AND ${routeableCredentialSql('m.model_id')}
               ${needsFullToolSemantics ? "AND NOT (ak.source = 'oauth' AND oa.provider = 'openai')" : ''}
          )`;
     const routeableOrder = `ORDER BY CASE WHEN m.display_name LIKE '%browser account%' THEN 0 ELSE 1 END, m.intelligence_rank ASC, m.id ASC LIMIT 1`;
@@ -919,7 +856,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         recordRetryFailure(retryFailures, lastError);
         settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
         logRequest('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'error', estimatedInputTokens, 0, Date.now() - start, safeProviderFailureDescription(lastError), analyticsRequestId, attempt + 1, true);
-        sendFallbackExhausted(res, lastError, retryFailures, attempt + 1);
+        sendFallbackExhausted(res, retryFailures, attempt + 1);
         return;
       }
       if (err instanceof RoutePreparationError) {
@@ -953,7 +890,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           'error', estimatedInputTokens, 0, Date.now() - start,
           safeProviderFailureDescription(lastError), analyticsRequestId, attempt + 1, true,
         );
-        sendFallbackExhausted(res, lastError, retryFailures, attempt);
+        sendFallbackExhausted(res, retryFailures, attempt);
       } else {
         settleClientCapacity();
         const status = Number.isInteger(err.status) && err.status >= 400 && err.status <= 599 ? err.status : 503;
@@ -980,9 +917,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // mid-stream errors emit an `error` SSE frame so the client sees a real signal
         // instead of a silently truncated stream.
         let estimatedOutputTokens = 0;
-        let reportedPromptTokens = 0;
-        let reportedCompletionTokens = 0;
-        let reportedTotalTokens = 0;
+        let outputCharacters = 0;
+        let reportedUsage: TokenUsage | undefined;
         let streamStarted = false;
         const bufferedUsageChunks: string[] = [];
         const includeUsage = stream_options?.include_usage === true;
@@ -994,7 +930,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           );
 
           for await (const chunk of gen) {
-            if (!isValidStreamChunk(chunk)) {
+            if (!isOpenAIStreamChunk(chunk)) {
               throw new ProviderProtocolError(`${route.displayName} returned a malformed streaming chunk.`);
             }
             const localRouteModelId = toLocalModelId(route.platform, route.modelId);
@@ -1007,9 +943,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 : Math.floor(Date.now() / 1000),
             };
             if (chunk.usage) {
-              reportedPromptTokens = chunk.usage.prompt_tokens;
-              reportedCompletionTokens = chunk.usage.completion_tokens;
-              reportedTotalTokens = chunk.usage.total_tokens;
+              reportedUsage = chunk.usage;
             }
             const usageOnly = chunk.choices.length === 0 && chunk.usage !== undefined;
             // Normalize provider-specific usage behavior at the gateway. OpenAI's
@@ -1025,10 +959,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // that the provider produced a completion. Keep them buffered until
             // the first substantive choice so an all-usage stream can fallback.
             if (!streamStarted && !hasSubstantiveOpenAIStreamDelta(chunk)) {
+              if (bufferedUsageChunks.length >= 64) throw new ProviderProtocolError('Upstream returned too much metadata without a completion.');
               bufferedUsageChunks.push(serialized);
               continue;
             }
             if (!streamStarted) {
+              // Once output begins, the fallback window has served its purpose.
+              // Provider idle timeouts and downstream cancellation remain active.
+              attemptDeadline.clearDeadline();
               res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
               res.setHeader('Cache-Control', 'no-cache, no-transform');
               res.setHeader('Connection', 'keep-alive');
@@ -1040,24 +978,24 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               for (const buffered of bufferedUsageChunks) {
                 await writeResponseChunk(res, buffered, downstream.signal);
               }
+              bufferedUsageChunks.length = 0;
             }
-            const outputCharacters = chunk.choices.reduce((sum, choice) => {
-              const text = choice.delta?.content ?? '';
+            outputCharacters += chunk.choices.reduce((sum, choice) => {
+              const text = `${choice.delta?.content ?? ''}${choice.delta?.refusal ?? ''}${choice.delta?.reasoning_content ?? ''}${choice.delta?.reasoning ?? ''}`;
               const toolDelta = choice.delta?.tool_calls?.map(call => (
                 `${call.id ?? ''}${call.function?.name ?? ''}${call.function?.arguments ?? ''}`
               )).join('') ?? '';
               return sum + text.length + toolDelta.length;
             }, 0);
-            estimatedOutputTokens += Math.ceil(outputCharacters / 4);
+            estimatedOutputTokens = Math.ceil(outputCharacters / 4);
             await writeResponseChunk(res, serialized, downstream.signal);
           }
 
           if (!streamStarted) {
             throw new ProviderProtocolError(`${route.displayName} returned an empty streaming response.`);
           }
-          const actualInputTokens = reportedPromptTokens > 0 ? reportedPromptTokens : estimatedInputTokens;
-          const actualOutputTokens = reportedCompletionTokens > 0 ? reportedCompletionTokens : estimatedOutputTokens;
-          const totalTokens = reportedTotalTokens > 0 ? reportedTotalTokens : actualInputTokens + actualOutputTokens;
+          const { prompt_tokens: actualInputTokens, completion_tokens: actualOutputTokens, total_tokens: totalTokens } =
+            resolveUsage(reportedUsage, estimatedInputTokens, estimatedOutputTokens);
           if (includeUsage) {
             const envelope = usageChunkEnvelope ?? {
               id: `chatcmpl-${crypto.randomUUID()}`,
@@ -1125,18 +1063,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, stream_options, oauth: route.oauth, signal: attemptDeadline.signal },
         );
 
-        const reportedPromptTokens = result.usage?.prompt_tokens ?? 0;
-        const reportedCompletionTokens = result.usage?.completion_tokens ?? 0;
         const estimatedOutputTokens = result.choices.reduce((sum, choice) => {
-          const content = contentToString(choice.message.content);
+          const content = contentToString(choice.message.content) + (choice.message.refusal ?? '');
           const toolArguments = choice.message.tool_calls?.map(call => call.function.arguments).join('') ?? '';
           return sum + Math.ceil((content.length + toolArguments.length) / 4);
         }, 0);
-        const actualInputTokens = reportedPromptTokens > 0 ? reportedPromptTokens : estimatedInputTokens;
-        const actualOutputTokens = reportedCompletionTokens > 0 ? reportedCompletionTokens : estimatedOutputTokens;
-        const totalTokens = (result.usage?.total_tokens ?? 0) > 0
-          ? result.usage.total_tokens
-          : actualInputTokens + actualOutputTokens;
+        const { prompt_tokens: actualInputTokens, completion_tokens: actualOutputTokens, total_tokens: totalTokens } =
+          resolveUsage(result.usage, estimatedInputTokens, estimatedOutputTokens);
         const localRouteModelId = toLocalModelId(route.platform, route.modelId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         releaseProviderCapacity(route.capacityReservationId);
@@ -1256,7 +1189,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       'error', estimatedInputTokens, 0, Date.now() - start,
       safeProviderFailureDescription(lastError), analyticsRequestId, attemptsPerformed + 1, true,
     );
-    sendFallbackExhausted(res, lastError, retryFailures, attemptsPerformed);
+    sendFallbackExhausted(res, retryFailures, attemptsPerformed);
   }
   else settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
 });

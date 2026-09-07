@@ -33,7 +33,8 @@ export interface ApiFetchOptions extends RequestInit {
 }
 
 function responseMessage(payload: ApiErrorPayload | undefined, fallback: string) {
-  return payload?.error?.message ?? payload?.message ?? fallback
+  return [payload?.error?.message, payload?.message, payload?.detail, payload?.title]
+    .find((value): value is string => typeof value === 'string' && value.trim().length > 0) ?? fallback
 }
 
 async function parseResponseBody(response: Response): Promise<unknown> {
@@ -41,7 +42,7 @@ async function parseResponseBody(response: Response): Promise<unknown> {
   if (!text) return undefined
 
   const contentType = response.headers.get('content-type') ?? ''
-  if (contentType.includes('application/json')) {
+  if (/\bapplication\/(?:[\w.-]+\+)?json\b/i.test(contentType)) {
     try {
       return JSON.parse(text) as unknown
     } catch {
@@ -49,7 +50,8 @@ async function parseResponseBody(response: Response): Promise<unknown> {
     }
   }
 
-  return text
+  if (response.ok) throw new ApiError('Expected JSON from the dashboard API. Check the server URL or reverse proxy configuration.', response.status)
+  return undefined
 }
 
 /** Fetch a dashboard API route with consistent JSON handling, cancellation, and errors. */

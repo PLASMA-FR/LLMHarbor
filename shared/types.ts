@@ -196,6 +196,9 @@ export interface ChatCompletionChunk {
       role?: 'assistant';
       content?: string;
       refusal?: string;
+      /** Provider extensions emitted by reasoning-capable compatible APIs. */
+      reasoning_content?: string;
+      reasoning?: string;
       tool_calls?: ChatToolCallDelta[];
     };
     finish_reason: string | null;

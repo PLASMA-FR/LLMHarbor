@@ -367,4 +367,53 @@ describe('FreeModelUpdater', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
   });
+
+  it('resumes a persisted deadline after restart and repairs stale running status', async () => {
+    insertApiKey('openrouter');
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-01T00:00:00Z'));
+    const probe = vi.fn().mockResolvedValue({ ok: true });
+    const updater = new FreeModelUpdater({
+      providers: [provider([{ id: 'resume/free:free', pricing: { prompt: '0', completion: '0' } }])],
+      keyResolver: () => 'test-key', probeModel: probe,
+    });
+    updater.setSelectedProviders(['openrouter']);
+    getDb().prepare("UPDATE free_model_updater_settings SET enabled = 1, status = 'running', next_run_at = '2026-06-01T00:05:00Z', refresh_interval_hours = 1 WHERE id = 1").run();
+    updater.start();
+    expect(updater.getStatus().status).toBe('idle');
+    await vi.advanceTimersByTimeAsync(5 * 60_000 - 1);
+    expect(probe).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(updater.getStatus().nextRunAt).toBe('2026-06-01T01:05:00.000Z');
+    await updater.stop();
+    vi.useRealTimers();
+  });
+
+  it('repairs an interrupted manual refresh even when scheduling is disabled', async () => {
+    getDb().prepare("UPDATE free_model_updater_settings SET enabled = 0, status = 'running' WHERE id = 1").run();
+    const updater = new FreeModelUpdater();
+    updater.start();
+    expect(updater.getStatus()).toMatchObject({ enabled: false, status: 'idle' });
+    await updater.stop();
+  });
+
+  it('keeps newly discovered models disabled until their first successful probe', async () => {
+    insertApiKey('openrouter');
+    let release!: (value: { ok: boolean }) => void;
+    let started!: () => void;
+    const probing = new Promise<void>(resolve => { started = resolve; });
+    const updater = new FreeModelUpdater({
+      providers: [provider([{ id: 'pending/free:free', pricing: { prompt: '0', completion: '0' } }])],
+      keyResolver: () => 'test-key',
+      probeModel: () => { started(); return new Promise(resolve => { release = resolve; }); },
+    });
+    updater.setSelectedProviders(['openrouter']);
+    const run = updater.refreshNow();
+    await probing;
+    expect(getDb().prepare("SELECT enabled FROM models WHERE model_id = 'pending/free:free'").get()).toEqual({ enabled: 0 });
+    release({ ok: true });
+    await run;
+    expect(getDb().prepare("SELECT enabled FROM models WHERE model_id = 'pending/free:free'").get()).toEqual({ enabled: 1 });
+  });
 });

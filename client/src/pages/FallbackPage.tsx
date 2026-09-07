@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, ArrowUp } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
+import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { formatCompactNumber, formatPercent } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -132,11 +133,11 @@ export default function FallbackPage() {
 
   const saveMutation = useMutation({
     mutationFn: (data: { modelDbId: number; priority: number; enabled: boolean }[]) => apiFetch('/api/fallback', { method: 'PUT', body: JSON.stringify(data) }),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['fallback'] }); setLocalEntries(null) },
+    onSuccess: () => { void invalidateRoutingQueries(queryClient); setLocalEntries(null) },
   })
   const sortMutation = useMutation({
     mutationFn: (preset: string) => apiFetch(`/api/fallback/sort/${preset}`, { method: 'POST' }),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['fallback'] }); setLocalEntries(null) },
+    onSuccess: () => { void invalidateRoutingQueries(queryClient); setLocalEntries(null) },
   })
 
   const allEntries = localEntries ?? entries

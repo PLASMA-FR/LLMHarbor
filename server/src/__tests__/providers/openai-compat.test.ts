@@ -274,7 +274,7 @@ describe('OpenAICompatProvider', () => {
     });
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({ ok: true, body: malformed } as any);
     await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
-      .rejects.toThrow(/only malformed frames/i);
+      .rejects.toMatchObject({ code: 'malformed_provider_response' });
   });
 
   it('forwards stream_options and accepts a valid usage-only trailer after a completion choice', async () => {
@@ -328,7 +328,7 @@ describe('OpenAICompatProvider', () => {
       },
     })));
     await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
-      .rejects.toThrow(/malformed frames/i);
+      .rejects.toMatchObject({ code: 'malformed_provider_response' });
   });
 
   it('preserves a terminal safety refusal without falling back as an empty stream', async () => {
@@ -358,11 +358,11 @@ describe('OpenAICompatProvider', () => {
     });
     vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(stream('{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0,"total_tokens":1}}')));
     await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
-      .rejects.toThrow(/usage without any completion choices/i);
+      .rejects.toMatchObject({ code: 'malformed_provider_response' });
 
     vi.spyOn(global, 'fetch').mockResolvedValueOnce(new Response(stream('{"choices":[]}')));
     await expect(collectStream(provider.streamChatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')))
-      .rejects.toThrow(/only malformed frames/i);
+      .rejects.toMatchObject({ code: 'malformed_provider_response' });
   });
 
   it('keeps the timeout active while a non-streaming response body is consumed', async () => {

@@ -274,7 +274,7 @@ export class FreeModelUpdater {
   private readonly keyResolver: KeyResolver;
   private readonly injectedProbeModel?: ProbeModel;
   private readonly failRefreshOnProviderError: boolean;
-  private intervalId: ReturnType<typeof setInterval> | null = null;
+  private intervalId: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private idleWaiters: Array<() => void> = [];
   private runController: AbortController | null = null;
@@ -389,18 +389,28 @@ export class FreeModelUpdater {
 
   start(): void {
     const generation = ++this.schedulerGeneration;
-    if (this.intervalId) clearInterval(this.intervalId);
+    if (this.intervalId) clearTimeout(this.intervalId);
     this.intervalId = null;
     this.runController?.abort(new Error('Free-model updater configuration changed.'));
     const schedule = async () => {
       if (this.running) await new Promise<void>(resolve => this.idleWaiters.push(resolve));
       if (generation !== this.schedulerGeneration) return;
       const status = this.getStatus();
+      if (status.status === 'running' && !this.running) {
+        getDb().prepare("UPDATE free_model_updater_settings SET status = 'idle' WHERE id = 1").run();
+      }
       if (!status.enabled) return;
-      this.intervalId = setInterval(() => {
-        if (!this.getStatus().enabled) return;
-        this.refreshNow().catch(error => console.error('[FreeModelUpdater] refresh failed:', shortError(error)));
-      }, status.refreshIntervalHours * 60 * 60 * 1000);
+      const nextRun = status.nextRunAt ? Date.parse(status.nextRunAt) : NaN;
+      const delay = Number.isFinite(nextRun)
+        ? Math.max(1, nextRun - this.now().getTime())
+        : status.refreshIntervalHours * 60 * 60 * 1000;
+      this.intervalId = setTimeout(async () => {
+        this.intervalId = null;
+        if (generation !== this.schedulerGeneration) return;
+        try { await this.refreshNow(); }
+        catch (error) { console.error('[FreeModelUpdater] refresh failed:', shortError(error)); }
+        finally { if (generation === this.schedulerGeneration) void schedule(); }
+      }, delay);
       this.intervalId.unref?.();
     };
     void schedule();
@@ -409,7 +419,7 @@ export class FreeModelUpdater {
   async stop(): Promise<void> {
     this.schedulerGeneration++;
     if (this.intervalId) {
-      clearInterval(this.intervalId);
+      clearTimeout(this.intervalId);
       this.intervalId = null;
     }
     this.runController?.abort(new Error('Free-model updater stopped.'));
@@ -515,7 +525,7 @@ export class FreeModelUpdater {
     } else {
       const result = db.prepare(`
         INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled)
-        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 0)
       `).run(
         model.platform,
         model.modelId,
@@ -660,6 +670,7 @@ export class FreeModelUpdater {
       return { success: false, skipped: true, detectedCount: this.getStatus().detectedCount };
     }
 
+    const generation = this.schedulerGeneration;
     this.running = true;
     const runController = new AbortController();
     this.runController = runController;
@@ -714,18 +725,22 @@ export class FreeModelUpdater {
         `).run();
         return { success: false, skipped: true, detectedCount: this.getStatus().detectedCount };
       }
+      const retryAt = new Date(this.now().getTime() + this.getStatus().refreshIntervalHours * 60 * 60 * 1000).toISOString();
       getDb().prepare(`
         UPDATE free_model_updater_settings
            SET status = 'error',
                error_message = ?,
+               next_run_at = CASE WHEN enabled = 1 THEN ? ELSE NULL END,
                updated_at = datetime('now')
          WHERE id = 1
-      `).run(shortError(error));
+      `).run(shortError(error), retryAt);
       throw error;
     } finally {
       if (this.runController === runController) this.runController = null;
       this.running = false;
       for (const resolve of this.idleWaiters.splice(0)) resolve();
+      // Manual refreshes reset the timer too. A concurrent stop owns scheduling.
+      if (generation === this.schedulerGeneration && this.getStatus().enabled) this.start();
     }
   }
 }
