@@ -21,6 +21,7 @@ const upstream = createServer(async (req, res) => {
   const lastPrompt = request.messages.findLast((message: { role: string }) => message.role === 'user')?.content;
   const slow = lastPrompt === 'slow';
   const refusal = lastPrompt === 'refuse';
+  const markdown = lastPrompt === 'markdown';
   if (typeof lastPrompt === 'string' && lastPrompt.startsWith('retry-once') && !failedPrompts.has(lastPrompt)) {
     failedPrompts.add(lastPrompt);
     res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -36,7 +37,7 @@ const upstream = createServer(async (req, res) => {
   }
   res.setHeader('Content-Type', 'text/event-stream');
   const send = (delta: Record<string, unknown>, finish_reason: string | null = null) => res.write(`data: ${JSON.stringify({ ...envelope, object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
-  send(refusal ? { refusal: 'This is a simulated refusal.' } : { content: slow ? 'Working…' : 'Streaming reply ⚓.' });
+  send(refusal ? { refusal: 'This is a simulated refusal.' } : { content: slow ? 'Working…' : markdown ? '**Formatted reply**\n\n```js\nconst total = 1;\n```\n\n![Diagram](/fixture-image)' : 'Streaming reply ⚓.' });
   const finish = () => {
     send({}, refusal ? 'content_filter' : 'stop');
     res.write(`data: ${JSON.stringify({ ...envelope, object: 'chat.completion.chunk', choices: [], usage })}\n\n`);

@@ -53,7 +53,7 @@ export function InlineNotice({
     info: 'border-primary/25 bg-primary/8 text-foreground',
   }
   return (
-    <div className={cn('rounded-[var(--radius-panel)] border px-3 py-2.5 text-sm leading-5', classes[tone], className)} role={tone === 'critical' ? 'alert' : 'status'}>
+    <div className={cn('rounded-[var(--radius-panel)] border px-3 py-2.5 text-sm leading-5', classes[tone], className)} role={tone === 'critical' ? 'alert' : tone === 'positive' ? 'status' : undefined}>
       {children}
     </div>
   )

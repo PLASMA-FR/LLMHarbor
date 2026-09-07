@@ -183,17 +183,17 @@ function resolveDiscoveryProvider(platform: Platform): DiscoveryProvider | null 
 
 function defaultKeyResolver(platform: Platform): string | null {
   const row = getDb().prepare(`
-    SELECT encrypted_key, iv, auth_tag
+    SELECT encrypted_key, iv, auth_tag, source
       FROM api_keys
      WHERE platform = ?
        AND enabled = 1
        AND (status IN ('healthy', 'unknown') OR (source = 'oauth' AND status NOT IN ('invalid', 'error')))
      ORDER BY CASE status WHEN 'healthy' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, id DESC
      LIMIT 1
-  `).get(platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+  `).get(platform) as { encrypted_key: string; iv: string; auth_tag: string; source: string } | undefined;
   if (!row) return null;
   try {
-    return decrypt(row.encrypted_key, row.iv, row.auth_tag);
+    return row.source === 'anonymous' ? '' : decrypt(row.encrypted_key, row.iv, row.auth_tag);
   } catch {
     return null;
   }
@@ -428,6 +428,17 @@ export class FreeModelUpdater {
     }
   }
 
+  async cancelRefresh(): Promise<FreeModelUpdaterStatus> {
+    await this.stop();
+    const status = this.getStatus();
+    if (status.enabled) {
+      const next = new Date(this.now().getTime() + status.refreshIntervalHours * 60 * 60 * 1000).toISOString();
+      getDb().prepare('UPDATE free_model_updater_settings SET next_run_at = ? WHERE id = 1').run(next);
+      this.start();
+    }
+    return this.getStatus();
+  }
+
   private async discoverFreeModels(signal?: AbortSignal): Promise<DiscoveryRun> {
     const selected = selectedVisiblePlatforms();
     const providers = this.providers
@@ -597,7 +608,7 @@ export class FreeModelUpdater {
          WHERE model_id = ?
       `).run(now, modelDbId);
       if (current?.created_by_updater === 1) {
-        db.prepare('UPDATE models SET enabled = 1 WHERE id = ?').run(modelDbId);
+        db.prepare('UPDATE models SET enabled = 1 WHERE id = ? AND operator_disabled = 0').run(modelDbId);
       }
       return;
     }

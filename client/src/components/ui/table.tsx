@@ -8,7 +8,10 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
     <div
       data-slot="table-container"
-      className="relative w-full overflow-x-auto overscroll-x-contain"
+      tabIndex={0}
+      role="group"
+      aria-label={props['aria-label'] ?? 'Scrollable data table'}
+      className="relative w-full overflow-x-auto overscroll-x-contain outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
     >
       <table
         data-slot="table"

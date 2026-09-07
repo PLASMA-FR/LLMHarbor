@@ -1,9 +1,21 @@
+import { sendValidationError } from '../lib/validation.js';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { freeModelUpdater } from '../services/freeModelUpdater.js';
+import { safeUpstreamFailure } from '../lib/errors.js';
 
 export const freeModelUpdaterRouter = Router();
+
+freeModelUpdaterRouter.post('/refresh', (_req, res) => {
+  if (!freeModelUpdater.getStatus().selectedProviderCount) {
+    res.status(400).json({ error: { message: 'Select at least one provider before refreshing models.', code: 'discovery_provider_required', param: 'selectedProviders' } });
+    return;
+  }
+  void freeModelUpdater.refreshNow().catch(error => console.error('[Discovery]', safeUpstreamFailure(error)));
+  res.status(202).json({ status: 'running', statusUrl: '/api/discovery/status' });
+});
+freeModelUpdaterRouter.post('/cancel', async (_req, res) => { res.json(await freeModelUpdater.cancelRefresh()); });
 
 const providerSelectionSchema = z.object({
   selectedProviders: z.array(z.string().min(1).max(120)).max(50),
@@ -25,7 +37,7 @@ freeModelUpdaterRouter.get('/providers', (_req: Request, res: Response) => {
 freeModelUpdaterRouter.put('/providers', (req: Request, res: Response) => {
   const parsed = providerSelectionSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   if (freeModelUpdater.getStatus().enabled && parsed.data.selectedProviders.length === 0) {
@@ -49,7 +61,7 @@ freeModelUpdaterRouter.put('/providers', (req: Request, res: Response) => {
 freeModelUpdaterRouter.post('/enable', (req: Request, res: Response) => {
   const parsed = intervalSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   if (parsed.data.selectedProviders) {

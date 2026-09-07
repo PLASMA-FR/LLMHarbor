@@ -311,7 +311,7 @@ export function routeRequest(
 
       let decryptedKey: string;
       try {
-        decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+        decryptedKey = key.source === 'anonymous' ? '' : decrypt(key.encrypted_key, key.iv, key.auth_tag);
       } catch {
         sawCredentialFailure = true;
         db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")

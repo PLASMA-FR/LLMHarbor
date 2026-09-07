@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { EmptyState, ErrorState, LoadingState, PageHeader, SectionTitle } from '@/components/page-header'
 import { MetricCard } from '@/components/metric-card'
+import { SetupChecklist } from '@/components/setup-checklist'
 import { StatusIndicator, type StatusTone } from '@/components/status-indicator'
 import { apiFetch } from '@/lib/api'
 import { formatCompactNumber, formatDuration, formatPercent, formatRelativeTime } from '@/lib/format'
@@ -154,15 +155,11 @@ export default function OverviewPage() {
   const readyRoutes = configuredRoutes.filter(route => route.eligible && route.penalty === 0)
   const degradedRoutes = configuredRoutes.filter(route => route.eligible && route.penalty > 0)
   const providerCount = health.data?.platforms.filter(platform => platform.totalKeys > 0).length ?? 0
-  const credentialIssues = health.data?.platforms.reduce(
-    (total, platform) => total + platform.errorKeys + platform.invalidKeys + platform.rateLimitedKeys,
-    0,
-  ) ?? 0
+  const credentialIssues = health.data?.keys.filter(key => key.enabled && ['error', 'invalid', 'rate_limited'].includes(key.status)).length ?? 0
   const quotaLimitedRoutes = configuredRoutes.filter(route => !route.eligible && /quota limit/i.test(route.skipReason ?? '')).length
   const tokenUsage = (summary.data?.totalInputTokens ?? 0) + (summary.data?.totalOutputTokens ?? 0)
   const isInitialLoading = health.isLoading || routes.isLoading || summary.isLoading
   const coreUnavailable = health.isError && routes.isError && summary.isError
-  const hasConfiguration = providerCount > 0 || configuredRoutes.length > 0
   const completedRequests = (summary.data?.successfulRequests ?? 0) + (summary.data?.failedRequests ?? 0)
 
   return (
@@ -182,16 +179,11 @@ export default function OverviewPage() {
         }
       />
 
+      <SetupChecklist />
       {coreUnavailable ? (
         <ErrorState title="Dashboard data is unavailable" description="LLMHarbor did not respond to the health, routing, or analytics checks." action={<Button variant="outline" size="sm" onClick={() => void retryAll()}>Retry</Button>} />
       ) : isInitialLoading ? (
         <LoadingState title="Checking LLMHarbor" description="Loading health, routes, and recent traffic…" />
-      ) : !hasConfiguration ? (
-        <EmptyState
-          title="Configure your first provider"
-          description="Add provider credentials, register a model, and then return here to monitor the route."
-          action={<Button onClick={() => navigate('/keys')}>Add provider credentials</Button>}
-        />
       ) : (
         <div className="space-y-6">
           <section aria-labelledby="overview-health-heading">
@@ -227,7 +219,7 @@ export default function OverviewPage() {
                   <h2 id="recent-requests-heading" className="text-sm font-semibold">Recent requests</h2>
                   <p className="mt-0.5 text-xs text-muted-foreground">Most recent routed traffic in the last 24 hours.</p>
                 </div>
-                <Button variant="ghost" size="xs" onClick={() => navigate('/analytics')}>View analytics <ArrowRight aria-hidden="true" /></Button>
+                <Button variant="ghost" size="xs" onClick={() => navigate('/analytics?view=requests')}>View analytics <ArrowRight aria-hidden="true" /></Button>
               </div>
               {recent.isLoading ? (
                 <div className="p-4"><LoadingState title="Loading recent traffic" /></div>
@@ -265,15 +257,21 @@ export default function OverviewPage() {
             </section>
 
             <section className="panel-card min-w-0 rounded-[var(--radius-panel)] p-4" aria-labelledby="provider-health-heading">
-              <SectionTitle id="provider-health-heading" title="Provider health" description="Enabled credentials by upstream." action={<Button variant="ghost" size="xs" onClick={() => navigate('/keys')}>Manage</Button>} />
+              <SectionTitle id="provider-health-heading" title="Provider health" description="Enabled credentials by upstream." action={<Button variant="ghost" size="xs" onClick={() => navigate('/providers')}>Manage</Button>} />
               <div className="space-y-1">
                 {(health.data?.platforms ?? []).filter(platform => platform.totalKeys > 0).slice(0, 8).map(platform => {
-                  const status = providerStatus(platform)
+                  const activeKeys = health.data?.keys.filter(key => key.platform === platform.platform && key.enabled) ?? []
+                  const healthyKeys = activeKeys.filter(key => key.status === 'healthy').length
+                  const status = providerStatus({ ...platform, healthyKeys,
+                    invalidKeys: activeKeys.filter(key => key.status === 'invalid').length,
+                    errorKeys: activeKeys.filter(key => key.status === 'error').length,
+                    rateLimitedKeys: activeKeys.filter(key => key.status === 'rate_limited').length,
+                  })
                   return (
                     <div key={platform.platform} className="flex items-center justify-between gap-4 rounded-[var(--radius-button)] px-2 py-2 hover:bg-muted/40">
                       <div className="min-w-0">
                         <p className="truncate text-sm font-medium">{platform.platform}</p>
-                        <p className="text-xs text-muted-foreground">{platform.healthyKeys}/{platform.totalKeys} healthy · {platform.enabledKeys} enabled</p>
+                        <p className="text-xs text-muted-foreground">{healthyKeys}/{platform.enabledKeys} enabled credentials healthy</p>
                       </div>
                       <StatusIndicator label={status.label} tone={status.tone} />
                     </div>

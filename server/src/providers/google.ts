@@ -369,7 +369,7 @@ function toGeminiToolConfig(toolChoice?: ChatToolChoice): { functionCallingConfi
 // system/user/tool messages all surface as `parts: [{ text }]` for Gemini.
 function toGeminiContents(messages: ChatMessage[]) {
   const systemMessages = messages
-    .filter(m => m.role === 'system')
+    .filter(m => (m.role === 'system' || m.role === 'developer'))
     .map(m => contentToString(m.content))
     .filter(s => s.length > 0);
 
@@ -381,7 +381,7 @@ function toGeminiContents(messages: ChatMessage[]) {
   }
 
   const contents = messages
-    .filter(m => m.role !== 'system')
+    .filter(m => (m.role !== 'system' && m.role !== 'developer'))
     .map((m): { role: 'user' | 'model'; parts: GeminiPart[] } | null => {
       if (m.role === 'assistant') {
         const parts: GeminiPart[] = [];

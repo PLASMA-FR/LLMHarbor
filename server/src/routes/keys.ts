@@ -1,3 +1,6 @@
+import { sendValidationError } from '../lib/validation.js';
+import { collectionResponse } from '../lib/pagination.js';
+import { resetKeyHealthFailures } from '../services/health.js';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
@@ -14,13 +17,13 @@ const MAX_BULK_IMPORT_KEYS = 5_000;
 // Built-in and custom endpoint ids are accepted here. Custom endpoints are
 // validated against custom_endpoints through hasProvider().
 
-const addKeySchema = z.object({
+export const addKeySchema = z.object({
   platform: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/, 'Use a lowercase platform id like custom-local-vllm'),
   key: z.string().trim().min(1).max(MAX_PROVIDER_SECRET_LENGTH),
   label: z.string().trim().max(80).optional(),
 });
 
-const importKeysSchema = z.object({
+export const importKeysSchema = z.object({
   // `platform` is the stable identifier. `providerId` remains accepted for
   // older dashboard/CLI clients, but ordinal ids must not be used by new
   // callers because adding an endpoint can renumber the provider list.
@@ -61,7 +64,7 @@ function parseImportLines(contents: string): { uniqueKeys: string[]; attempted: 
   const uniqueKeys: string[] = [];
   let attempted = 0;
   let duplicateCount = 0;
-  for (const rawLine of contents.split(/\r?\n/)) {
+  for (const rawLine of contents.split(/\r\n|\r|\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
     attempted += 1;
@@ -75,23 +78,11 @@ function parseImportLines(contents: string): { uniqueKeys: string[]; attempted: 
   return { uniqueKeys, attempted, duplicateCount };
 }
 
-// List all keys (masked)
-keysRouter.get('/', (_req: Request, res: Response) => {
-  const db = getDb();
-  const rows = db.prepare(`
-    SELECT ak.*,
-           (SELECT MAX(r.created_at)
-              FROM requests r
-             WHERE r.key_id = ak.id AND r.status = 'success' AND r.is_final = 1) AS last_success_at
-      FROM api_keys ak
-     ORDER BY ak.created_at DESC, ak.id DESC
-  `).all() as any[];
-
-  const keys = rows.map(row => {
+function serializeKey(row: any) {
     let maskedKey = '****';
     try {
       const realKey = decrypt(row.encrypted_key, row.iv, row.auth_tag);
-      maskedKey = maskKey(realKey);
+      maskedKey = row.source === 'anonymous' ? 'No API key required' : maskKey(realKey);
     } catch {
       maskedKey = '[decrypt failed]';
     }
@@ -108,9 +99,22 @@ keysRouter.get('/', (_req: Request, res: Response) => {
       lastCheckedAt: toUtcTimestamp(row.last_checked_at),
       lastSuccessAt: toUtcTimestamp(row.last_success_at),
     };
-  });
+}
 
-  res.json(keys);
+// List all keys (masked)
+keysRouter.get('/', (req: Request, res: Response) => {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT ak.*,
+           (SELECT MAX(r.created_at)
+              FROM requests r
+             WHERE r.key_id = ak.id AND r.status = 'success' AND r.is_final = 1) AS last_success_at
+      FROM api_keys ak
+     ORDER BY ak.created_at DESC, ak.id DESC
+  `).all() as any[];
+
+  const keys = rows.map(serializeKey);
+  collectionResponse(req, res, keys);
 });
 
 keysRouter.get('/providers', (_req: Request, res: Response) => {
@@ -120,7 +124,7 @@ keysRouter.get('/providers', (_req: Request, res: Response) => {
 keysRouter.post('/import', (req: Request, res: Response) => {
   const parsed = importKeysSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -218,7 +222,7 @@ keysRouter.post('/import', (req: Request, res: Response) => {
 keysRouter.post('/', (req: Request, res: Response) => {
   const parsed = addKeySchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -254,6 +258,14 @@ keysRouter.post('/', (req: Request, res: Response) => {
     status: 'unknown',
     enabled: true,
   });
+});
+
+keysRouter.get('/:id', (req, res) => {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) { res.status(400).json({ error: { message: 'Provide a positive credential ID.', param: 'id' } }); return; }
+  const row = getDb().prepare('SELECT * FROM api_keys WHERE id = ?').get(id);
+  if (!row) { res.status(404).json({ error: { message: 'Provider key not found.' } }); return; }
+  res.json(serializeKey(row));
 });
 
 // Delete a key
@@ -311,35 +323,34 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   res.json({ success: true, enabled, updatedKeys });
 });
 
-// Toggle enable/disable
+export const updateProviderKeySchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().trim().max(80).optional(),
+  key: z.string().trim().min(1).max(MAX_PROVIDER_SECRET_LENGTH).optional(),
+}).strict().refine(body => Object.keys(body).length > 0, { message: 'Provide label, enabled, or key.' });
+
 keysRouter.patch('/:id', (req: Request, res: Response) => {
   const id = parsePositiveResourceId(req.params.id);
-  if (id === null) {
-    res.status(400).json({ error: { message: 'Invalid key ID' } });
-    return;
-  }
-
-  const { enabled } = req.body;
-  if (typeof enabled !== 'boolean') {
-    res.status(400).json({ error: { message: 'enabled must be a boolean' } });
-    return;
-  }
-
+  if (id === null) { res.status(400).json({ error: { message: 'Invalid key ID', param: 'id' } }); return; }
+  const parsed = updateProviderKeySchema.safeParse(req.body);
+  if (!parsed.success) { sendValidationError(res, parsed.error); return; }
   const db = getDb();
-  const updated = db.transaction(() => {
-    const row = db.prepare('SELECT oauth_account_id FROM api_keys WHERE id = ?').get(id) as { oauth_account_id: number | null } | undefined;
-    if (!row) return false;
-    db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
-    if (row.oauth_account_id) {
-      db.prepare('UPDATE oauth_accounts SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, row.oauth_account_id);
-    }
-    return true;
-  })();
-
-  if (!updated) {
-    res.status(404).json({ error: { message: 'Key not found' } });
-    return;
+  const row = db.prepare('SELECT oauth_account_id, enabled FROM api_keys WHERE id = ?').get(id) as { oauth_account_id: number | null; enabled: number } | undefined;
+  if (!row) { res.status(404).json({ error: { message: 'Key not found' } }); return; }
+  if (row.oauth_account_id && (parsed.data.key !== undefined || parsed.data.label !== undefined)) {
+    res.status(409).json({ error: { message: 'Manage this credential through its connected OAuth account.', code: 'managed_oauth_credential' } }); return;
   }
-
-  res.json({ success: true, enabled });
+  db.transaction(() => {
+    if (parsed.data.label !== undefined) db.prepare('UPDATE api_keys SET label = ? WHERE id = ?').run(parsed.data.label, id);
+    if (parsed.data.key !== undefined) {
+      const key = encrypt(parsed.data.key);
+      db.prepare("UPDATE api_keys SET encrypted_key = ?, iv = ?, auth_tag = ?, source = 'manual', status = 'unknown', last_checked_at = NULL WHERE id = ?").run(key.encrypted, key.iv, key.authTag, id);
+    }
+    if (parsed.data.enabled !== undefined) {
+      db.prepare('UPDATE api_keys SET enabled = ? WHERE id = ?').run(Number(parsed.data.enabled), id);
+      if (row.oauth_account_id) db.prepare('UPDATE oauth_accounts SET enabled = ? WHERE id = ?').run(Number(parsed.data.enabled), row.oauth_account_id);
+    }
+  })();
+  if (parsed.data.key !== undefined) resetKeyHealthFailures(id);
+  res.json({ success: true, enabled: parsed.data.enabled ?? row.enabled === 1 });
 });

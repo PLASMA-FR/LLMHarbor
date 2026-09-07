@@ -56,7 +56,7 @@ export interface ApiKey {
   maskedKey: string;
   status: KeyStatus;
   enabled: boolean;
-  source?: 'manual' | 'oauth';
+  source?: 'manual' | 'oauth' | 'anonymous';
   oauthAccountId?: number | null;
   createdAt: string;
   lastCheckedAt: string | null;
@@ -136,7 +136,7 @@ export type ChatContentBlock = { type: string; text?: string; [key: string]: unk
 export type ChatContent = string | null | ChatContentBlock[];
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant' | 'tool';
+  role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   content: ChatContent;
   name?: string;
   tool_call_id?: string;
@@ -150,6 +150,7 @@ export interface ChatCompletionRequest {
   messages: ChatMessage[];
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   stream?: boolean;
   top_p?: number;
   tools?: ChatToolDefinition[];

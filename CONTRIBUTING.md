@@ -22,7 +22,7 @@ bash -n bin/llmharbor install.sh install-macos.sh
 
 Run `npm run build` before `test:e2e` whenever dashboard code changes. On Linux, `npx playwright install --with-deps chromium` also installs browser OS dependencies. CI runs browser checks on Node 24 and the server tests/builds on both supported Node lines.
 
-Browser tests start their own listener on `127.0.0.1:4179`, use SQLite in memory and a simulated loopback provider, and do not read the production database or call real model providers. The port must be available. Failure traces are written to `client/test-results/`; inspect one with `npx playwright show-trace <trace.zip>`.
+Browser tests start their own listener on `127.0.0.1:4179`, use SQLite in memory and a simulated loopback provider, and do not read the production database or call real model providers. The port must be available. The suite also checks WCAG-tagged axe rules, focus restoration, mobile navigation and offline failures. Failure traces are written to `client/test-results/`; inspect one with `npx playwright show-trace <trace.zip>`.
 
 For focused checks:
 
@@ -35,6 +35,8 @@ npm run test:e2e -w client -- --grep Playground
 ## Working on the server
 
 - Keep client authorization and quota checks before upstream work. Use `services/credentials.ts` for credential eligibility and OAuth preparation.
+- Keep request schemas authoritative. The OpenAPI document uses runtime Zod schemas; verify schema validity and SDK behavior in `api-experience.test.ts` when changing the API. Preserve old resource aliases.
+- Use `sendValidationError` for field diagnostics. `apiContract` supplies common JSON error metadata; do not return submitted secrets in errors.
 - Use `providers/openai-stream.ts` for OpenAI-compatible SSE. It normalizes envelopes, preserves tool/refusal/reasoning deltas, bounds preambles and validates completion termination. `lib/sse.ts` handles framing and reader cleanup.
 - Keep retries before substantive output. Once streaming starts, retain downstream cancellation and provider body-idle timeouts; do not replay a partial completion.
 - Provider error responses and analytics must not contain raw upstream bodies or secrets. Use the existing safe error helpers.
@@ -45,6 +47,7 @@ npm run test:e2e -w client -- --grep Playground
 
 - Use `apiFetch` for JSON APIs and pass React Query's cancellation signal. Use `invalidateRoutingQueries` after configuration changes that affect several views.
 - Keep loading, empty and error states distinct. Label controls, preserve keyboard operation and check narrow layouts.
+- Reuse the modal, confirmation, notification, collection and code-view components. See [UX and API conventions](docs/ux-and-api.md) before adding another page or workflow.
 - Playground state lives in memory above the page routes. It survives navigation but is intentionally cleared on reload; do not persist conversation text or credentials to browser storage by default.
 - Add browser coverage for changes to complete user workflows. Unit tests should cover parsing and state invariants, not duplicate component markup.
 

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { invalidateRoutingQueries } from '@/lib/query-cache'
 import { copyText } from '@/lib/clipboard'
+import { useConfirm, notify } from '@/lib/feedback'
 import { formatDateTime, formatRelativeTime } from '@/lib/format'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -218,8 +219,9 @@ function LimitBars({ limits }: { limits?: AccountLimit[] }) {
 }
 
 export default function OAuthPage() {
+  const confirm = useConfirm()
   const queryClient = useQueryClient()
-  const [selectedAccount, setSelectedAccount] = useState<number | null>(null)
+  const [selectedAccount, setSelectedAccount] = useState<number | null>(() => { const id = Number(new URLSearchParams(window.location.search).get('account')); return Number.isSafeInteger(id) && id > 0 ? id : null })
   const [renaming, setRenaming] = useState<Record<number, string>>({})
   const [activeConnection, setActiveConnection] = useState<ActiveConnection | null>(null)
   const [deviceCodeCopied, setDeviceCodeCopied] = useState(false)
@@ -337,6 +339,7 @@ export default function OAuthPage() {
     }),
     onSuccess: (_, variables) => {
       invalidateOAuthRoutingState()
+      notify('OAuth account updated.')
       if (variables.body.label !== undefined) {
         setRenaming(current => {
           const next = { ...current }
@@ -351,6 +354,7 @@ export default function OAuthPage() {
     mutationFn: (id: number) => apiFetch(`/api/oauth/accounts/${id}`, { method: 'DELETE' }),
     onSuccess: (_, deletedId) => {
       invalidateOAuthRoutingState()
+      notify('OAuth account disconnected.')
       setSelectedAccount(current => current === deletedId ? null : current)
     },
   })
@@ -658,8 +662,8 @@ export default function OAuthPage() {
                     setSelectedAccount(selectedAccountRecord.id)
                     updateAccount.mutate({ id: selectedAccountRecord.id, body: { enabled: !selectedAccountRecord.enabled } })
                   }}>{selectedAccountRecord.enabled ? 'Disable routing' : 'Enable routing'}</Button>
-                  <Button variant="destructive" size="sm" disabled={deleteAccount.isPending} onClick={() => {
-                    const confirmed = window.confirm(`Disconnect OAuth account "${selectedAccountRecord.label}"? This removes its stored tokens and OAuth-backed routing capacity.`)
+                  <Button variant="destructive" size="sm" disabled={deleteAccount.isPending} onClick={async () => {
+                    const confirmed = await confirm({ title: `Disconnect ${selectedAccountRecord.label}?`, description: 'This removes its stored tokens and OAuth-backed routing capacity. Other connected accounts remain available.', confirmLabel: 'Disconnect account' })
                     if (confirmed) deleteAccount.mutate(selectedAccountRecord.id)
                   }}>Disconnect account</Button>
                 </div>

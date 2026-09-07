@@ -159,9 +159,10 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages,
+        messages: this.platform === 'openai' ? messages : messages.map(message => message.role === 'developer' ? { ...message, role: 'system' } : message),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: this.platform === 'openai' && options?.max_completion_tokens !== undefined ? undefined : options?.max_tokens,
+        max_completion_tokens: this.platform === 'openai' ? options?.max_completion_tokens : undefined,
         top_p: options?.top_p,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
@@ -205,9 +206,10 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify({
         model: modelId,
-        messages,
+        messages: this.platform === 'openai' ? messages : messages.map(message => message.role === 'developer' ? { ...message, role: 'system' } : message),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: this.platform === 'openai' && options?.max_completion_tokens !== undefined ? undefined : options?.max_tokens,
+        max_completion_tokens: this.platform === 'openai' ? options?.max_completion_tokens : undefined,
         top_p: options?.top_p,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
@@ -272,14 +274,14 @@ export class OpenAICompatProvider extends BaseProvider {
 
   private responsesBody(messages: ChatMessage[], modelId: string, options?: CompletionOptions, stream = false): Record<string, unknown> {
     const systemInstructions = messages
-      .filter(message => message.role === 'system')
+      .filter(message => (message.role === 'system' || message.role === 'developer'))
       .map(normalizeMessageText)
       .filter(Boolean)
       .join('\n\n');
     return {
       model: modelId,
       instructions: systemInstructions || 'You are Codex, a precise coding and reasoning assistant. Answer the user directly and concisely unless more detail is needed.',
-      input: messages.filter(message => message.role !== 'system').map(message => ({
+      input: messages.filter(message => (message.role !== 'system' && message.role !== 'developer')).map(message => ({
         role: message.role === 'assistant' ? 'assistant' : 'user',
         content: [{
           type: message.role === 'assistant' ? 'output_text' : 'input_text',

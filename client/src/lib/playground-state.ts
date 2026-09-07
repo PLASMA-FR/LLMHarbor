@@ -32,6 +32,7 @@ export function createPlaygroundDraft() {
     selectedClientKeyId: null as number | null, streaming: true,
     temperature: '', maxTokens: '', systemPrompt: '', toolsJson: '',
     toolChoice: 'auto' as 'auto' | 'none' | 'required', toolResults: {} as Record<string, string>,
+    markdown: true,
   }
 }
 

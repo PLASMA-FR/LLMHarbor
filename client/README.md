@@ -18,3 +18,5 @@ The development server proxies `/api` and `/v1` to the dashboard listener config
 Keep control-plane requests in `src/lib/api.ts`, reuse the focused UI primitives under `src/components/ui`, and preserve keyboard navigation, explicit labels, loading/error/empty states, and narrow-window table scrolling when changing pages.
 
 Use `invalidateRoutingQueries` after mutations that affect route availability. Playground drafts are kept in the application context so navigation does not discard a conversation; reload intentionally clears this memory. Browser tests require a current production build and start an in-memory server with a simulated local provider on port 4179. See [the contributing guide](../CONTRIBUTING.md).
+
+The shell uses a data router for unsaved-change protection, a page finder, and a mobile drawer. Client access is separate from provider configuration. Use the shared collection controls, modal/confirmation primitives, ErrorNotice and CodeBlock components; the full interaction and API conventions are in [the UX guide](../docs/ux-and-api.md).

@@ -416,4 +416,33 @@ describe('FreeModelUpdater', () => {
     await run;
     expect(getDb().prepare("SELECT enabled FROM models WHERE model_id = 'pending/free:free'").get()).toEqual({ enabled: 1 });
   });
+
+  it('preserves an explicit catalog pause after successful rediscovery', async () => {
+    insertApiKey('openrouter');
+    const updater = new FreeModelUpdater({ providers: [provider([{ id: 'operator/free:free', pricing: { prompt: '0', completion: '0' } }])], keyResolver: () => 'test-key', probeModel: async () => ({ ok: true }) });
+    updater.setSelectedProviders(['openrouter']);
+    await updater.refreshNow();
+    getDb().prepare("UPDATE models SET enabled = 0, operator_disabled = 1 WHERE model_id = 'operator/free:free'").run();
+    await updater.refreshNow();
+    expect(getDb().prepare("SELECT enabled FROM models WHERE model_id = 'operator/free:free'").get()).toEqual({ enabled: 0 });
+  });
+
+  it('cancels active discovery while retaining the next scheduled run', async () => {
+    insertApiKey('openrouter');
+    let started!: () => void;
+    const probing = new Promise<void>(resolve => { started = resolve; });
+    const updater = new FreeModelUpdater({
+      providers: [provider([{ id: 'cancel/free:free', pricing: { prompt: '0', completion: '0' } }])], keyResolver: () => 'test-key',
+      probeModel: (_model, signal) => new Promise(resolve => { started(); signal!.addEventListener('abort', () => resolve({ ok: false }), { once: true }); }),
+    });
+    updater.setSelectedProviders(['openrouter']);
+    updater.enable(1);
+    const run = updater.refreshNow();
+    await probing;
+    const status = await updater.cancelRefresh();
+    await expect(run).resolves.toMatchObject({ skipped: true });
+    expect(status).toMatchObject({ enabled: true, status: 'idle' });
+    expect(Date.parse(status.nextRunAt!)).toBeGreaterThan(Date.now());
+    await updater.stop();
+  });
 });

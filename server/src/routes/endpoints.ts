@@ -1,3 +1,4 @@
+import { sendValidationError } from '../lib/validation.js';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
@@ -8,6 +9,7 @@ import { safeUpstreamFailure } from '../lib/errors.js';
 import { parsePositiveResourceId } from '../lib/resourceId.js';
 import { toUtcTimestamp } from '../lib/time.js';
 import { normalizeCustomEndpointUrl } from '../lib/urlSecurity.js';
+import { encrypt } from '../lib/crypto.js';
 
 export const endpointsRouter = Router();
 
@@ -21,21 +23,23 @@ const endpointUrlSchema = z.string().trim().min(1).max(500).superRefine((value, 
   }
 });
 
-const endpointSchema = z.object({
+export const endpointSchema = z.object({
   name: z.string().trim().min(1).max(80),
   baseUrl: endpointUrlSchema,
   validateUrl: endpointUrlSchema.optional().nullable(),
   timeoutMs: z.number().int().min(1000).max(600000).optional(),
+  apiKey: z.string().trim().max(16_384).optional().describe('Optional initial credential. An explicit empty string enables an anonymous local endpoint.'),
 });
 
-const endpointPatchSchema = endpointSchema
+export const endpointPatchSchema = endpointSchema
+  .omit({ apiKey: true })
   .partial()
   .extend({ enabled: z.boolean().optional() })
   .refine(value => Object.keys(value).length > 0, {
     message: 'Provide at least one endpoint field to update.',
   });
 
-const modelSchema = z.object({
+export const modelSchema = z.object({
   modelId: z.string().trim().min(1).max(240),
   displayName: z.string().trim().min(1).max(160),
   intelligenceRank: z.number().int().min(1).max(999).default(50),
@@ -50,10 +54,10 @@ const modelSchema = z.object({
   enabled: z.boolean().default(true),
 });
 
-const modelPatchSchema = modelSchema.omit({ modelId: true }).partial().strict()
+export const modelPatchSchema = modelSchema.omit({ modelId: true }).partial().strict()
   .refine(value => Object.keys(value).length > 0, { message: 'Provide at least one model field to update.' });
 
-const probeSchema = z.object({
+export const probeSchema = z.object({
   modelId: z.string().min(1).max(240),
   keyId: z.number().int().positive().safe().optional(),
 });
@@ -203,7 +207,7 @@ function serializeModel(m: any) {
   };
 }
 
-endpointsRouter.get('/', (_req: Request, res: Response) => {
+function listEndpoints() {
   const db = getDb();
   const customEndpoints = db.prepare(`
     SELECT ce.*
@@ -256,18 +260,26 @@ endpointsRouter.get('/', (_req: Request, res: Response) => {
     };
   });
 
-  res.json([...builtIns, ...custom]);
+  return [...builtIns, ...custom];
+}
+
+endpointsRouter.get('/', (_req, res) => res.json(listEndpoints()));
+endpointsRouter.get('/:platform', (req, res) => {
+  const endpoint = listEndpoints().find(endpoint => endpoint.platform === req.params.platform);
+  if (!endpoint) { res.status(404).json({ error: { message: 'Provider not found.' } }); return; }
+  res.json(endpoint);
 });
 
 endpointsRouter.post('/', (req: Request, res: Response) => {
   const parsed = endpointSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
   const platform = nextCustomPlatform(parsed.data.name);
-  const result = getDb().prepare(`
+  const result = getDb().transaction(() => {
+    const result = getDb().prepare(`
     INSERT INTO custom_endpoints (platform, name, base_url, validate_url, timeout_ms, enabled)
     VALUES (?, ?, ?, ?, ?, 1)
   `).run(
@@ -277,6 +289,14 @@ endpointsRouter.post('/', (req: Request, res: Response) => {
     parsed.data.validateUrl ? normalizeCustomEndpointUrl(parsed.data.validateUrl) : null,
     parsed.data.timeoutMs ?? 120000,
   );
+    if (parsed.data.apiKey !== undefined) {
+      const credential = encrypt(parsed.data.apiKey || 'anonymous-local-endpoint');
+      getDb().prepare(`INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, source)
+        VALUES (?, ?, ?, ?, ?, 'unknown', 1, ?)`)
+        .run(platform, parsed.data.apiKey ? `${parsed.data.name} key` : 'No API key required', credential.encrypted, credential.iv, credential.authTag, parsed.data.apiKey ? 'manual' : 'anonymous');
+    }
+    return result;
+  })();
   clearDynamicProvider(platform);
 
   res.status(201).json({
@@ -291,9 +311,9 @@ endpointsRouter.post('/', (req: Request, res: Response) => {
     credentialMode: 'api-key',
     ...serializeEndpointCounts({
       modelCount: 0,
-      configuredKeyCount: 0,
-      enabledKeyCount: 0,
-      availableKeyCount: 0,
+      configuredKeyCount: parsed.data.apiKey === undefined ? 0 : 1,
+      enabledKeyCount: parsed.data.apiKey === undefined ? 0 : 1,
+      availableKeyCount: parsed.data.apiKey === undefined ? 0 : 1,
     }),
   });
 });
@@ -307,7 +327,7 @@ endpointsRouter.patch('/:platform', (req: Request, res: Response) => {
 
   const parsed = endpointPatchSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -376,7 +396,7 @@ endpointsRouter.post('/:platform/models/probe', async (req: Request, res: Respon
 
   const parsed = probeSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -460,7 +480,7 @@ endpointsRouter.post('/:platform/models', (req: Request, res: Response) => {
 
   const parsed = modelSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -520,6 +540,14 @@ endpointsRouter.post('/:platform/models', (req: Request, res: Response) => {
   });
 });
 
+endpointsRouter.get('/:platform/models/:modelDbId', (req, res) => {
+  const id = parsePositiveResourceId(req.params.modelDbId);
+  if (id === null) { res.status(400).json({ error: { message: 'Provide a positive model ID.', param: 'modelDbId' } }); return; }
+  const model = getDb().prepare('SELECT m.*, fc.priority, fc.enabled AS fallback_enabled FROM models m LEFT JOIN fallback_config fc ON fc.model_db_id = m.id WHERE m.id = ? AND m.platform = ?').get(id, req.params.platform);
+  if (!model) { res.status(404).json({ error: { message: 'Model not found.' } }); return; }
+  res.json(serializeModel(model));
+});
+
 endpointsRouter.patch('/:platform/models/:modelDbId', (req: Request, res: Response) => {
   const platform = platformSchema.safeParse(req.params.platform);
   const modelDbId = parsePositiveResourceId(req.params.modelDbId);
@@ -533,7 +561,7 @@ endpointsRouter.patch('/:platform/models/:modelDbId', (req: Request, res: Respon
   }
   const parsed = modelPatchSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(error => error.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   const db = getDb();
@@ -546,7 +574,8 @@ endpointsRouter.patch('/:platform/models/:modelDbId', (req: Request, res: Respon
     contextWindow: 'context_window', enabled: 'enabled',
   } as const;
   const fields = Object.keys(parsed.data) as Array<keyof typeof columns>;
-  const result = db.prepare(`UPDATE models SET ${fields.map(field => `${columns[field]} = ?`).join(', ')} WHERE id = ? AND platform = ?`)
+  const operatorFlag = parsed.data.enabled === undefined ? '' : `, operator_disabled = ${parsed.data.enabled ? 0 : 1}`;
+  const result = db.prepare(`UPDATE models SET ${fields.map(field => `${columns[field]} = ?`).join(', ')}${operatorFlag} WHERE id = ? AND platform = ?`)
     .run(...fields.map(field => field === 'enabled' ? Number(parsed.data[field]) : parsed.data[field]), modelDbId, platform.data);
   if (result.changes === 0) {
     res.status(404).json({ error: { message: 'Model not found' } });

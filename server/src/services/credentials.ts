@@ -66,7 +66,7 @@ export async function prepareProviderCredential(keyId: number, signal?: AbortSig
     LEFT JOIN oauth_accounts oa ON oa.id = ak.oauth_account_id WHERE ak.id = ? AND ak.enabled = 1
   `).get(keyId) as ProviderCredential | undefined;
   if (!key) throw new ProviderError('Provider credential is unavailable.', { retryable: true });
-  if (!key.oauth_account_id) return { apiKey: decrypt(key.encrypted_key, key.iv, key.auth_tag) };
+  if (!key.oauth_account_id) return { apiKey: key.source === 'anonymous' ? '' : decrypt(key.encrypted_key, key.iv, key.auth_tag) };
 
   const account = await ensureFreshOAuthAccount(db, key.oauth_account_id, signal);
   signal?.throwIfAborted();

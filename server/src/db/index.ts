@@ -730,6 +730,8 @@ function createTables(db: Database.Database) {
   ensureClientApiKeyEndpointColumn(db);
   ensureClientApiKeyHashes(db);
   ensureApiKeyOAuthColumns(db);
+  const modelColumns = db.prepare('PRAGMA table_info(models)').all() as Array<{ name: string }>;
+  if (!modelColumns.some(column => column.name === 'operator_disabled')) db.prepare('ALTER TABLE models ADD COLUMN operator_disabled INTEGER NOT NULL DEFAULT 0').run();
   ensureOAuthAccountsProjectedAsKeys(db);
   ensureDefaultLocalEndpoint(db);
 }
@@ -748,9 +750,14 @@ function ensureRequestAnalyticsColumns(db: Database.Database) {
   if (!names.has('request_id')) db.prepare('ALTER TABLE requests ADD COLUMN request_id TEXT').run();
   if (!names.has('attempt')) db.prepare('ALTER TABLE requests ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1').run();
   if (!names.has('is_final')) db.prepare('ALTER TABLE requests ADD COLUMN is_final INTEGER NOT NULL DEFAULT 1').run();
+  if (!names.has('trace_id')) db.prepare('ALTER TABLE requests ADD COLUMN trace_id TEXT').run();
+  if (!names.has('client_key_id')) db.prepare('ALTER TABLE requests ADD COLUMN client_key_id INTEGER').run();
   db.prepare("UPDATE requests SET request_id = 'legacy-' || id WHERE request_id IS NULL OR request_id = ''").run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_final_created_at ON requests(is_final, created_at DESC)').run();
   db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_request_attempt ON requests(request_id, attempt)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_trace_attempt ON requests(trace_id, attempt)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_final_id ON requests(is_final, id DESC)').run();
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_requests_client_final_id ON requests(client_key_id, is_final, id DESC)').run();
 }
 
 function ensureClientApiKeyEndpointColumn(db: Database.Database) {
@@ -2261,6 +2268,23 @@ export function listClientApiKeys(): ClientApiKeyRecord[] {
   const db = getDb();
   const rows = db.prepare('SELECT * FROM client_api_keys ORDER BY created_at DESC, id DESC').all() as any[];
   return rows.map(row => rowToClientApiKey(row));
+}
+
+export function getClientApiKey(id: number): ClientApiKeyRecord | null {
+  const row = getDb().prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id);
+  return row ? rowToClientApiKey(row) : null;
+}
+
+export function rotateClientApiKey(id: number): ClientApiKeyRecord | null {
+  const db = getDb();
+  const existing = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id) as { key_hash: string } | undefined;
+  if (!existing) return null;
+  const key = createClientApiKey();
+  db.prepare('UPDATE client_api_keys SET key = ?, key_hash = ?, key_hint = ? WHERE id = ?')
+    .run(scrubbedClientKeyValue(), clientApiKeyHash(key), clientApiKeyHint(key), id);
+  if (ephemeralPrimaryClientSecret && clientApiKeyHash(ephemeralPrimaryClientSecret) === existing.key_hash) ephemeralPrimaryClientSecret = key;
+  const row = db.prepare('SELECT * FROM client_api_keys WHERE id = ?').get(id);
+  return rowToClientApiKey({ ...(row as object), revealed_key: key }, true);
 }
 
 export function getUnifiedApiKey(): string {

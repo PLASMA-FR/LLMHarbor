@@ -1,4 +1,7 @@
+import { sendValidationError } from '../lib/validation.js';
 import { Router } from 'express';
+import { createHash } from 'node:crypto';
+import { parsePositiveResourceId } from '../lib/resourceId.js';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
@@ -8,8 +11,26 @@ import { hasProvider } from '../providers/index.js';
 
 export const fallbackRouter = Router();
 
+function routingVersion(): string {
+  const rows = getDb().prepare('SELECT model_db_id, priority, enabled FROM fallback_config ORDER BY model_db_id').all();
+  return `"${createHash('sha256').update(JSON.stringify(rows)).digest('hex').slice(0, 32)}"`;
+}
+
+fallbackRouter.patch('/models/:id', (req, res) => {
+  const id = parsePositiveResourceId(req.params.id);
+  if (id === null) { res.status(400).json({ error: { message: 'Provide a positive model ID.', param: 'id' } }); return; }
+  const parsed = z.object({ enabled: z.boolean() }).strict().safeParse(req.body);
+  if (!parsed.success) { sendValidationError(res, parsed.error); return; }
+  const result = getDb().prepare('UPDATE fallback_config SET enabled = ? WHERE model_db_id = ?').run(Number(parsed.data.enabled), id);
+  if (!result.changes) { res.status(404).json({ error: { message: 'Routing entry not found.' } }); return; }
+  const row = getDb().prepare('SELECT priority, enabled FROM fallback_config WHERE model_db_id = ?').get(id) as { priority: number; enabled: number };
+  res.setHeader('ETag', routingVersion());
+  res.json({ modelDbId: id, priority: row.priority, enabled: row.enabled === 1 });
+});
+
 // Get fallback chain (with dynamic penalties)
 fallbackRouter.get('/', (_req: Request, res: Response) => {
+  res.setHeader('ETag', routingVersion());
   const db = getDb();
   const rows = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled, m.enabled AS model_enabled,
@@ -131,9 +152,13 @@ const updateSchema = z.array(z.object({
 
 // Update fallback chain (full replace)
 fallbackRouter.put('/', (req: Request, res: Response) => {
+  if (req.get('If-Match') && req.get('If-Match') !== routingVersion()) {
+    res.status(409).json({ error: { message: 'Routing changed while you were editing. Reload the latest order before saving.', code: 'routing_conflict', type: 'conflict' } });
+    return;
+  }
   const parsed = updateSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 
@@ -162,7 +187,7 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
     }
   });
   updateAll();
-
+  res.setHeader('ETag', routingVersion());
   res.json({ success: true });
 });
 
@@ -174,9 +199,18 @@ const SORT_PRESETS: Record<string, string> = {
   budget: "CASE m.monthly_token_budget WHEN '~120M' THEN 1 WHEN '~50-100M' THEN 2 WHEN '~30M' THEN 3 WHEN '~18-45M' THEN 4 WHEN '~18M' THEN 5 WHEN '~15M' THEN 6 WHEN '~12M' THEN 7 WHEN '~6M' THEN 8 WHEN '~5-10M' THEN 9 WHEN '~4M' THEN 10 ELSE 11 END ASC",
 };
 
+fallbackRouter.get('/presets/:preset', (req, res) => {
+  const preset = String(req.params.preset);
+  if (!Object.hasOwn(SORT_PRESETS, preset)) {
+    res.status(400).json({ error: { message: 'Choose intelligence, speed, or budget.', param: 'preset' } }); return;
+  }
+  const models = getDb().prepare(`SELECT m.id FROM models m ORDER BY ${SORT_PRESETS[preset]}, m.id ASC`).all() as Array<{ id: number }>;
+  res.json({ preset, order: models.map(model => model.id) });
+});
+
 fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
   const preset = String(req.params.preset);
-  const orderBy = SORT_PRESETS[preset];
+  const orderBy = Object.hasOwn(SORT_PRESETS, preset) ? SORT_PRESETS[preset] : undefined;
   if (!orderBy) {
     res.status(400).json({ error: { message: `Unknown preset: ${preset}. Use: intelligence, speed, budget` } });
     return;

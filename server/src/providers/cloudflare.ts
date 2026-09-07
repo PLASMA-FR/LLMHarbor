@@ -44,7 +44,7 @@ export class CloudflareProvider extends BaseProvider {
   //     even though the OpenAI spec allows it (collapse to '');
   //   - doesn't accept the array content envelope, so flatten to string.
   private normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
-    return messages.map(m => ({ ...m, content: contentToString(m.content) }));
+    return messages.map(m => ({ ...m, role: m.role === 'developer' ? 'system' : m.role, content: contentToString(m.content) }));
   }
 
   async chatCompletion(

@@ -12,6 +12,7 @@ const failureCount = new Map<number, number>();
 const activeKeyChecks = new Set<Promise<KeyStatus>>();
 const activeKeyCheckControllers = new Set<AbortController>();
 let acceptingHealthChecks = true;
+export function resetKeyHealthFailures(keyId: number): void { failureCount.delete(keyId); }
 
 export function checkKeyHealth(keyId: number, signal?: AbortSignal): Promise<KeyStatus> {
   if (!acceptingHealthChecks) return Promise.resolve('error');
@@ -60,8 +61,14 @@ async function checkKeyHealthInternal(keyId: number, signal?: AbortSignal): Prom
   if (!provider) return 'error';
 
   try {
-    const apiKey = decrypt(row.encrypted_key, row.iv, row.auth_tag);
+    const apiKey = row.source === 'anonymous' ? '' : decrypt(row.encrypted_key, row.iv, row.auth_tag);
     const isValid = await provider.validateKey(apiKey, signal);
+
+    // A check started before secret replacement must not invalidate the new
+    // credential or contribute to its consecutive-failure count.
+    const current = db.prepare('SELECT encrypted_key, iv, auth_tag, status FROM api_keys WHERE id = ?').get(keyId) as typeof row | undefined;
+    if (!current) return 'error';
+    if (current.encrypted_key !== row.encrypted_key || current.iv !== row.iv || current.auth_tag !== row.auth_tag) return current.status as KeyStatus;
 
     const status: KeyStatus = isValid ? 'healthy' : 'invalid';
 
@@ -87,8 +94,8 @@ async function checkKeyHealthInternal(keyId: number, signal?: AbortSignal): Prom
     // a bad key. Mark status='error' but do NOT increment failure counter — auto-
     // disable is reserved for confirmed 401/403 (returned by validateKey as false).
     console.error(`[Health] Key ${keyId} transport error:`, redactSensitive(err.message));
-    db.prepare("UPDATE api_keys SET status = ?, last_checked_at = datetime('now') WHERE id = ?")
-      .run('error', keyId);
+    db.prepare("UPDATE api_keys SET status = ?, last_checked_at = datetime('now') WHERE id = ? AND encrypted_key = ? AND iv = ? AND auth_tag = ?")
+      .run('error', keyId, row.encrypted_key, row.iv, row.auth_tag);
     return 'error';
   }
 }

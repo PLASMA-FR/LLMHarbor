@@ -17,14 +17,18 @@ export class ApiError extends Error {
   readonly type?: string
   readonly code?: string
   readonly details?: ApiErrorPayload
+  readonly requestId?: string
+  readonly fieldErrors: Array<{ path: string; message: string }>
 
-  constructor(message: string, status: number, payload?: ApiErrorPayload) {
+  constructor(message: string, status: number, payload?: ApiErrorPayload, requestId?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.type = payload?.error?.type
     this.code = payload?.error?.code
     this.details = payload
+    this.requestId = typeof payload?.error?.request_id === 'string' ? payload.error.request_id : requestId
+    this.fieldErrors = Array.isArray(payload?.error?.details) ? payload.error.details.filter((item): item is { path: string; message: string } => Boolean(item && typeof item === 'object' && typeof item.path === 'string' && typeof item.message === 'string')) : []
   }
 }
 
@@ -55,7 +59,7 @@ async function parseResponseBody(response: Response): Promise<unknown> {
 }
 
 /** Fetch a dashboard API route with consistent JSON handling, cancellation, and errors. */
-export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
+export async function apiRequest<T>(path: string, options: ApiFetchOptions = {}): Promise<{ data: T; requestId: string | null; etag: string | null }> {
   const { timeoutMs = DEFAULT_TIMEOUT_MS, signal: callerSignal, headers, ...requestOptions } = options
   const controller = new AbortController()
   const abortFromCaller = () => controller.abort(callerSignal?.reason)
@@ -85,21 +89,25 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
     if (!response.ok) {
       const payload = typeof body === 'object' && body !== null ? body as ApiErrorPayload : undefined
       const fallback = typeof body === 'string' && body.trim() ? body : `Request failed with HTTP ${response.status}`
-      throw new ApiError(responseMessage(payload, fallback), response.status, payload)
+      throw new ApiError(responseMessage(payload, fallback), response.status, payload, response.headers.get('X-Request-Id') ?? undefined)
     }
 
-    return body as T
+    return { data: body as T, requestId: response.headers.get('X-Request-Id'), etag: response.headers.get('ETag') }
   } catch (error) {
     if (error instanceof ApiError) throw error
     if (controller.signal.aborted) {
       const timedOut = controller.signal.reason instanceof DOMException && controller.signal.reason.name === 'TimeoutError'
       throw new ApiError(timedOut ? 'The server took too long to respond.' : 'The request was cancelled.', 0)
     }
-    throw new ApiError(error instanceof Error ? error.message : 'Could not reach the LLMHarbor server.', 0)
+    throw new ApiError('Could not reach LLMHarbor. Check the server connection, then try again.', 0)
   } finally {
     window.clearTimeout(timeout)
     callerSignal?.removeEventListener('abort', abortFromCaller)
   }
+}
+
+export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
+  return (await apiRequest<T>(path, options)).data
 }
 
 export function getErrorMessage(error: unknown, fallback = 'Something went wrong.') {

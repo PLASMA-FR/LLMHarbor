@@ -1,3 +1,4 @@
+import { sendValidationError } from '../lib/validation.js';
 import crypto from 'crypto';
 import { createServer, type Server as HttpServer } from 'http';
 import { Router } from 'express';
@@ -850,7 +851,7 @@ oauthRouter.patch('/accounts/:id', (req: Request, res: Response) => {
     return;
   }
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   const db = getDb();

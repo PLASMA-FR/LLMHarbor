@@ -13,7 +13,7 @@
     "dev": "concurrently \"npm run dev -w server\" \"npm run dev -w client\"",
     "lint": "npm run lint -w client",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
-    "test:e2e": "npm run test:e2e -w client",
+    "test:e2e": "npm run test:e2e -w client --",
     "test": "npm run test -w server && npm run test -w client --if-present",
     "build": "npm run build -w server && npm run build -w client",
     "build:server": "npm run build -w server",

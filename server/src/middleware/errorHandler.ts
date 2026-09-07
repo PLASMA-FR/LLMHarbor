@@ -10,6 +10,7 @@ export function errorHandler(err: Error, req: Request, res: Response, next: Next
 
   const isBodyTooLarge = (err as any).type === 'entity.too.large' || status === 413;
   const isBadJson = (err as any).type === 'entity.parse.failed';
+  const code = isBodyTooLarge ? 'request_too_large' : isBadJson ? 'invalid_json' : (err as any).code;
   const expose = (err as any).expose === true || status < 500;
   const message = isBodyTooLarge
     ? 'Request body is too large.'
@@ -22,7 +23,7 @@ export function errorHandler(err: Error, req: Request, res: Response, next: Next
     error: {
       message,
       type: isBodyTooLarge ? 'invalid_request_error' : isBadJson ? 'invalid_request_error' : status >= 500 ? 'server_error' : 'request_error',
-      ...((err as any).code ? { code: String((err as any).code) } : {}),
+      ...(code ? { code: String(code) } : {}),
       request_id: requestId,
     },
   });

@@ -182,7 +182,7 @@ export function updateOAuthModels(db: Database.Database, models: OAuthDiscovered
       size_label = CASE WHEN models.display_name LIKE '%browser account%' THEN excluded.size_label ELSE models.size_label END,
       context_window = CASE WHEN models.display_name LIKE '%browser account%' THEN excluded.context_window ELSE models.context_window END,
       monthly_token_budget = CASE WHEN models.display_name LIKE '%browser account%' THEN excluded.monthly_token_budget ELSE models.monthly_token_budget END,
-      enabled = CASE WHEN models.display_name LIKE '%browser account%' THEN excluded.enabled ELSE models.enabled END
+      enabled = CASE WHEN models.operator_disabled = 1 THEN 0 WHEN models.display_name LIKE '%browser account%' THEN excluded.enabled ELSE models.enabled END
   `);
   const insertFallback = db.prepare('INSERT OR IGNORE INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
   let priority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS priority FROM fallback_config').get() as { priority: number }).priority;
@@ -212,7 +212,7 @@ export function updateOAuthModels(db: Database.Database, models: OAuthDiscovered
       for (const platform of platforms) {
         for (const row of browserRows.all(platform) as Array<{ id: number; platform: string; model_id: string }>) {
           const enabled = Boolean(supported.get(row.platform, row.model_id));
-          db.prepare('UPDATE models SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, row.id);
+          db.prepare('UPDATE models SET enabled = CASE WHEN operator_disabled = 1 THEN 0 ELSE ? END WHERE id = ?').run(enabled ? 1 : 0, row.id);
           if (enabled) insertFallback.run(row.id, ++priority);
           else db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(row.id);
         }

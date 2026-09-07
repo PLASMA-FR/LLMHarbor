@@ -12,6 +12,7 @@ export interface CompletionOptions {
   model?: string;
   temperature?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   top_p?: number;
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;

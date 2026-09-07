@@ -122,6 +122,7 @@ describe('Endpoint command center API', () => {
         type: 'conflict',
         code: 'model_already_exists',
         param: 'modelId',
+        request_id: expect.any(String),
       },
     });
     expect(getDb().prepare("SELECT COUNT(*) AS count FROM models WHERE platform = 'groq' AND model_id = 'llama-3.3-70b-test'").get()).toEqual({ count: 1 });

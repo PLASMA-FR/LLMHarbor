@@ -105,7 +105,7 @@
       </div>
       <div class="code-panel">
         <p>Client key</p>
-        <pre><code>POST /api/settings/api-keys
+        <pre><code>POST /api/client-keys
 {
   "label": "editor agent"
 }</code></pre>
@@ -115,8 +115,8 @@ POST /api/oauth/connect/antigravity/start
 POST /api/oauth/connect/:provider/callback
 GET  /api/oauth/accounts/:id/models</code></pre>
         <p>Access policy</p>
-        <pre><code>GET   /api/settings/api-keys/:id/access-policy
-PATCH /api/settings/api-keys/:id/access-policy
+        <pre><code>GET   /api/client-keys/:id/access-policy
+PATCH /api/client-keys/:id/access-policy
 {
   "platforms": [{ "platform": "groq", "enabled": false }],
   "models": [{ "modelDbId": 42, "enabled": false }]
@@ -128,7 +128,7 @@ PATCH /api/settings/api-keys/:id/access-policy
       <div>
         <p class="eyebrow">Provider operations</p>
         <h2>Bulk API key importer</h2>
-        <p>Open Providers &amp; keys, pick a target from the current provider list, upload a <code>.txt</code> file, and LLMHarbor creates one stored credential per non-empty, non-comment line. The dashboard submits the stable provider <code>platform</code> returned by <code>GET /api/keys/providers</code>; legacy numeric positions are accepted only for older clients.</p>
+        <p>Open Providers, pick a target from the current provider list, upload a <code>.txt</code> file, and LLMHarbor creates one stored credential per non-empty, non-comment line. The dashboard submits the stable provider <code>platform</code> returned by <code>GET /api/provider-keys/providers</code>; legacy numeric positions are accepted only for older clients.</p>
       </div>
       <div class="code-panel">
         <p>keys.txt</p>
@@ -137,7 +137,7 @@ AIzaSy...two
 # comments are ignored
 AIzaSy...three</code></pre>
         <p>API shape</p>
-        <pre><code>POST /api/keys/import
+        <pre><code>POST /api/provider-keys/import
 {
   "platform": "google",
   "contents": "key-one\nkey-two",
@@ -167,7 +167,7 @@ AIzaSy...three</code></pre>
           <ol>
             <li>Install with the curl command above.</li>
             <li>Start the app with <code>llmharbor start</code> or run from the repo with <code>npm run dev</code>.</li>
-            <li>Open the local dashboard and create a client key under Providers &amp; keys. Use Settings to scope that key by route, provider, and model if it is for an agent or shared tool.</li>
+            <li>Open the local dashboard and create a client key under Providers. Use Settings to scope that key by route, provider, and model if it is for an agent or shared tool.</li>
             <li>Add at least one provider key or connect a supported OAuth account, then run Check all or refresh account inventory.</li>
             <li>Point any OpenAI-compatible client at <code>http://127.0.0.1:3001/v1</code>.</li>
           </ol>
@@ -190,7 +190,7 @@ AIzaSy...three</code></pre>
 
         <article id="providers" class="doc-section">
           <h3>Providers and custom endpoints</h3>
-          <p>Built-in providers appear first in Providers &amp; keys and Models. Custom OpenAI-compatible endpoints can be added under Providers &amp; keys and then populated from Models. Resolve the stable bulk-import <code>platform</code> from the current UI or <code>GET /api/keys/providers</code>.</p>
+          <p>Built-in providers appear first in Providers and Models. Custom OpenAI-compatible endpoints can be added under Providers and then populated from Models. Resolve the stable bulk-import <code>platform</code> from the current UI or <code>GET /api/provider-keys/providers</code>.</p>
           <ul class="pill-list"><li>OpenAI</li><li>Google</li><li>OpenAI / ChatGPT OAuth</li><li>Antigravity OAuth</li><li>Freebuff</li><li>Groq</li><li>Cerebras</li><li>SambaNova</li><li>NVIDIA</li><li>Mistral</li><li>OpenRouter</li><li>GitHub Models</li><li>Cohere</li><li>Cloudflare</li><li>Zhipu</li><li>Ollama</li><li>Kilo Gateway</li><li>Pollinations</li><li>LLM7</li><li>HuggingFace</li><li>Custom</li></ul>
         </article>
 
@@ -209,16 +209,16 @@ AIzaSy...three</code></pre>
           <h3>API reference</h3>
           <div class="api-list">
             <div><code>GET /api/ping</code><span>Public liveness check.</span></div>
-            <div><code>GET /api/keys</code><span>List masked provider credentials.</span></div>
-            <div><code>POST /api/keys</code><span>Add one provider credential.</span></div>
-            <div><code>GET /api/keys/providers</code><span>List stable provider targets for bulk import.</span></div>
-            <div><code>POST /api/keys/import</code><span>Import provider credentials from text lines.</span></div>
-            <div><code>GET /api/settings/api-keys</code><span>List local client keys.</span></div>
-            <div><code>POST /api/settings/api-keys</code><span>Create local client keys for apps and agents.</span></div>
-            <div><code>GET /api/settings/api-keys/:id/access-policy</code><span>Inspect routes, providers, and models scoped to one local key.</span></div>
-            <div><code>PATCH /api/settings/api-keys/:id/access-policy</code><span>Allow or block local routes, provider endpoints, and model rows.</span></div>
+            <div><code>GET /api/provider-keys</code><span>List masked provider credentials.</span></div>
+            <div><code>POST /api/provider-keys</code><span>Add one provider credential.</span></div>
+            <div><code>GET /api/provider-keys/providers</code><span>List stable provider targets for bulk import.</span></div>
+            <div><code>POST /api/provider-keys/import</code><span>Import provider credentials from text lines.</span></div>
+            <div><code>GET /api/client-keys</code><span>List local client keys.</span></div>
+            <div><code>POST /api/client-keys</code><span>Create local client keys for apps and agents.</span></div>
+            <div><code>GET /api/client-keys/:id/access-policy</code><span>Inspect routes, providers, and models scoped to one local key.</span></div>
+            <div><code>PATCH /api/client-keys/:id/access-policy</code><span>Allow or block local routes, provider endpoints, and model rows.</span></div>
             <div><code>GET /api/oauth/accounts</code><span>List connected OAuth-backed accounts.</span></div>
-            <div><code>GET /api/endpoints</code><span>List built-in and custom endpoints.</span></div>
+            <div><code>GET /api/providers</code><span>List built-in and custom endpoints.</span></div>
             <div><code>GET /v1/models</code><span>List the models eligible for the authenticated client key.</span></div>
             <div><code>POST /v1/chat/completions</code><span>OpenAI-compatible chat completions proxy.</span></div>
           </div>

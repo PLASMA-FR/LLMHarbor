@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useLocation, NavLink } from 'react-router-dom'
+import { useConfirm } from '@/lib/feedback'
 import { ArrowDown, Braces, CircleStop, Copy, Download, RotateCcw, Send, Trash2 } from 'lucide-react'
 import { apiFetch, apiUrl } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
@@ -26,6 +28,8 @@ import type {
   ChatToolDefinition,
   TokenUsage,
 } from '../../../shared/types'
+
+const MessageMarkdown = lazy(() => import('@/components/message-markdown'))
 
 interface FallbackEntry {
   modelDbId: number
@@ -213,12 +217,17 @@ function ToolCallCard({
 }
 
 export default function PlaygroundPage() {
+  const confirm = useConfirm()
+  const location = useLocation()
   const [messages, setMessages] = usePlaygroundField('messages')
   const [input, setInput] = usePlaygroundField('input')
   const [loading, setLoading] = useState(false)
   const [selectedModel, setSelectedModel] = usePlaygroundField('selectedModel')
+  const preferredFromUrl = new URLSearchParams(location.search).get('model')
+  useEffect(() => { if (preferredFromUrl) setSelectedModel(preferredFromUrl) }, [preferredFromUrl, setSelectedModel])
   const [selectedClientKeyId, setSelectedClientKeyId] = usePlaygroundField('selectedClientKeyId')
   const [streaming, setStreaming] = usePlaygroundField('streaming')
+  const [markdown, setMarkdown] = usePlaygroundField('markdown')
   const [temperature, setTemperature] = usePlaygroundField('temperature')
   const [maxTokens, setMaxTokens] = usePlaygroundField('maxTokens')
   const [systemPrompt, setSystemPrompt] = usePlaygroundField('systemPrompt')
@@ -662,8 +671,8 @@ export default function PlaygroundPage() {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  function clearThread() {
-    if (messages.length && !window.confirm('Clear this conversation? Export it first if you want to keep a copy.')) return
+  async function clearThread() {
+    if (messages.length && !await confirm({ title: 'Clear this conversation?', description: 'The messages in this browser session will be removed. Export the conversation first if you want to keep it.', confirmLabel: 'Clear conversation' })) return
     setMessages([])
     setToolResults({})
     setFormError(null)
@@ -675,7 +684,7 @@ export default function PlaygroundPage() {
       <PageHeader
         eyebrow="Request debugger"
         title="Playground"
-        description="Exercise the same OpenAI-compatible endpoint your applications use, including streaming and tool calls."
+        description="Try a prompt, inspect the response, and verify the route your apps will use."
         actions={
           <>
             <Select disabled={loading} value={selectedModel} onValueChange={value => setSelectedModel(value ?? 'auto')}>
@@ -711,6 +720,7 @@ export default function PlaygroundPage() {
               <p className="mt-0.5 text-xs text-muted-foreground">Enter sends · Shift Enter adds a line · Kept until reload</p>
             </div>
             <div className="flex items-center gap-2">
+              <Button variant="ghost" size="xs" aria-pressed={markdown} onClick={() => setMarkdown(value => !value)}>{markdown ? 'Markdown preview' : 'Plain text'}</Button>
               <StatusIndicator label={streaming ? 'Streaming' : 'Single response'} tone={loading ? 'warning' : 'info'} />
               <Badge variant="outline" className="max-w-52 truncate">{activeModelLabel}</Badge>
             </div>
@@ -735,7 +745,7 @@ export default function PlaygroundPage() {
                     message.role === 'tool' && 'rounded-[var(--radius-panel)] border border-primary/25 bg-primary/5 px-4 py-3',
                   )}>
                     <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.08em] opacity-65">{message.role === 'tool' ? 'Tool result' : message.role}</p>
-                    {message.content || message.refusal ? <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content || message.refusal}</div> : message.toolCalls?.length ? null : <span className="text-sm text-muted-foreground">{loading && message.id === latestMessage?.id ? 'Waiting for response…' : 'No response text returned.'}</span>}
+                    {message.content || message.refusal ? markdown && message.role === 'assistant' && message.kind !== 'error' && !(loading && message.id === latestMessage?.id) ? <Suspense fallback={<div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content || message.refusal}</div>}><MessageMarkdown content={message.content || message.refusal || ''} /></Suspense> : <div className="whitespace-pre-wrap break-words text-sm leading-6">{message.content || message.refusal}</div> : message.toolCalls?.length ? null : <span className="text-sm text-muted-foreground">{loading && message.id === latestMessage?.id ? 'Waiting for response…' : 'No response text returned.'}</span>}
 
                     {message.toolCalls?.map(call => (
                       <ToolCallCard
@@ -778,6 +788,7 @@ export default function PlaygroundPage() {
           </div>
 
           <div className="border-t border-border bg-card p-3">
+            {!hasEnabledClientKey || !selectedModelReady ? <p className="mb-3 text-xs text-muted-foreground">{setupMessage} <NavLink to={!hasEnabledClientKey ? '/access?create=1' : '/models'} className="text-primary underline underline-offset-2">{!hasEnabledClientKey ? 'Create a client key' : 'Review models and routing'}</NavLink></p> : null}
             {!following && messages.length > 0 ? <Button variant="outline" size="sm" className="mb-2" onClick={() => setFollowing(true)}><ArrowDown aria-hidden="true" /> Jump to latest</Button> : null}
             {formError ? <InlineNotice tone="critical" className="mb-3">{formError}</InlineNotice> : null}
             <div className="flex items-end gap-2 rounded-[var(--radius-panel)] border border-input bg-background p-2 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/20">

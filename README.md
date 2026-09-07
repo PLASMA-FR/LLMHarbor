@@ -101,7 +101,7 @@ LLMHarbor ships with adapters and catalog entries for the common free-tier and O
 | Kilo Gateway | Provider-routed models | OpenAI-compatible aggregator; availability is provider-dependent. |
 | Pollinations | Provider-routed models | OpenAI-compatible endpoint; availability is provider-dependent. |
 | LLM7 | Provider-routed models | OpenAI-compatible aggregator; availability is provider-dependent. |
-| Custom OpenAI-compatible | vLLM, LiteLLM, OpenCode Zen, private gateways | Add from Providers & keys, then register models on Models. |
+| Custom OpenAI-compatible | vLLM, LiteLLM, OpenCode Zen, private gateways | Add from Providers, then register models on Models. |
 
 ## Quick start
 
@@ -186,14 +186,14 @@ http://localhost:3001
 
 Then:
 
-1. Go to **Providers & keys** and add provider keys or a custom endpoint.
+1. Go to **Providers** and add provider keys or a custom endpoint.
    - For one key, paste it into **Add a provider key**.
    - For many keys, use **Bulk import provider keys** with a `.txt` file: choose the provider target, then upload one key per line. The dashboard submits the provider's stable platform identifier.
 2. Go to **Models** and probe the models you want to use.
 3. Optional: go to **OAuth accounts** and connect OpenAI/ChatGPT, Antigravity, or Freebuff.
 4. Go to **Routing** and order the route list.
-5. Create a client API key from **Providers & keys** and save the secret shown once.
-6. Open **Settings** and restrict that key to specific local routes, provider endpoints, or model rows.
+5. Create a client API key from **Client access** and save the secret shown once.
+6. Configure that key’s quotas and route/provider/model policy in **Client access**.
 7. Point your OpenAI-compatible client at `http://localhost:3001/v1`.
 
 ### Production build
@@ -296,7 +296,7 @@ curl http://localhost:3001/v1/chat/completions \
 Local `llmharbor-*` keys can be scoped without touching upstream provider credentials. Create one key per app, then decide which local routes, provider endpoints, and model rows that key may use.
 
 ```bash
-curl http://127.0.0.1:3001/api/settings/api-keys \
+curl http://127.0.0.1:3001/api/client-keys \
   -H "Content-Type: application/json" \
   -d '{
     "label": "editor agent"
@@ -307,10 +307,10 @@ Access policies are stored per local key. They can block an OpenAI-compatible ro
 
 ```bash
 # Inspect routes, provider endpoints, and model rows available to one key
-curl http://127.0.0.1:3001/api/settings/api-keys/1/access-policy
+curl http://127.0.0.1:3001/api/client-keys/1/access-policy
 
 # Block model catalog listing and one provider for that key
-curl -X PATCH http://127.0.0.1:3001/api/settings/api-keys/1/access-policy \
+curl -X PATCH http://127.0.0.1:3001/api/client-keys/1/access-policy \
   -H "Content-Type: application/json" \
   -d '{
     "routes": [{"route":"v1.models","enabled":false}],
@@ -346,12 +346,12 @@ key-two
 key-three
 ```
 
-Open **Providers & keys → Bulk import provider keys**, choose a target from the current provider list, upload the file, and import. The dashboard submits the provider's stable `platform` value returned by `GET /api/keys/providers`; legacy numeric list positions remain accepted only for older clients. Cloudflare lines use the same stored shape as the single-key form: `account_id:api_token`.
+Open **Providers → Import keys**, choose a target from the current provider list, upload the file, and import. The dashboard submits the provider's stable `platform` value returned by `GET /api/provider-keys/providers`; legacy numeric list positions remain accepted only for older clients. Cloudflare lines use the same stored shape as the single-key form: `account_id:api_token`.
 
 The same flow is available through the local control-plane API:
 
 ```bash
-curl http://127.0.0.1:3001/api/keys/import \
+curl http://127.0.0.1:3001/api/provider-keys/import \
   -H "Content-Type: application/json" \
   -d '{"platform":"google","contents":"key-one\nkey-two","labelPrefix":"Google batch"}'
 ```
@@ -424,15 +424,25 @@ Every successful response includes routing headers when available:
 | Page | Use it for |
 |---|---|
 | Overview | Check service health, route readiness, quota pressure, recent traffic, and failures. |
-| Playground | Test streaming, tool calls and refusals; inspect request IDs and routing; copy responses or export the conversation. Drafts and threads survive page navigation until reload. |
-| Providers & keys | Manage local client keys, provider keys, key health, and custom providers. |
+| Playground | Test streaming, tools and refusals; preview Markdown or inspect plain text; copy code, responses or export the thread. Conversations survive navigation until reload. |
+| Providers | Connect upstream credentials and custom endpoints, import keys, inspect health, and replace credentials in place. Local endpoints can use anonymous upstream access. |
+| Client access | Create one-time client keys, rotate secrets, edit quotas and configure paged provider/model access policies. |
 | OAuth accounts | Connect browser accounts, refresh discovered models, inspect account limits, and handle reconnects. |
-| Models | Register and probe models, and edit display names, context windows and per-credential quotas in place. |
-| Routing | Reorder the fallback chain, inspect route eligibility, and switch models on or off. |
-| Analytics | Watch final client outcomes, latency, tokens, provider/model distribution, and sanitized failures. Failed fallback attempts remain visible in the recent-error feed for diagnosis. |
-| Settings | Tune local API access policies for each `llmharbor-*` key, browse the entire model scope, and manage backups and discovery. |
+| Models | Search, register, probe and enable a route on the same page; edit catalog state, context windows and quotas. |
+| Routing | Preview an ordered draft, then save it with protection against concurrent changes and accidental navigation. |
+| Analytics | Inspect aggregate usage or paginated request history, including per-client attribution and fallback traces. |
+| API & SDKs | Generate cURL, JavaScript and Python examples, diagnose errors and download OpenAPI. |
+| Settings | Manage discovery and backups in separate workflows; monitor or cancel discovery and inspect staged restores. |
 
 Model-setting and client-limit PATCH requests preserve omitted fields; send `null` to clear a quota. Newly discovered models remain unavailable to routing until their first successful verification. The discovery scheduler resumes its saved next-run deadline after a restart.
+
+Press **Ctrl/Cmd+K** to find a page. Mobile navigation uses a keyboard-accessible drawer. See the [UX and API guide](docs/ux-and-api.md) for canonical resource paths, compatible aliases and interaction conventions.
+
+### API discovery and diagnostics
+
+Open `/v1` for inference discovery, `/v1/openapi.json` for its schema, or `/api/openapi.json` for the full control-plane contract. All JSON errors include a code and request ID; validation errors also identify individual fields. The API accepts `developer` messages and `max_completion_tokens` as an alternative to `max_tokens`. Unsupported multiple completions and JSON-schema output fail explicitly; other unrecognized fields are reported in `X-LLMHarbor-Ignored-Parameters`.
+
+Canonical control resources are `/api/providers`, `/api/provider-keys`, `/api/client-keys`, `/api/routing`, `/api/discovery` and `/api/backups`. Older paths remain supported. Add `?limit=25` to key lists for cursor pagination, or use `/api/requests` and `/api/requests/{id}` to inspect routed traffic. Control APIs retain the local/private dashboard boundary; client Bearer keys authenticate the `/v1` inference API.
 
 ## How routing works
 
@@ -469,7 +479,8 @@ Main pieces:
 | Rate limiter | `server/src/services/ratelimit.ts` | Provider-side RPM, RPD, TPM, TPD accounting and cooldowns. |
 | Providers | `server/src/providers/*.ts` | Provider-specific request and streaming adapters. |
 | Keys routes | `server/src/routes/keys.ts` | Provider credential management and bulk import. |
-| Settings routes | `server/src/routes/settings.ts` | Local client API keys, route/provider/model access policies, and legacy endpoint compatibility. |
+| Client key routes | `server/src/routes/clientKeys.ts` | Client keys, secret rotation, quotas and access policies. |
+| Settings routes | `server/src/routes/settings.ts` | Connection settings and legacy endpoint compatibility. |
 | OAuth routes | `server/src/routes/oauth.ts` | Browser-account OAuth flows, encrypted account storage, and discovered inventory. |
 | Access policy service | `server/src/services/accessPolicy.ts` | Per-client-key policy snapshots, persistence, and enforcement helpers. |
 | Endpoint routes | `server/src/routes/endpoints.ts` | Custom providers and model registry. |
@@ -562,7 +573,7 @@ npm audit
 LLMHarbor/
   client/               React + Vite dashboard
     src/components/     Shared UI primitives and app shell pieces
-    src/pages/          Overview, playground, providers/keys, models, routing, OAuth, analytics, settings
+    src/pages/          Overview, providers, client access, models, routing, OAuth, analytics, API guide, settings
   server/               Express API and provider routing
     src/db/             SQLite schema and model catalog
     src/providers/      Provider adapters

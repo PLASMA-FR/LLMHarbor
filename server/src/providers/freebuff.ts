@@ -111,13 +111,13 @@ function chatHeaders(token: string) {
 
 function normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
   const systemInstructions = messages
-    .filter(message => message.role === 'system')
+    .filter(message => (message.role === 'system' || message.role === 'developer'))
     .map(message => contentToString(message.content).trim())
     .filter(Boolean)
     .join('\n\n');
   const normalized: ChatMessage[] = [
     { role: 'system', content: FREEBUFF_SYSTEM_PROMPT },
-    ...messages.filter(message => message.role !== 'system').map(message => ({ ...message })),
+    ...messages.filter(message => (message.role !== 'system' && message.role !== 'developer')).map(message => ({ ...message })),
   ];
 
   if (systemInstructions) {

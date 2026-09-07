@@ -7,7 +7,7 @@ import type { ChatMessage } from '@llmharbor/shared/types.js';
 //
 // llmharbor accepts the array envelope so clients like opencode and
 // continue.dev (which always serialize as arrays) don't 400. Non-text blocks
-// are dropped silently — vision/audio aren't supported (see README).
+// are rejected by request validation before this normalization step.
 export type ContentTextBlock = { type: 'text'; text: string };
 export type ContentBlock = ContentTextBlock | { type: string; [key: string]: unknown };
 
@@ -25,6 +25,7 @@ export function contentToString(content: unknown): string {
 export function flattenMessageContent(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((m) => ({
     ...m,
+    role: m.role === 'developer' ? 'system' : m.role,
     content: contentToString(m.content),
   }));
 }

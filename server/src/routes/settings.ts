@@ -1,23 +1,16 @@
+import { clientKeysRouter, clientKeyLimitsSchema } from './clientKeys.js';
+import { sendValidationError } from '../lib/validation.js';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { parsePositiveResourceId } from '../lib/resourceId.js';
 import { toUtcTimestamp } from '../lib/time.js';
-import {
-  getClientApiKeyPolicySnapshot,
-  isKnownClientPolicyPlatform,
-  isKnownLocalApiRoute,
-  updateClientApiKeyPolicy,
-  type ClientAccessPolicyPatch,
-} from '../services/accessPolicy.js';
+
 import {
   clientApiKeyLimitsFromRow,
   createNamedClientApiKey,
-  deleteClientApiKey,
-  listClientApiKeys,
   regenerateUnifiedKey,
-  updateClientApiKey,
 } from '../db/index.js';
 
 export const settingsRouter = Router();
@@ -56,45 +49,6 @@ settingsRouter.get('/connection', (_req: Request, res: Response) => {
   });
 });
 
-const limitValueSchema = z.union([z.number().int().positive().safe(), z.null()]).optional();
-
-const clientKeyLimitsSchema = z.object({
-  rpm: limitValueSchema,
-  rpd: limitValueSchema,
-  tpm: limitValueSchema,
-  tpd: limitValueSchema,
-}).strict().optional();
-
-const createClientKeySchema = z.object({
-  label: z.string().trim().min(1).max(80).optional(),
-  limits: clientKeyLimitsSchema,
-}).strict();
-
-const updateClientKeySchema = z.object({
-  label: z.string().trim().min(1).max(80).optional(),
-  enabled: z.boolean().optional(),
-  limits: clientKeyLimitsSchema,
-}).strict().refine(body => body.label !== undefined || body.enabled !== undefined || body.limits !== undefined, {
-  message: 'Provide label, enabled, or limits',
-});
-
-const accessPolicyPatchSchema = z.object({
-  routes: z.array(z.object({
-    route: z.string().min(1).max(80).refine(isKnownLocalApiRoute, 'Unknown local API route'),
-    enabled: z.boolean(),
-  })).max(32).optional(),
-  platforms: z.array(z.object({
-    platform: z.string().trim().min(1).max(80).refine(isKnownClientPolicyPlatform, 'Unknown provider platform'),
-    enabled: z.boolean(),
-  })).max(512).optional(),
-  models: z.array(z.object({
-    modelDbId: z.number().int().positive().safe(),
-    enabled: z.boolean(),
-  })).max(10_000).optional(),
-}).strict().refine(body => body.routes !== undefined || body.platforms !== undefined || body.models !== undefined, {
-  message: 'Provide routes, platforms, or models',
-});
-
 // Client API keys are hash-only at rest and are revealed once on creation or
 // rotation. The dashboard Playground has its own loopback/control-plane route
 // and never needs to recover a stored secret.
@@ -114,119 +68,7 @@ settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
   res.json({ apiKey: newKey });
 });
 
-// Personal API platform keys. Multiple enabled keys can authenticate against /v1.
-settingsRouter.get('/api-keys', (_req: Request, res: Response) => {
-  res.json(listClientApiKeys());
-});
-
-settingsRouter.get('/api-keys/:id/access-policy', (req: Request, res: Response) => {
-  const id = parsePositiveResourceId(req.params.id);
-  if (id === null) {
-    res.status(400).json({ error: { message: 'Invalid key ID' } });
-    return;
-  }
-
-  const snapshot = getClientApiKeyPolicySnapshot(id);
-  if (!snapshot) {
-    res.status(404).json({ error: { message: 'Client key not found' } });
-    return;
-  }
-
-  res.json(snapshot);
-});
-
-settingsRouter.patch('/api-keys/:id/access-policy', (req: Request, res: Response) => {
-  const id = parsePositiveResourceId(req.params.id);
-  if (id === null) {
-    res.status(400).json({ error: { message: 'Invalid key ID' } });
-    return;
-  }
-
-  const parsed = accessPolicyPatchSchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  const db = getDb();
-  if (parsed.data.models?.length) {
-    const modelExists = db.prepare('SELECT id FROM models WHERE id = ?');
-    const missing = parsed.data.models.find(item => !modelExists.get(item.modelDbId));
-    if (missing) {
-      res.status(400).json({ error: { message: `Unknown model DB id ${missing.modelDbId}` } });
-      return;
-    }
-  }
-
-  const snapshot = updateClientApiKeyPolicy(id, parsed.data as ClientAccessPolicyPatch);
-  if (!snapshot) {
-    res.status(404).json({ error: { message: 'Client key not found' } });
-    return;
-  }
-
-  res.json(snapshot);
-});
-
-settingsRouter.post('/api-keys', (req: Request, res: Response) => {
-  const parsed = createClientKeySchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  const key = createNamedClientApiKey(parsed.data.label ?? 'Personal key', null, parsed.data.limits);
-  res.status(201).json(key);
-});
-
-settingsRouter.patch('/api-keys/:id', (req: Request, res: Response) => {
-  const id = parsePositiveResourceId(req.params.id);
-  if (id === null) {
-    res.status(400).json({ error: { message: 'Invalid key ID' } });
-    return;
-  }
-
-  const parsed = updateClientKeySchema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  const key = updateClientApiKey(id, parsed.data);
-  if (!key) {
-    res.status(404).json({ error: { message: 'Client key not found' } });
-    return;
-  }
-
-  res.json(key);
-});
-
-settingsRouter.delete('/api-keys/:id', (req: Request, res: Response) => {
-  const id = parsePositiveResourceId(req.params.id);
-  if (id === null) {
-    res.status(400).json({ error: { message: 'Invalid key ID' } });
-    return;
-  }
-
-  const existing = getDb().prepare('SELECT id FROM client_api_keys WHERE id = ?').get(id);
-  if (!existing) {
-    res.status(404).json({ error: { message: 'Client key not found' } });
-    return;
-  }
-  const count = (getDb().prepare('SELECT COUNT(*) AS count FROM client_api_keys').get() as { count: number }).count;
-  if (count <= 1) {
-    res.status(409).json({ error: { message: 'Create another client API key before deleting the final key.', type: 'conflict', code: 'last_client_key' } });
-    return;
-  }
-
-  const deleted = deleteClientApiKey(id);
-  if (!deleted) {
-    res.status(404).json({ error: { message: 'Client key not found' } });
-    return;
-  }
-
-  res.json({ success: true });
-});
-
+settingsRouter.use('/api-keys', clientKeysRouter);
 
 const updateLocalEndpointSchema = z.object({
   name: z.string().min(1).max(100).optional(),
@@ -307,7 +149,7 @@ settingsRouter.patch('/local-endpoints/:id', (req: Request, res: Response) => {
     return;
   }
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   const db = getDb();
@@ -337,7 +179,7 @@ settingsRouter.post('/local-endpoints/:id/domains', (req: Request, res: Response
     return;
   }
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   const db = getDb();
@@ -388,7 +230,7 @@ settingsRouter.post('/local-endpoints/:id/keys', (req: Request, res: Response) =
     return;
   }
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
   const endpoint = getDb().prepare('SELECT * FROM local_endpoints WHERE id = ?').get(id) as any;

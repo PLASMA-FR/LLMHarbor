@@ -1,3 +1,4 @@
+import { sendValidationError } from '../lib/validation.js';
 import crypto from 'crypto';
 import fs from 'fs/promises';
 import { createReadStream, createWriteStream } from 'fs';
@@ -8,7 +9,7 @@ import { pipeline } from 'stream/promises';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { backupDbToFile, getDb, stageDbRestoreFromBackupFile } from '../db/index.js';
+import { backupDbToFile, getDb, getDbPath, stageDbRestoreFromBackupFile } from '../db/index.js';
 import { getEncryptionKeyHexForBackup } from '../lib/crypto.js';
 import { redactSensitive } from '../lib/errors.js';
 
@@ -32,6 +33,13 @@ function configuredMaxBackupBytes(): number {
 
 const MAX_BACKUP_BYTES = configuredMaxBackupBytes();
 const MAX_LEGACY_JSON_BACKUP_BYTES = Math.min(MAX_BACKUP_BYTES, LEGACY_JSON_MAX_BACKUP_BYTES);
+
+backupRouter.get('/status', async (_req, res) => {
+  const database = getDbPath();
+  const stat = async (file: string) => fs.stat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const [active, staged] = database === ':memory:' ? [null, null] : await Promise.all([stat(database), stat(`${database}.pending-restore.ready`)]);
+  res.json({ databaseBytes: active?.size ?? 0, pendingRestore: Boolean(staged), stagedAt: staged?.mtime.toISOString() ?? null, maxBackupBytes: MAX_BACKUP_BYTES });
+});
 
 class BackupTooLargeError extends Error {}
 
@@ -225,7 +233,7 @@ backupRouter.get('/export', async (_req: Request, res: Response) => {
 backupRouter.post('/import', async (req: Request, res: Response) => {
   const parsed = importBackupSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(error => error.message).join(', ') } });
+    sendValidationError(res, parsed.error);
     return;
   }
 

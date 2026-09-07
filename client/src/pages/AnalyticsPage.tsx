@@ -1,5 +1,8 @@
 import { useId, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useSearchParams } from 'react-router-dom'
+import { SectionTabs } from '@/components/section-tabs'
+import { RequestHistory } from '@/components/request-history'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, Legend,
@@ -71,7 +74,7 @@ const timeRanges: Array<{ value: TimeRange; label: string }> = [
   { value: 'alltime', label: 'All time' },
 ]
 
-export default function AnalyticsPage() {
+function AnalyticsCharts() {
   const [range, setRange] = useState<TimeRange>('7d')
 
   const { data: summary, isLoading: summaryLoading, isError: summaryError, error: summaryQueryError, refetch: refetchSummary } = useQuery({
@@ -119,26 +122,12 @@ export default function AnalyticsPage() {
 
   return (
     <div>
-      <PageHeader
-        eyebrow="Observability"
-        title="Analytics"
-        description="Request volume, reliability, latency, token use, and upstream failures without vanity metrics."
-        actions={
-          <div className="flex gap-1 rounded-[var(--radius-input)] border border-border bg-card p-1" role="group" aria-label="Analytics time range">
-            {timeRanges.map(({ value, label }) => (
-              <Button
-                key={value}
-                variant={range === value ? 'secondary' : 'ghost'}
-                size="xs"
-                aria-pressed={range === value}
-                onClick={() => setRange(value)}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
-        }
-      />
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex gap-1 rounded-lg border border-border bg-card p-1" role="group" aria-label="Analytics time range">
+          {timeRanges.map(({ value, label }) => <Button key={value} variant={range === value ? 'secondary' : 'ghost'} size="xs" aria-pressed={range === value} onClick={() => setRange(value)}>{label}</Button>)}
+        </div>
+        <Button variant="outline" size="sm" onClick={() => void refetchAll()}>Refresh metrics</Button>
+      </div>
 
       <div className="space-y-6">
         {analyticsError ? <ErrorState title="Some analytics could not load" description={analyticsError.message} action={<Button variant="outline" size="sm" onClick={() => void refetchAll()}>Retry all</Button>} /> : null}
@@ -356,4 +345,13 @@ export default function AnalyticsPage() {
       </div>
     </div>
   )
+}
+
+export default function AnalyticsPage() {
+  const [params, setParams] = useSearchParams()
+  const view = params.get('view') === 'requests' ? 'requests' : 'overview'
+  return <div><PageHeader title="Analytics" description="Understand traffic and follow a request through its provider fallbacks." />
+    <div className="mb-6"><SectionTabs label="Analytics views" value={view} onChange={value => setParams({ view: value })} items={[{ value: 'overview', label: 'Usage & reliability' }, { value: 'requests', label: 'Request history' }]} /></div>
+    {view === 'requests' ? <RequestHistory /> : <AnalyticsCharts />}
+  </div>
 }

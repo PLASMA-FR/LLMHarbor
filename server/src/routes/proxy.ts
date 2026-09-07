@@ -1,7 +1,8 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { z } from 'zod';
+import { chatCompletionSchema, isEmptyAssistantStub, supportedChatParameters } from '../schemas/chat.js';
+import { sendValidationError } from '../lib/validation.js';
 import type { ChatMessage, TokenUsage } from '@llmharbor/shared/types.js';
 import { routeRequestAsync, recordRateLimitHit, recordRouteFailure, recordSuccess, RoutePreparationError, type RouteResult } from '../services/router.js';
 import { commitProviderRequestReservation, recordRequest, recordTokens, releaseProviderCapacity, setCooldown, getNextCooldownDuration } from '../services/ratelimit.js';
@@ -16,8 +17,12 @@ import { hasSubstantiveOpenAIStreamDelta, isOpenAIStreamChunk } from '../provide
 import { resolveUsage } from '../lib/usage.js';
 import { routeableCredentialSql } from '../services/credentials.js';
 import { hasProvider } from '../providers/index.js';
+import { buildOpenApi, publicApiDescription } from '../lib/openapi.js';
 
 export const proxyRouter = Router({ mergeParams: true });
+let publicSchema: ReturnType<typeof buildOpenApi> | undefined;
+proxyRouter.get('/', (_req, res) => res.json(publicApiDescription));
+proxyRouter.get('/openapi.json', (_req, res) => res.json(publicSchema ??= buildOpenApi()));
 
 // Virtual "auto" model. Clients like Hermes require a non-empty `model` field
 // on every request, but llmharbor's whole point is to pick the model itself.
@@ -100,7 +105,7 @@ function getSessionKey(clientApiKeyId: number, messages: ChatMessage[]): string 
   if (!firstUser) return '';
   const firstUserText = contentToString(firstUser.content);
   if (!firstUserText) return '';
-  const firstSystemText = contentToString(messages.find(m => m.role === 'system')?.content ?? '');
+  const firstSystemText = contentToString(messages.find(m => m.role === 'system' || m.role === 'developer')?.content ?? '');
   const hash = crypto.createHash('sha256').update(firstSystemText).update('\0').update(firstUserText).digest('hex');
   return `${clientApiKeyId}:${hash}`;
 }
@@ -259,113 +264,6 @@ function retryBudgetForConfiguredRoutes(): number {
     return MIN_RETRY_BUDGET;
   }
 }
-
-const toolCallSchema = z.object({
-  id: z.string().min(1),
-  type: z.literal('function'),
-  function: z.object({
-    name: z.string().min(1),
-    arguments: z.string(),
-  }),
-  thought_signature: z.string().optional(),
-});
-
-// Clients like opencode / continue.dev send text in OpenAI's typed content
-// envelope. Vision/audio capability routing is not implemented, so reject
-// those blocks explicitly instead of silently deleting prompt content.
-const contentBlockSchema = z.object({
-  type: z.literal('text'),
-  text: z.string(),
-}).passthrough();
-const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
-
-function hasNonEmptyContent(content: unknown): boolean {
-  if (typeof content === 'string') return content.length > 0;
-  if (Array.isArray(content)) return content.length > 0;
-  return false;
-}
-
-const systemMessageSchema = z.object({
-  role: z.literal('system'),
-  content: contentSchema,
-  name: z.string().optional(),
-});
-
-const userMessageSchema = z.object({
-  role: z.literal('user'),
-  content: contentSchema,
-  name: z.string().optional(),
-});
-
-const assistantMessageSchema = z.object({
-  role: z.literal('assistant'),
-  content: z.union([contentSchema, z.null()]).optional(),
-  name: z.string().optional(),
-  refusal: z.string().optional(),
-  tool_calls: z.array(toolCallSchema).optional(),
-});
-
-function isEmptyAssistantStub(message: { role: string; content?: unknown; refusal?: string; tool_calls?: unknown[] }): boolean {
-  return message.role === 'assistant'
-    && !hasNonEmptyContent(message.content)
-    && !message.refusal
-    && (message.tool_calls?.length ?? 0) === 0;
-}
-
-const toolMessageSchema = z.object({
-  role: z.literal('tool'),
-  content: contentSchema,
-  tool_call_id: z.string().min(1),
-  name: z.string().optional(),
-});
-
-const toolDefinitionSchema = z.object({
-  type: z.literal('function'),
-  function: z.object({
-    name: z.string().min(1),
-    description: z.string().optional(),
-    parameters: z.record(z.string(), z.unknown()).optional(),
-    strict: z.boolean().optional(),
-  }),
-});
-
-const toolChoiceSchema = z.union([
-  z.enum(['none', 'auto', 'required']),
-  z.object({
-    type: z.literal('function'),
-    function: z.object({
-      name: z.string().min(1),
-    }),
-  }),
-]);
-
-const chatCompletionSchema = z.object({
-  messages: z.array(z.union([
-    systemMessageSchema,
-    userMessageSchema,
-    assistantMessageSchema,
-    toolMessageSchema,
-  ])).min(1),
-  model: z.string().optional(),
-  temperature: z.number().min(0).max(2).optional(),
-  max_tokens: z.number().int().positive().safe().optional(),
-  top_p: z.number().min(0).max(1).optional(),
-  stream: z.boolean().optional(),
-  tools: z.array(toolDefinitionSchema).optional(),
-  tool_choice: toolChoiceSchema.optional(),
-  parallel_tool_calls: z.boolean().optional(),
-  stream_options: z.object({
-    include_usage: z.boolean().optional(),
-  }).strict().optional(),
-}).superRefine((request, context) => {
-  if (request.stream_options !== undefined && request.stream !== true) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['stream_options'],
-      message: 'stream_options requires stream=true',
-    });
-  }
-});
 
 export function isRetryableError(err: any): boolean {
   if (err instanceof ProviderError) return err.retryable;
@@ -590,6 +488,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // locality is not a reliable authorization boundary.
   const clientKey = authenticateProxyClient(req, res);
   if (!clientKey) return;
+  const log = logRequest.bind(null, crypto.randomUUID(), clientKey.id);
   if (!enforceEndpointBinding(req, res, clientKey)) return;
 
   if (!isClientRouteAllowed(clientKey.id, 'v1.chat.completions')) {
@@ -600,16 +499,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Validate request
   const parsed = chatCompletionSchema.safeParse(req.body);
   if (!parsed.success) {
-    res.status(400).json({
-      error: {
-        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
-        type: 'invalid_request_error',
-      },
-    });
+    sendValidationError(res, parsed.error);
     return;
   }
 
-  const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls, stream_options } = parsed.data;
+  const { model: requestedModel, temperature, max_completion_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls, stream_options } = parsed.data;
+  const max_tokens = max_completion_tokens ?? parsed.data.max_tokens;
+  const ignored = Object.keys(req.body).filter(key => !supportedChatParameters.includes(key) && /^[A-Za-z0-9_]{1,80}$/.test(key)).slice(0, 32);
+  if (ignored.length) res.setHeader('X-LLMHarbor-Ignored-Parameters', ignored.join(', '));
   const requestMessages = parsed.data.messages.filter(m => !isEmptyAssistantStub(m));
   if (requestMessages.length === 0) {
     res.status(400).json({
@@ -848,14 +745,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     } catch (err: any) {
       if (downstream.signal.aborted || res.destroyed) {
         settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
-        logRequest('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
+        log('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
         return;
       }
       if (attemptDeadline.signal.aborted) {
         lastError = attemptDeadline.signal.reason ?? err;
         recordRetryFailure(retryFailures, lastError);
         settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
-        logRequest('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'error', estimatedInputTokens, 0, Date.now() - start, safeProviderFailureDescription(lastError), analyticsRequestId, attempt + 1, true);
+        log('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'error', estimatedInputTokens, 0, Date.now() - start, safeProviderFailureDescription(lastError), analyticsRequestId, attempt + 1, true);
         sendFallbackExhausted(res, retryFailures, attempt + 1);
         return;
       }
@@ -864,7 +761,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         lastAttemptRoute = err.failedRoute;
         addRetrySkip(err, err.failedRoute, true);
         recordRetryFailure(retryFailures, err);
-        logRequest(
+        log(
           err.failedRoute.platform, err.failedRoute.modelId, err.failedRoute.keyId,
           'error', 0, 0, Date.now() - start,
           safeProviderFailureDescription(err), analyticsRequestId, attempt + 1, false,
@@ -885,7 +782,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       if (lastError) {
         settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
         const failedRoute = lastAttemptRoute;
-        logRequest(
+        log(
           failedRoute?.platform ?? 'routing', failedRoute?.modelId ?? requestedModel ?? AUTO_MODEL_ID, failedRoute?.keyId ?? 0,
           'error', estimatedInputTokens, 0, Date.now() - start,
           safeProviderFailureDescription(lastError), analyticsRequestId, attempt + 1, true,
@@ -894,7 +791,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         settleClientCapacity();
         const status = Number.isInteger(err.status) && err.status >= 400 && err.status <= 599 ? err.status : 503;
-        logRequest('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'error', estimatedInputTokens, 0, Date.now() - start, sanitizeProviderErrorMessage(err.message), analyticsRequestId, attempt + 1, true);
+        log('routing', requestedModel ?? AUTO_MODEL_ID, 0, 'error', estimatedInputTokens, 0, Date.now() - start, sanitizeProviderErrorMessage(err.message), analyticsRequestId, attempt + 1, true);
         res.status(status).json({
           error: {
             message: sanitizeProviderErrorMessage(err.message ?? 'No eligible route is currently available.'),
@@ -926,7 +823,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
-            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, stream_options, oauth: route.oauth, signal: attemptDeadline.signal },
+            { temperature, max_tokens, max_completion_tokens, top_p, tools, tool_choice, parallel_tool_calls, stream_options, oauth: route.oauth, signal: attemptDeadline.signal },
           );
 
           for await (const chunk of gen) {
@@ -1021,7 +918,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           settleClientCapacity(totalTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(clientKey.id, messages, route.modelDbId);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', actualInputTokens, actualOutputTokens, Date.now() - start, null, analyticsRequestId, attempt + 1, true);
+          log(route.platform, route.modelId, route.keyId, 'success', actualInputTokens, actualOutputTokens, Date.now() - start, null, analyticsRequestId, attempt + 1, true);
           return;
         } catch (streamErr: any) {
           if (downstream.signal.aborted || res.destroyed) {
@@ -1029,7 +926,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             recordTokens(route.platform, route.modelId, route.keyId, attemptedTokens);
             settleClientCapacity(attemptedTokens);
             releaseProviderCapacity(route.capacityReservationId);
-            logRequest(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, estimatedOutputTokens, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
+            log(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, estimatedOutputTokens, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
             return;
           }
           if (streamStarted) {
@@ -1051,7 +948,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             settleClientCapacity(estimatedInputTokens + estimatedOutputTokens);
             try { await writeResponseChunk(res, `data: ${JSON.stringify(payload)}\n\n`, downstream.signal); } catch { /* socket gone */ }
             try { await writeResponseChunk(res, 'data: [DONE]\n\n', downstream.signal); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, estimatedOutputTokens, Date.now() - start, safeStreamError, analyticsRequestId, attempt + 1, true);
+            log(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, estimatedOutputTokens, Date.now() - start, safeStreamError, analyticsRequestId, attempt + 1, true);
             return;
           }
           // Pre-stream error — bubble to outer retry/502 handler.
@@ -1060,7 +957,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, messages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls, stream_options, oauth: route.oauth, signal: attemptDeadline.signal },
+          { temperature, max_tokens, max_completion_tokens, top_p, tools, tool_choice, parallel_tool_calls, stream_options, oauth: route.oauth, signal: attemptDeadline.signal },
         );
 
         const estimatedOutputTokens = result.choices.reduce((sum, choice) => {
@@ -1090,7 +987,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           _routed_via: { platform: route.platform, model: route.modelId },
         });
 
-        logRequest(
+        log(
           route.platform, route.modelId, route.keyId, 'success',
           actualInputTokens,
           actualOutputTokens,
@@ -1106,7 +1003,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens);
       if (downstream.signal.aborted || res.destroyed) {
         settleClientCapacity(estimatedInputTokens);
-        logRequest(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
+        log(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
         return;
       }
       const latency = Date.now() - start;
@@ -1115,7 +1012,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         oauthAccountsRefreshedAfter401.add(route.oauth.accountId);
         try {
           await forceRefreshOAuthAccount(getDb(), route.oauth.accountId, attemptDeadline.signal);
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, false);
+          log(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, false);
           lastError = err;
           recordRetryFailure(retryFailures, err);
           // Do not skip the route: the next selection will decrypt the newly
@@ -1125,11 +1022,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         } catch (refreshError) {
           if (downstream.signal.aborted || res.destroyed) {
             settleClientCapacity(estimatedInputTokens);
-            logRequest(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
+            log(route.platform, route.modelId, route.keyId, 'cancelled', estimatedInputTokens, 0, Date.now() - start, 'Client disconnected', analyticsRequestId, attempt + 1, true);
             return;
           }
           const safeRefreshError = safeProviderFailureDescription(refreshError);
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeRefreshError, analyticsRequestId, attempt + 1, false);
+          log(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeRefreshError, analyticsRequestId, attempt + 1, false);
           addRetrySkip(refreshError, route, true);
           lastError = refreshError;
           recordRetryFailure(retryFailures, refreshError);
@@ -1141,7 +1038,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // a model/account-specific 401 must not permanently strand the account.
       if (isProviderCredentialInvalid(err) && !route.oauth) markProviderCredentialInvalid(route.keyId);
       if (isRetryableError(err)) {
-        logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, false);
+        log(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, false);
         // Put this model+key on cooldown and try the next one
         addRetrySkip(err, route);
         // Persistent cooldowns and the dashboard's "rate-limit hits" metric
@@ -1164,7 +1061,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
       // Non-retryable error (auth, 4xx, etc.): don't retry
       settleClientCapacity(estimatedInputTokens);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, true);
+      log(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, analyticsRequestId, attempt + 1, true);
       res.status(502).json({
         error: {
           message: `The upstream provider route '${route.displayName}' failed.`,
@@ -1184,7 +1081,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (!downstream.signal.aborted && !res.destroyed) {
     settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
     const failedRoute = lastAttemptRoute;
-    logRequest(
+    log(
       failedRoute?.platform ?? 'routing', failedRoute?.modelId ?? requestedModel ?? AUTO_MODEL_ID, failedRoute?.keyId ?? 0,
       'error', estimatedInputTokens, 0, Date.now() - start,
       safeProviderFailureDescription(lastError), analyticsRequestId, attemptsPerformed + 1, true,
@@ -1194,7 +1091,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   else settleClientCapacity(reachedUpstream ? estimatedInputTokens : 0);
 });
 
+proxyRouter.all('/chat/completions', (_req, res) => {
+  res.setHeader('Allow', 'POST');
+  res.status(405).json({ error: { message: 'Use POST /v1/chat/completions with a JSON request body.' } });
+});
+proxyRouter.all('/models', (_req, res) => {
+  res.setHeader('Allow', 'GET, HEAD');
+  res.status(405).json({ error: { message: 'Use GET /v1/models to list available models.' } });
+});
+
 function logRequest(
+  traceId: string,
+  clientKeyId: number,
   platform: string,
   modelId: string,
   keyId: number,
@@ -1210,9 +1118,9 @@ function logRequest(
   try {
     const db = getDb();
     db.prepare(`
-      INSERT INTO requests (request_id, attempt, is_final, platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(requestId, attempt, isFinal ? 1 : 0, platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error);
+      INSERT INTO requests (request_id, attempt, is_final, platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, trace_id, client_key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(requestId, attempt, isFinal ? 1 : 0, platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, traceId, clientKeyId);
   } catch (e) {
     console.error('Failed to log request:', e);
   }

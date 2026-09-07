@@ -17,6 +17,10 @@ import { endpointsRouter } from './routes/endpoints.js';
 import { oauthRouter } from './routes/oauth.js';
 import { backupRouter } from './routes/backup.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { apiContract, requireJsonBody } from './middleware/apiContract.js';
+import { clientKeysRouter } from './routes/clientKeys.js';
+import { requestsRouter } from './routes/requests.js';
+import { apiDocsRouter } from './routes/apiDocs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -226,6 +230,7 @@ function createBaseApp() {
     hsts: false,
   }));
   app.use(cors({
+    exposedHeaders: ['X-Request-Id', 'X-Routed-Via', 'X-Fallback-Attempts', 'X-LLMHarbor-Ignored-Parameters', 'Retry-After', 'ETag'],
     origin(origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) {
       callback(null, !origin || allowedCorsOrigins.has(origin));
     },
@@ -242,6 +247,7 @@ function createBaseApp() {
     }
     next();
   });
+  app.use(apiContract);
 
   // Public liveness probe: no credentials or config data. The split public API
   // listener exposes this too so operators can check the port without an API key.
@@ -266,8 +272,8 @@ function mountDashboardPlaygroundProxy(app: express.Express) {
 
 export function createPublicApiApp() {
   const app = createBaseApp();
-
-  app.use(express.json({ limit: process.env.LLMHARBOR_API_BODY_LIMIT ?? DEFAULT_API_BODY_LIMIT }));
+  app.use(requireJsonBody);
+  app.use(express.json({ type: ['application/json', 'application/*+json'], limit: process.env.LLMHARBOR_API_BODY_LIMIT ?? DEFAULT_API_BODY_LIMIT }));
 
   // Public listener: only OpenAI-compatible proxy routes plus /api/ping.
   // No dashboard static files and no mutating /api control-plane routes.
@@ -302,27 +308,35 @@ export function createDashboardApp(options: CreateAppOptions = {}) {
     requireControlPlaneAccess(controlPlaneAccess),
     requireSafeControlPlaneOrigin(allowedDashboardOrigins),
   );
+  app.use(requireJsonBody);
 
   app.use(
-    '/api/settings/backup',
-    express.json({ limit: BACKUP_IMPORT_BODY_LIMIT }),
+    ['/api/settings/backup', '/api/backups'],
+    express.json({ type: ['application/json', 'application/*+json'], limit: BACKUP_IMPORT_BODY_LIMIT }),
     backupRouter,
   );
-  app.use(express.json({ limit: process.env.LLMHARBOR_API_BODY_LIMIT ?? DEFAULT_API_BODY_LIMIT }));
+  app.use(express.json({ type: ['application/json', 'application/*+json'], limit: process.env.LLMHARBOR_API_BODY_LIMIT ?? DEFAULT_API_BODY_LIMIT }));
 
   // The local dashboard can exercise the exact OpenAI-compatible handlers
   // without retrieving a hash-only client secret from storage.
   mountDashboardPlaygroundProxy(app);
 
   // Dashboard/control-plane API routes.
+  app.use('/api', apiDocsRouter);
   app.use('/api/keys', keysRouter);
+  app.use('/api/provider-keys', keysRouter);
+  app.use('/api/client-keys', clientKeysRouter);
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);
+  app.use('/api/routing', fallbackRouter);
   app.use('/api/analytics', analyticsRouter);
+  app.use('/api/requests', requestsRouter);
   app.use('/api/health', healthRouter);
   app.use('/api/settings/free-model-updater', freeModelUpdaterRouter);
+  app.use('/api/discovery', freeModelUpdaterRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/endpoints', endpointsRouter);
+  app.use('/api/providers', endpointsRouter);
   app.use('/api/oauth', oauthRouter);
 
   // Keep the local/Tailscale dashboard listener useful for playground calls too.

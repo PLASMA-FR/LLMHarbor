@@ -93,12 +93,14 @@ describe('model settings and credential preparation', () => {
   });
 
   it('returns JSON at API namespace roots and keeps dashboard API responses out of caches', async () => {
-    for (const path of ['/api', '/v1', '/api/unknown']) {
+    for (const path of ['/api/unknown', '/v1/unknown']) {
       const { response, data } = await request(path);
       expect(response.status).toBe(404);
       expect(response.headers.get('content-type')).toContain('application/json');
       expect(data.error.type).toBe('not_found');
     }
+    expect((await request('/api')).data.links.clientKeys).toBe('/api/client-keys');
+    expect((await request('/v1')).data.links.models).toBe('/v1/models');
     expect((await request('/api/keys')).response.headers.get('cache-control')).toContain('no-store');
   });
 });

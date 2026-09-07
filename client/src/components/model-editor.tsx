@@ -3,9 +3,10 @@ import type { Model } from '../../../shared/types'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { InlineNotice } from '@/components/status-indicator'
 
-export type ModelSettings = Pick<Model, 'displayName' | 'contextWindow' | 'rpmLimit' | 'rpdLimit' | 'tpmLimit' | 'tpdLimit'>
+export type ModelSettings = Pick<Model, 'displayName' | 'contextWindow' | 'rpmLimit' | 'rpdLimit' | 'tpmLimit' | 'tpdLimit' | 'enabled'>
 const limits = [
   ['contextWindow', 'Context window'], ['rpmLimit', 'Requests / minute'], ['rpdLimit', 'Requests / day'],
   ['tpmLimit', 'Tokens / minute'], ['tpdLimit', 'Tokens / day'],
@@ -18,6 +19,7 @@ export function ModelEditor({ model, busy, onSave, onCancel }: {
   onCancel: () => void
 }) {
   const [name, setName] = useState(model.displayName)
+  const [enabled, setEnabled] = useState(model.enabled)
   const [values, setValues] = useState(() => Object.fromEntries(limits.map(([field]) => [field, model[field]?.toString() ?? ''])))
   const [error, setError] = useState<string | null>(null)
   return (
@@ -26,6 +28,7 @@ export function ModelEditor({ model, busy, onSave, onCancel }: {
       const patch: Partial<ModelSettings> = {}
       if (!name.trim()) { setError('A display name is required.'); return }
       if (name.trim() !== model.displayName) patch.displayName = name.trim()
+      if (enabled !== model.enabled) patch.enabled = enabled
       for (const [field, label] of limits) {
         const value = values[field].trim() ? Number(values[field]) : null
         if (value !== null && (!Number.isSafeInteger(value) || value <= 0)) { setError(`${label} must be a positive whole number, or blank.`); return }
@@ -49,6 +52,7 @@ export function ModelEditor({ model, busy, onSave, onCancel }: {
           </div>
         ))}
       </div>
+      <div className="flex items-center justify-between gap-4 rounded-lg border border-border p-3"><Label htmlFor={`catalog-enabled-${model.id}`}>Available in the catalog</Label><Switch id={`catalog-enabled-${model.id}`} checked={enabled} onCheckedChange={setEnabled} disabled={busy} /></div>
       {error ? <InlineNotice tone="critical">{error}</InlineNotice> : null}
       <p className="text-xs text-muted-foreground">Request and token quotas apply to each credential. Blank removes a quota. Context window is catalog metadata; the upstream enforces its context limit.</p>
       <div className="flex gap-2">
